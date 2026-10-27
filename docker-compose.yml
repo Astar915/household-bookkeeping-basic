@@ -1,0 +1,19 @@
+services:
+  household-bookkeeping-web:
+    build: .
+    restart: unless-stopped
+    environment:
+      HOUSEHOLD_WEB_ALLOW_REMOTE: "1"
+      HOUSEHOLD_WEB_PUBLIC_ORIGIN: ${HOUSEHOLD_WEB_PUBLIC_ORIGIN:?Set your HTTPS website origin}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - household-bookkeeping-data:/var/lib/household-bookkeeping
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/config', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  household-bookkeeping-data:

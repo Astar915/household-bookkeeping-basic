@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f5f6fa" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#11131b" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="家庭记账">
+  <title>家庭记账</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <script src="/appearance.js"></script>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <script defer src="/app.js"></script>
+  <script defer src="/mobile.js"></script>
+  <script defer src="/github-login.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="家庭记账"><img src="/icon.svg" alt=""><span data-i18n="appName">家庭记账</span></a>
+    <button id="appearanceButton" class="icon-button appearance-launch" type="button" aria-label="外观"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg></button>
+    <div id="toolbar" class="toolbar hidden">
+      <span id="connectionState" class="connection"></span>
+      <button id="syncButton" class="button secondary" type="button" data-i18n="syncNow">立即同步</button>
+      <select id="languageSelect" aria-label="Language">
+        <option value="zh-CN">简体中文</option><option value="ja-JP">日本語</option><option value="en-US">English</option>
+      </select>
+      <span id="usernameLabel" class="username"></span>
+      <button id="logoutButton" class="button text-button" type="button" data-i18n="logout">退出</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="authScreen" class="auth-layout">
+      <div class="intro">
+        <p class="eyebrow" data-i18n="privateLedger">私人账本 · 多设备同步</p>
+        <h1 data-i18n="heroTitle">每一笔，都清楚。</h1>
+        <p data-i18n="heroText">断网时先保存在本机；恢复网络后再安全同步到你的独立账本。</p>
+        <div class="feature-list">
+          <span data-i18n="feature1">每个账号有独立账本</span>
+          <span data-i18n="feature2">离线记录，联网续传</span>
+          <span data-i18n="feature3">电脑和手机共用同一网页</span>
+        </div>
+      </div>
+      <div class="auth-card">
+        <div class="github-welcome">
+          <span class="github-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .9a11.1 11.1 0 0 0-3.5 21.63c.55.1.75-.24.75-.53v-2.1c-3.1.67-3.75-1.3-3.75-1.3-.5-1.28-1.23-1.62-1.23-1.62-1-.69.08-.67.08-.67 1.12.08 1.71 1.14 1.71 1.14 1 1.7 2.6 1.2 3.24.92.1-.72.39-1.2.7-1.48-2.48-.28-5.1-1.25-5.1-5.56 0-1.23.44-2.24 1.15-3.03-.12-.28-.5-1.43.11-2.98 0 0 .94-.3 3.05 1.16A10.6 10.6 0 0 1 12 6.1c.94 0 1.88.13 2.76.38 2.12-1.45 3.05-1.16 3.05-1.16.61 1.55.23 2.7.11 2.98.72.79 1.15 1.8 1.15 3.03 0 4.32-2.62 5.27-5.12 5.55.4.35.76 1.02.76 2.06V22c0 .3.2.64.76.53A11.1 11.1 0 0 0 12 .9Z"/></svg></span>
+          <h2 data-gh-text="title">一个 GitHub 账号，就能开始</h2>
+          <p class="fineprint" data-gh-text="intro">首次授权自动建立你的私人账本，以后在其他设备使用同一个 GitHub 登录即可。</p>
+          <button id="githubSignIn" type="button" class="button primary wide" data-gh-text="signIn">使用 GitHub 登录</button>
+          <p class="fineprint" data-gh-text="privacy">密码只在 GitHub 页面输入；登录不会上传或覆盖云备份。</p>
+        </div>
+        <section id="githubLoginProgress" class="hidden" aria-live="polite">
+          <p data-gh-text="instructions">复制临时授权码，在 GitHub 验证页输入并确认，再返回这里。</p>
+          <div id="githubLoginCode" class="device-code"></div>
+          <div class="button-row"><button id="githubCopyCode" type="button" class="button secondary" data-gh-text="copyCode">复制授权码</button><a id="githubVerification" href="https://github.com/login/device" target="_blank" rel="noopener noreferrer" class="button primary" data-gh-text="openGithub">打开 GitHub 授权</a></div>
+          <p id="githubLoginState" class="fineprint"></p>
+          <button id="githubCancelLogin" type="button" class="text-button" data-gh-text="cancel">取消登录</button>
+        </section>
+        <details id="legacyAccountMigration" class="legacy-migration">
+          <summary data-gh-text="legacyTitle">已有旧账号？迁移原账本</summary>
+          <p class="fineprint" data-gh-text="legacyHelp">先验证原账号，再关联 GitHub，保留原来的账目和设置。新用户直接使用上方 GitHub 登录。</p>
+          <div class="button-row"><button type="button" class="auth-tab" data-auth-tab="login" data-gh-text="legacyPassword">原账号密码</button><button type="button" class="auth-tab" data-auth-tab="recover" data-gh-text="legacyRecovery">原账号恢复码</button></div>
+        <form id="loginForm" class="auth-form">
+          <label><span data-i18n="username">用户名</span><input name="username" required autocomplete="username" minlength="3" maxlength="32"></label>
+          <label><span data-i18n="password">密码</span><input name="password" type="password" required autocomplete="current-password"></label>
+          <button class="button secondary wide" data-gh-text="verifyLegacy">验证原账号并保留账本</button>
+        </form>
+        <form id="recoverForm" class="auth-form hidden">
+          <label><span data-i18n="username">用户名</span><input name="username" required autocomplete="username"></label>
+          <label><span data-i18n="recoveryCode">恢复码</span><input name="recoveryCode" required autocomplete="off"></label>
+          <label><span data-i18n="newPassword">新密码（至少12位）</span><input name="newPassword" type="password" required autocomplete="new-password" minlength="12"></label>
+          <button class="button primary wide" data-i18n="resetPassword">重置密码</button>
+        </form>
+        </details>
+        <div id="authMessage" class="message hidden" role="status"></div>
+      </div>
+    </section>
+
+    <section id="appScreen" class="app-screen hidden">
+      <div class="page-heading">
+        <div><p class="eyebrow" data-i18n="overview">总览</p><h1 data-i18n="yourLedger">你的家庭账本</h1></div>
+        <div id="syncSummary" class="sync-summary"></div>
+      </div>
+      <div id="githubLinkBanner" class="panel hidden"><p data-gh-text="linkHelp">关联 GitHub 后，以后直接使用 GitHub 登录，当前账本和设置会保留。</p><button type="button" id="githubLinkLegacy" class="button primary" data-gh-text="linkButton">关联 GitHub，保留当前账本</button></div>
+      <div id="offlineBanner" class="offline-banner hidden"></div>
+      <section class="panel accounts-panel">
+        <div class="section-heading"><div><h2 data-i18n="accounts">账户</h2><p data-i18n="accountsHint">余额按已入账流水计算，离线暂存记录单独显示。</p></div><button id="showAccountForm" class="button secondary" data-i18n="addAccount">＋ 添加账户</button></div>
+        <div id="accountGrid" class="account-grid"></div>
+        <form id="accountForm" class="inline-form hidden">
+          <label><span data-i18n="accountName">账户名称</span><input name="name" required maxlength="80"></label>
+          <label><span data-i18n="accountType">类型</span><select name="type" required></select></label>
+          <label><span data-i18n="currency">币种</span><select name="currency"><option>JPY</option><option>CNY</option></select></label>
+          <label><span data-i18n="openingBalance">期初余额</span><input name="openingBalance" required inputmode="decimal" value="0"></label>
+          <label><span data-i18n="openingDate">期初日期</span><input name="openingDate" type="date" required></label>
+          <label><span data-i18n="completeness">余额状态</span><select name="completeness"><option value="known" data-i18n="known">完整</option><option value="partial" data-i18n="partial">部分核实</option><option value="inferred" data-i18n="inferred">包含推算</option></select></label>
+          <div class="form-actions"><button type="submit" class="button primary" data-i18n="saveToQueue">保存并同步</button><button id="cancelAccount" class="button text-button" type="button" data-i18n="cancel">取消</button></div>
+        </form>
+      </section>
+
+      <div class="content-columns">
+        <section class="panel entry-panel">
+          <div class="section-heading"><div><h2 data-i18n="quickEntry">快速记账</h2><p data-i18n="entryHint">提交后先进入同步队列；网络中断时保留在此设备。</p></div></div>
+          <form id="transactionForm" class="entry-form">
+            <div class="segmented" role="group" aria-label="Transaction type">
+              <button type="button" data-kind="expense" class="selected" data-i18n="expense">支出</button>
+              <button type="button" data-kind="income" data-i18n="income">收入</button>
+              <button type="button" data-kind="transfer" data-i18n="transfer">转账</button>
+            </div>
+            <input name="kind" type="hidden" value="expense">
+            <label><span data-i18n="date">日期</span><input name="date" type="date" required></label>
+            <label><span data-i18n="amount">金额</span><div class="amount-wrap"><input name="amount" required inputmode="decimal" placeholder="0"><span id="amountCurrency">JPY</span></div></label>
+            <label id="categoryRow"><span data-i18n="category">消费类别</span><div class="control-with-action"><select name="categoryName" required></select><button id="showCategoryForm" class="button compact" type="button" aria-label="Add category">＋</button></div></label>
+            <label><span data-i18n="fromAccount">付款/转出账户</span><select name="accountName" required></select></label>
+            <label id="toAccountRow" class="hidden"><span data-i18n="toAccount">转入账户</span><select name="toAccountName"></select></label>
+            <label id="toAmountRow" class="hidden"><span data-i18n="toAmount">实际转入金额（跨币种时填写）</span><div class="amount-wrap"><input name="toAmount" inputmode="decimal" placeholder=""><span id="toCurrency">CNY</span></div></label>
+            <label class="span-two"><span data-i18n="description">说明</span><input name="description" required maxlength="240" placeholder=""></label>
+            <button type="submit" class="button primary wide" data-i18n="saveEntry">保存记账</button>
+          </form>
+          <form id="categoryForm" class="inline-form compact-form hidden">
+            <label><span data-i18n="categoryName">类别名称</span><input name="name" required maxlength="80"></label>
+            <label><span data-i18n="categoryType">类别类型</span><select name="kind"><option value="expense" data-i18n="expense">支出</option><option value="income" data-i18n="income">收入</option></select></label>
+            <div class="form-actions"><button type="submit" class="button primary" data-i18n="add">添加</button><button id="cancelCategory" class="button text-button" type="button" data-i18n="cancel">取消</button></div>
+          </form>
+        </section>
+        <section class="panel queue-panel">
+          <div class="section-heading"><div><h2 data-i18n="pendingSync">待同步</h2><p data-i18n="queueHint">只要队列项目未成功写入云账本，就会继续保留并重试。</p></div><span id="pendingCount" class="count-badge">0</span></div>
+          <div id="outboxList" class="outbox-list empty-state"></div>
+          <div class="import-box">
+            <h3 data-i18n="importDesktop">导入桌面账本</h3>
+            <p data-i18n="importHint">只会上传你主动选择的SQLite文件；请先关闭桌面软件，避免遗漏尚未写入文件的内容。</p>
+            <div class="file-actions"><label class="button secondary file-button"><span data-i18n="chooseFile">选择账本文件</span><input id="ledgerFile" type="file" accept=".sqlite3,.sqlite,.db,application/vnd.sqlite3"></label><button id="exportLedger" class="button text-button" type="button">导出云端账本</button></div>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel history-panel">
+        <div class="section-heading"><div><h2 data-i18n="recentTransactions">最近流水</h2><p data-i18n="recentHint">默认展示最近2000条；可按日期检索更早的账目。</p></div><span id="transactionCount" class="muted"></span></div>
+        <div class="table-scroll"><table><thead><tr><th data-i18n="date">日期</th><th data-i18n="type">类型</th><th data-i18n="description">说明</th><th data-i18n="category">类别</th><th data-i18n="account">账户/方向</th><th class="right" data-i18n="amount">金额</th><th data-i18n="status">状态</th></tr></thead><tbody id="transactionRows"></tbody></table></div>
+      </section>
+      <p class="privacy-note" data-i18n="privacyNote">账本保存在电脑服务；离线记录在恢复连接后续传。</p>
+    </section>
+  </main>
+
+  <dialog id="recoveryDialog" class="dialog-card">
+    <h2 data-i18n="saveRecovery">请保存账号恢复码</h2>
+    <p data-i18n="recoveryExplain">恢复码只显示这一次。丢失密码且没有恢复码时，目前无法通过邮件找回。</p>
+    <pre id="recoveryCodeDisplay"></pre>
+    <button id="copyRecovery" class="button secondary" data-i18n="copy">复制</button>
+    <button id="closeRecovery" class="button primary" data-i18n="savedContinue">我已保存，继续</button>
+  </dialog>
+  <div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>

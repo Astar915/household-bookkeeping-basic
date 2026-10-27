@@ -1,0 +1,38 @@
+# User-owned ledger data, backups, receipts, exports, and generated builds
+/data/
+/backups/
+/dist/
+/migration-notes/
+**/backups/
+**/receipt_images/
+*.zip
+*.bak
+*.log
+
+# Local Python environments and caches
+/.venv/
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+
+# Private project notes, user-specific skills, migration evidence, and screenshots
+/AGENTS.md
+/.agents/skills/household-bookkeeping/
+/.agents/skills/household-food-health/
+/docs/
+/scripts/probe_desktop_request.py
+/scripts/sanitize_portable_source.py
+/scripts/package_cloud_sync_test.ps1
+/scripts/package_portable_test.ps1

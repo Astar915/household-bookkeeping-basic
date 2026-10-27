@@ -1,0 +1,13 @@
+.git
+.agents
+backups
+data
+tests
+docs
+migration-notes
+__pycache__
+*.py[cod]
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.env
