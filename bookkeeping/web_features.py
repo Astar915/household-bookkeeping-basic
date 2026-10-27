@@ -494,6 +494,22 @@ class MobileWorkspace:
                     db.delete_food_purchase_item(int(data["id"]))
             elif action == "delete_transaction":
                 db.delete_transaction_with_backup(int(data["id"]))
+            elif action == "edit_transaction":
+                backup_path = db.update_transaction_with_backup(
+                    int(data["id"]),
+                    occurred_on=str(data.get("date", "")),
+                    kind=str(data.get("kind", "")),
+                    amount=str(data.get("amount", "")),
+                    currency=str(data.get("currency", "")),
+                    description=str(data.get("description", "")),
+                    category_name=data.get("category_name") or None,
+                    account_name=data.get("account_name") or None,
+                    to_account_name=data.get("to_account_name") or None,
+                    to_amount=data.get("to_amount") or None,
+                    memo_only=bool(data.get("memo_only", False)),
+                    needs_review=bool(data.get("needs_review", False)),
+                )
+                result["backup"] = backup_path.name
             elif action == "review_transaction":
                 db.confirm_transaction_review(int(data["id"]), account_name=data.get("account") or None)
             elif action == "delete_account":

@@ -1,0 +1,12 @@
+{
+  "name": "household-bookkeeping-cloud-full",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync:pwa": "node scripts/sync-pwa.mjs",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.153.0"
+  }
+}

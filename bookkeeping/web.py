@@ -141,7 +141,7 @@ class BookkeepingRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data: blob:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
-        if self.server.secure_cookie:
+        if self._secure_request():
             self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         for key, value in extra_headers:
             self.send_header(key, value)
@@ -186,10 +186,18 @@ class BookkeepingRequestHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin", "").rstrip("/")
         if not origin:
             return False
-        expected = self.server.public_origin
-        if not expected:
-            expected = f"http://{self.headers.get('Host', '')}".rstrip("/")
+        forwarded_host = self.headers.get("X-Forwarded-Host", "").strip()
+        forwarded_proto = self.headers.get("X-Forwarded-Proto", "").strip().lower()
+        if forwarded_host and forwarded_proto in {"http", "https"}:
+            expected = f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+        else:
+            expected = self.server.public_origin
+            if not expected:
+                expected = f"http://{self.headers.get('Host', '')}".rstrip("/")
         return hmac.compare_digest(origin.lower(), expected.lower())
+
+    def _secure_request(self) -> bool:
+        return self.server.secure_cookie or self.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
 
     def _cookie_values(self) -> dict[str, str]:
         cookies = http.cookies.SimpleCookie()
@@ -273,7 +281,7 @@ class BookkeepingRequestHandler(BaseHTTPRequestHandler):
             )
             connection.execute("DELETE FROM web_sessions WHERE expires_at < ?", (now.isoformat(),))
         self._auth_write(save_session)
-        secure = "; Secure" if self.server.secure_cookie else ""
+        secure = "; Secure" if self._secure_request() else ""
         session_cookie = f"hh_session={session_token}; Path=/; Max-Age={SESSION_MAX_AGE}; HttpOnly; SameSite=Strict{secure}"
         csrf_cookie = f"hh_csrf={csrf_token}; Path=/; Max-Age={SESSION_MAX_AGE}; SameSite=Strict{secure}"
         return (("Set-Cookie", session_cookie), ("Set-Cookie", csrf_cookie))
@@ -284,7 +292,7 @@ class BookkeepingRequestHandler(BaseHTTPRequestHandler):
         if token:
             token_hash = hashlib.sha256(token.encode("ascii", "ignore")).hexdigest()
             self._auth_write(lambda connection: connection.execute("DELETE FROM web_sessions WHERE token_hash=?", (token_hash,)))
-        secure = "; Secure" if self.server.secure_cookie else ""
+        secure = "; Secure" if self._secure_request() else ""
         return (
             ("Set-Cookie", f"hh_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}"),
             ("Set-Cookie", f"hh_csrf=; Path=/; Max-Age=0; SameSite=Strict{secure}"),
@@ -320,7 +328,8 @@ class BookkeepingRequestHandler(BaseHTTPRequestHandler):
             if route.startswith("/api/"):
                 if route == "/api/config":
                     self._json({"requiresInvite": False, "authMode": "github", "appVersion": "mobile-7",
-                                "secure": self.server.secure_cookie})
+                                "secure": self._secure_request(),
+                                "deploymentMode": "cloud" if os.environ.get("HOUSEHOLD_WEB_CLOUD_RUNTIME") == "1" else "selfhosted"})
                     return
                 if route == "/api/session":
                     try:
@@ -497,7 +506,7 @@ class BookkeepingRequestHandler(BaseHTTPRequestHandler):
             if route.startswith("/api/auth/github/"):
                 payload = self._read_json()
                 cookie = self._cookie_values().get("hh_gh_login", "")
-                secure = "; Secure" if self.server.secure_cookie else ""
+                secure = "; Secure" if self._secure_request() else ""
                 def flow_cookie(value, duration=0):
                     return (("Set-Cookie", f"hh_gh_login={value}; Path=/api/auth/github; Max-Age={duration}; HttpOnly; SameSite=Strict{secure}"),)
                 if route == "/api/auth/github/start":

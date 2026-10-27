@@ -36,3 +36,6 @@ __pycache__/
 /scripts/sanitize_portable_source.py
 /scripts/package_cloud_sync_test.ps1
 /scripts/package_portable_test.ps1
+
+# Wrangler account and build cache (may contain account metadata)
+.wrangler/

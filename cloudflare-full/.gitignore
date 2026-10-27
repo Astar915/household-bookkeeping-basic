@@ -1,0 +1,6 @@
+.dev.vars
+.wrangler/
+node_modules/
+coverage/
+wrangler.local.jsonc
+worker-configuration.d.ts

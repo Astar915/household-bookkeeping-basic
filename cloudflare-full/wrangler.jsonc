@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "household-bookkeeping-cloud-test",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-10-27",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+  "version_metadata": {
+    "binding": "CF_VERSION_METADATA"
+  },
+  "vars": {
+    "PUBLIC_ORIGIN": "https://household-bookkeeping-cloud-test.household-bookkeeping-cloud-test.workers.dev"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RUNTIME", "class_name": "BookkeepingRuntime" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BookkeepingRuntime"] }
+  ],
+  "containers": [
+    {
+      "class_name": "BookkeepingRuntime",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "base": {
+          "dockerfile": "./container/Dockerfile",
+          "build_context": ".."
+        }
+      }
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "LEDGER_ARCHIVE", "bucket_name": "household-bookkeeping-cloud-ledger" }
+  ],
+  "observability": { "enabled": true }
+}

@@ -1,4 +1,4 @@
-const CACHE = "household-ledger-mobile-v12";
+const CACHE = "household-ledger-mobile-v14";
 const SHELL = ["/", "/style.css", "/mobile.css", "/app.js", "/mobile.js", "/github-login.js", "/appearance.js", "/manifest.webmanifest", "/icon.svg", "/apple-touch-icon.png", "/icon-192.png", "/icon-512.png"];
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));

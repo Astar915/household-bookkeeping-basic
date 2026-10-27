@@ -24,7 +24,7 @@ const icons = {
 };
 const icon = name => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+(icons[name]||icons.book)+'</svg>';
 const b = (action, text, id="", cls="button secondary") => {
-  const names={privacy:m("显示或隐藏金额","金額表示の切替","Show or hide amounts"),refresh:m("刷新","更新","Refresh"),"budget-edit":m("编辑预算","予算編集","Edit budget"),"add-card":m("添加信用卡","カード追加","Add credit card"),"asset-edit":m("登记资产","資産を登録","Register asset"),"profile-add":m("添加 API 服务","APIを追加","Add API service"),backup:m("创建备份","バックアップ作成","Create backup"),"order-up":m("上移","上へ","Move up"),"order-down":m("下移","下へ","Move down"),"order-remove":m("移除扣款来源","引落元を削除","Remove funding source")};
+  const names={privacy:m("显示或隐藏金额","金額表示の切替","Show or hide amounts"),refresh:m("刷新","更新","Refresh"),"budget-edit":m("编辑预算","予算編集","Edit budget"),"add-card":m("添加信用卡","カード追加","Add credit card"),"asset-edit":m("登记资产","資産を登録","Register asset"),"profile-add":m("添加 API 服务","APIを追加","Add API service"),backup:m("创建备份","バックアップ作成","Create backup"),"order-up":m("上移","上へ","Move up"),"order-down":m("下移","下へ","Move down"),"order-remove":m("移除扣款来源","引落元を削除","Remove funding source"),"favorites-edit":m("编辑常用功能","ショートカットを編集","Edit shortcuts"),"favorites-add":m("添加常用功能","ショートカットを追加","Add shortcut"),"favorite-remove":m("移除此常用功能","ショートカットを削除","Remove shortcut")};
   return '<button type="button" class="'+cls+'" data-action="'+action+'" data-id="'+e(id)+'"'+(names[action]?' aria-label="'+e(names[action])+'"':"")+'>'+text+'</button>';
 };
 const money = (value, currency="JPY", digits=null) => hiddenAmounts ? "••••••" : formatMinor(value || "0", currency, digits === null ? currency === "CNY" ? 2 : 0 : digits);
@@ -35,7 +35,7 @@ const plainAmount = (minor, digits=0) => {
 let workspace = null, workspaceOwner = "", workspaceLoading = null, workspaceLoadingOwner = "";
 let workspaceEpoch = 0;
 let workspaceError = "";
-let selectedPage = "home", assetTab = "cash", moreTab = "", reportDate = "", ledgerSearchTimer = null, ledgerRangeRows = null, backupDraft = null;
+let selectedPage = "home", assetTab = "cash", moreTab = "", reportDate = "", ledgerSearchTimer = null, ledgerRangeRows = null, backupDraft = null, favoritesEditing = false;
 let hiddenAmounts = localStorage.getItem("hh-hide-amounts") === "1";
 let chatAgent = "bookkeeping", chats = {bookkeeping:[], food_health:[]}, attachments=[];
 let activeJob = "", loadingJob = false, selectedHistory = null;
@@ -99,9 +99,10 @@ function renderNavigation() {
 function navigate(page) {selectedPage=page;renderNavigation();window.scrollTo({top:0,behavior:"instant"});if(page==="more")renderMore();}
 function workspaceLoadError(error) {
   if(error?.status===401)return m("登录已过期，请退出后重新登录。","ログインの有効期限が切れました。再ログインしてください。","Your session expired. Sign out and sign in again.");
-  if(error?.status)return m("电脑服务未能读取账本：","PC側で台帳を読み込めません：","The computer could not read the ledger: ")+error.message;
-  if(error?.name==="AbortError")return m("账本加载超时。请确认电脑服务仍在运行，然后重试。","台帳の読み込みがタイムアウトしました。PC側のサービスを確認して再試行してください。","Ledger loading timed out. Check that the computer service is running, then retry.");
-  return m("暂时连不上电脑。电脑连接本手机热点也可以；请保持热点和电脑记账服务开启，并确认当前访问地址。","PCに接続できません。この端末のテザリングでも利用できます。テザリングとPC側のサービスを有効にし、アクセス先のアドレスを確認してください。","Cannot reach the computer. This phone's hotspot is supported; keep the hotspot and computer service on and check the current address.");
+  const cloud=typeof runtimeConfig!=="undefined"&&runtimeConfig?.deploymentMode==="cloud";
+  if(error?.status)return m(cloud?"云端服务未能读取账本：":"电脑服务未能读取账本：",cloud?"クラウドサービスで台帳を読み込めません：":"PC側で台帳を読み込めません：",cloud?"The cloud service could not read the ledger: ":"The computer could not read the ledger: ")+error.message;
+  if(error?.name==="AbortError")return cloud?m("云端账本加载超时，请稍后重试。","クラウド台帳の読み込みがタイムアウトしました。後で再試行してください。","Loading the cloud ledger timed out. Please try again."):m("账本加载超时。请确认电脑服务仍在运行，然后重试。","台帳の読み込みがタイムアウトしました。PC側のサービスを確認して再試行してください。","Ledger loading timed out. Check that the computer service is running, then retry.");
+  return cloud?m("暂时无法连接云端服务，请检查网络后重试。","クラウドサービスに接続できません。通信を確認して再試行してください。","Cannot reach the cloud service. Check your connection and try again."):m("暂时连不上电脑。电脑连接本手机热点也可以；请保持热点和电脑记账服务开启，并确认当前访问地址。","PCに接続できません。この端末のテザリングでも利用できます。テザリングとPC側のサービスを有効にし、アクセス先のアドレスを確認してください。","Cannot reach the computer. This phone's hotspot is supported; keep the hotspot and computer service on and check the current address.");
 }
 async function loadWorkspace(force=false) {
   if(!currentUser||!idb)return;
@@ -155,7 +156,7 @@ function renderDashboard() {
   const total=workspace.settings.monthly_jpy_budget_minor||"0";
   const remaining=BigInt(total)-BigInt(j.expense_minor);
   const percent=BigInt(total)>0n?Math.min(100,Math.max(0,Number(BigInt(j.expense_minor)*100n/BigInt(total)))):0;
-  root.innerHTML='<section class="hero-balance glass"><div class="hero-top"><span>'+m("本期净资产 · JPY","現在の純資産 · JPY","Net assets · JPY")+'</span><span class="live-badge">'+m("我的账本","マイ台帳","My ledger")+'</span></div><div class="hero-value">'+money(bal.net_assets.JPY)+'</div><p>'+m("人民币资产独立核算","人民元資産は別集計","CNY assets tracked separately")+' · '+money(bal.net_assets.CNY,"CNY")+'</p><div class="hero-actions">'+b("page",icon("plus")+" "+m("记一笔","記帳する","Record"),"entry","button hero-primary")+b("page",m("查看账户","口座を見る","Accounts"),"assets","button hero-secondary")+'</div></section>'+
+  root.innerHTML='<section class="hero-balance glass"><div class="hero-top"><span>'+m("总净资产 · JPY","総純資産 · JPY","Total net assets · JPY")+'</span><span class="live-badge">'+m("我的账本","マイ台帳","My ledger")+'</span></div><div class="hero-value">'+money(bal.net_assets.JPY)+'</div><p>'+m("人民币资产独立核算","人民元資産は別集計","CNY assets tracked separately")+' · '+money(bal.net_assets.CNY,"CNY")+'</p><div class="hero-actions">'+b("page",icon("plus")+" "+m("记一笔","記帳する","Record"),"entry","button hero-primary")+b("page",m("查看账户","口座を見る","Accounts"),"assets","button hero-secondary")+'</div></section>'+
     '<div class="metrics-grid">'+metric(m("本期支出","今期の支出","Period spending"),money(j.expense_minor),p.start+" — "+p.through,"expense-metric")+metric(m("本期收入","今期の収入","Period income"),money(j.income_minor),m("含人民币参考汇率折算","人民元の参考換算を含む","Includes CNY reference conversion"),"income-metric")+'</div>'+
     '<section class="panel budget-card"><div class="section-heading"><h2>'+m("预算，还剩","予算の残り","Room in your budget")+'</h2>'+b("module",icon("arrow"),"budget","icon-button")+'</div><strong class="budget-value">'+money(remaining)+'</strong><div class="budget-track"><progress max="100" value="'+percent+'"></progress></div><div class="spread muted"><span>'+m("已用","使用済み","Used")+' '+percent+'%</span><span>'+m("预算","予算","Budget")+' '+money(total)+'</span></div></section>'+
     '<section class="panel"><div class="section-heading"><h2>'+m("钱花在哪里","支出の内訳","Where it went")+'</h2>'+b("module",m("报表","レポート","Reports"),"reports","text-button accent")+'</div>'+categoryBars(j.categories)+'</section>'+
@@ -171,7 +172,8 @@ function categoryBars(categories={}) {
 function txCard(row) {
   const arrow=row.kind==="income"?"↙":row.kind==="transfer"?"⇄":"↗";
   const account=row.kind==="transfer"?(row.account_name||"")+" → "+(row.to_account_name||""):row.account_name||m("备查","メモ","Memo");
-  return '<button class="transaction-card" data-action="tx-detail" data-id="'+e(row.id)+'"><span class="transaction-icon kind-'+e(row.kind)+'">'+arrow+'</span><span class="transaction-description"><strong>'+e(row.description)+'</strong><small>'+e(row.category_name||t(row.kind))+' · '+e(account)+'</small><time>'+e(row.occurred_on)+(row.needs_review&&row.needs_review!=="0"?" · "+t("review"):"")+'</time></span><span class="transaction-amount kind-'+e(row.kind)+'">'+(row.kind==="income"?"+":"")+money(row.amount_minor,row.currency,row.currency_minor_digits||row.minor_digits)+'</span></button>';
+  const sign=row.kind==="income"?"+":row.kind==="expense"?"−":"";
+  return '<button class="transaction-card" data-action="tx-detail" data-id="'+e(row.id)+'"><span class="transaction-icon kind-'+e(row.kind)+'">'+arrow+'</span><span class="transaction-description"><strong>'+e(row.description)+'</strong><small>'+e(row.category_name||t(row.kind))+' · '+e(account)+'</small><time>'+e(row.occurred_on)+(row.needs_review&&row.needs_review!=="0"?" · "+t("review"):"")+'</time></span><span class="transaction-amount kind-'+e(row.kind)+'">'+sign+money(row.amount_minor,row.currency,row.currency_minor_digits||row.minor_digits)+'</span></button>';
 }
 function renderMobileTransactions() {
   const node=$("#ledgerList");if(!node)return;
@@ -196,8 +198,9 @@ function renderCredits() {
     (cards.map((card,i)=>'<article class="credit-card credit-'+i%3+'"><div class="spread"><h3>'+e(card.name)+'</h3>'+icon("card")+'</div><span>'+m("当前可用额度","利用可能額","Available credit")+'</span><strong>'+ (card.available_minor===null?"—":money(card.available_minor,card.currency,card.minor_digits))+'</strong><div class="credit-details"><span>'+m("总额度","利用限度額","Total limit")+'<b>'+(card.limit_minor===null?"—":money(card.limit_minor,card.currency,card.minor_digits))+'</b></span><span>'+m("欠款估算","債務の目安","Estimated debt")+'<b>'+(card.debt_estimate_minor===null?"—":money(card.debt_estimate_minor,card.currency,card.minor_digits))+'</b></span></div><p>'+m("快照","スナップショット","Snapshot")+' '+e(hiddenAmounts?"••••":card.snapshot_date||"—")+'</p><div class="button-row">'+b("credit-snapshot",m("录入快照","枠を入力","Snapshot"),card.account_id)+b("credit-repay",m("还款","返済","Repay"),card.account_id)+b("credit-history",m("恢复额度快照","枠履歴を復元","Restore snapshot"),card.account_id)+b("credit-plan",m("应还计划","返済予定","Due plan"),card.account_id)+(card.repayment_schedule?b("credit-toggle",card.repayment_schedule.enabled==="1"?m("暂停计划","予定を停止","Pause plan"):m("启用计划","予定を有効化","Enable plan"),card.account_id):"")+'</div></article>').join("")||empty(m("先登记一张信用卡","カードを追加してください","Add your first credit card")));
 }
 function renderAssets() {
+  const balanceRows=workspace?.balanceSheet?.rows||[];
   $("#fixedPanel").innerHTML='<div class="section-heading"><h2>'+m("固定资产","固定資産","Fixed assets")+'</h2>'+b("asset-edit",icon("plus"),"","icon-button")+'</div>'+
-    (workspace?.assets||[]).map(asset=>'<article class="panel asset-card"><div class="spread"><h3>'+e(asset.name)+'</h3>'+b("asset-edit",m("编辑","編集","Edit"),asset.id,"text-button accent")+'</div><strong class="asset-price">'+money(asset.cost_minor,asset.currency)+'</strong><p class="muted">'+e(asset.acquisition_month)+" · "+e(asset.useful_life_months)+" "+m("个月直线折旧","か月の定額償却","months straight-line depreciation")+'</p><div class="button-row">'+b("asset-toggle",asset.include_in_balance_sheet==="1"?m("已计入报表","集計対象","Included"):m("未计入报表","集計対象外","Excluded"),asset.id)+b("asset-delete",m("删除","削除","Delete"),asset.id,"button danger-text")+'</div></article>').join("");
+    (workspace?.assets||[]).map(asset=>{const row=balanceRows.find(item=>String(item.asset_id)===String(asset.id));const original=row?.original_cost_minor??asset.cost_minor;const depreciation=BigInt(row?.accumulated_depreciation_minor||"0");return '<article class="panel asset-card"><div class="spread"><h3>'+e(asset.name)+'</h3>'+b("asset-edit",m("编辑","編集","Edit"),asset.id,"text-button accent")+'</div><strong class="asset-price">'+money(original,asset.currency)+'</strong><p class="muted asset-depreciation">'+m("累计折旧","累計減価償却","Accumulated depreciation")+' <strong>'+(depreciation>0n?"−":"")+money(depreciation.toString(),asset.currency)+'</strong></p><div class="button-row">'+b("asset-toggle",asset.include_in_balance_sheet==="1"?m("已计入报表","集計対象","Included"):m("未计入报表","集計対象外","Excluded"),asset.id)+b("asset-delete",m("删除","削除","Delete"),asset.id,"button danger-text")+'</div></article>';}).join("");
 }
 const modules=()=>[
   ["rules","card",m("付款方式与扣款顺序","支払ルールと優先順位","Payment rules"),m("用途匹配，按账户顺序扣款","用途と口座優先順位","Scenarios and account priorities")],
@@ -211,12 +214,26 @@ const modules=()=>[
   ["install","plus",m("安装到 iPhone","iPhoneにインストール","Install on iPhone"),m("添加到主屏幕与离线使用","ホーム画面・オフライン","Home Screen and offline access")],
 ];
 function renderMore() {
-  $("#moreMenu").innerHTML=modules().map(([id,ico,title,subtitle])=>'<button class="module-row" data-action="module" data-id="'+id+'"><span class="module-icon">'+icon(ico)+'</span><span><strong>'+title+'</strong><small>'+subtitle+'</small></span>'+icon("arrow")+'</button>').join("");
+  const catalog=favoriteCatalog(),saved=getFavorites(),editing=favoritesEditing;
+  const favorites='<section class="mobile-favorites"><div class="section-heading"><h2>'+m("常用功能","よく使う機能","Quick access")+'</h2><div class="favorite-tools">'+b("favorites-edit",editing?m("完成","完了","Done"):m("编辑","編集","Edit"),"","text-button accent")+b("favorites-add",icon("plus"),"","icon-button")+'</div></div>'+
+    (saved.length?'<div class="favorite-grid">'+saved.map(id=>{const item=catalog.find(row=>row.id===id);return item?'<div class="favorite-item">'+b("favorite",'<span class="module-icon">'+icon(item.icon)+'</span><strong>'+item.title+'</strong>',id,"favorite-tile")+(editing?b("favorite-remove","×",id,"favorite-remove"):'')+'</div>':"";}).join("")+'</div>':'<p class="muted">'+m("点击 + 添加常用功能。","＋から機能を追加できます。","Tap + to add shortcuts.")+'</p>')+
+    (editing?'<div class="favorite-picker"><p>'+m("添加常用功能","機能を追加","Add a shortcut")+'</p><div class="favorite-options">'+catalog.filter(item=>!saved.includes(item.id)).map(item=>b("favorite-add",icon(item.icon)+" "+item.title,item.id,"text-button")).join("")+'</div></div>':"")+'</section>';
+  $("#moreMenu").innerHTML=favorites+modules().map(([id,ico,title,subtitle])=>'<button class="module-row" data-action="module" data-id="'+id+'"><span class="module-icon">'+icon(ico)+'</span><span><strong>'+title+'</strong><small>'+subtitle+'</small></span>'+icon("arrow")+'</button>').join("");
   $("#moreMenu").classList.toggle("hidden",!!moreTab);
   $("#modulePanel").classList.toggle("hidden",!moreTab||moreTab==="backup"||moreTab==="settings");
   $("#backupPage").classList.toggle("hidden",moreTab!=="backup");
   if(moreTab && !["backup","settings"].includes(moreTab))renderModule(moreTab);
 }
+function favoriteCatalog(){return [
+  {id:"home",icon:"home",title:m("总览","概要","Overview")},
+  {id:"entry",icon:"chat",title:m("记账","記帳","Record")},
+  {id:"ledger",icon:"book",title:m("账单记录","取引一覧","Ledger")},
+  {id:"assets",icon:"wallet",title:m("资产","資産","Assets")},
+  ...modules().map(([id,ico,title])=>({id,icon:ico,title}))
+];}
+function getFavorites(){const key="hh-mobile-favorites:"+(currentUser?.id||"guest");try{const stored=localStorage.getItem(key);const values=stored===null?["ledger","assets","reports"]:JSON.parse(stored);const allowed=new Set(favoriteCatalog().map(item=>item.id));return Array.isArray(values)?[...new Set(values.filter(id=>allowed.has(id)))].slice(0,8):["ledger","assets","reports"];}catch{return ["ledger","assets","reports"];}}
+function saveFavorites(values){localStorage.setItem("hh-mobile-favorites:"+(currentUser?.id||"guest"),JSON.stringify(values));}
+function openFavorite(id){if(["home","entry","ledger","assets"].includes(id)){navigate(id);return;}navigate("more");if(id==="settings")return editSettings();if(id==="rules")return editRules();moreTab=id;renderMore();}
 function moduleHeader(id) {
   const item=modules().find(row=>row[0]===id);
   return '<div class="module-header">'+b("module-back",m("‹ 更多","‹ その他","‹ More"),"","text-button accent")+'<h2>'+e(item?.[2]||"")+'</h2></div>';
@@ -244,7 +261,13 @@ function renderModule(id) {
       '<h3>'+m("食用记录","食事記録","Meals")+'</h3>'+w.eaten.map(row=>'<div class="panel food-row"><div><strong>'+e(row.item_name)+'</strong><small>'+e(row.consumed_on)+" · "+e(row.meal)+" · "+e(row.quantity_text)+'</small></div>'+b("food-delete",m("删除","削除","Delete"),"eaten:"+row.id,"text-button danger-text")+'</div>').join("");
   }
   if(id==="categories")content+='<div class="button-row">'+b("category-add",icon("plus")+" "+m("添加类别","カテゴリを追加","Add category"))+'</div><section class="panel">'+(cachedBootstrap?.categories||[]).map((row,index)=>'<div class="report-row"><div><strong>'+e(row.display_name)+'</strong><small>'+e(t(row.kind))+" · "+e(row.name)+'</small></div>'+b("category-edit",m("翻译","表示名","Translate"),index,"text-button accent")+'</div>').join("")+'</section>';
-  if(id==="install")content+='<section class="panel installation"><div class="install-symbol">'+icon("plus")+'</div><h3>'+m("让记账住进你的主屏幕","ホーム画面に家計簿を","A place on your Home Screen")+'</h3><ol><li>'+m("在 iPhone Safari 打开当前 HTTPS 地址。","iPhoneのSafariでこのHTTPSアドレスを開きます。","Open this HTTPS address in Safari on iPhone.")+'</li><li>'+m("点“分享”，选择“添加到主屏幕”。","共有から「ホーム画面に追加」を選択。","Tap Share, then Add to Home Screen.")+'</li><li>'+m("开启“作为网页 App 打开”（如有），再点“添加”。","表示される場合はWebアプリとして開くを有効にし「追加」。","Enable Open as Web App if shown, then tap Add.")+'</li></ol><p>'+m("同 Wi-Fi 测试时，电脑需保持开机并运行服务。离线可暂存手动账目；Agent 和云备份需要连接服务。","同じWi-FiでのテストはPCとサービスの起動が必要です。オフラインでは手動取引を保存できます。","For Wi-Fi testing, keep the computer and service running. Manual entries can be queued offline; agents and cloud backups need a connection.")+'</p><p class="address-display">'+e(location.origin)+'</p><a class="button secondary" href="/test-ca.cer">'+m("下载本机测试证书","テスト証明書を取得","Download test certificate")+'</a></section>';
+  if(id==="install"){
+    const cloud=typeof runtimeConfig!=="undefined"&&runtimeConfig?.deploymentMode==="cloud";
+    const installHelp=cloud
+      ?m("添加后可从主屏幕快速打开。手动账目可离线暂存，重新联网后同步；Agent 和云备份需要网络。","ホーム画面からすぐ開けます。手動記録はオフラインで一時保存でき、再接続後に同期します。Agent とクラウドバックアップには通信が必要です。","Open it quickly from your Home Screen. Manual entries can queue offline and sync when reconnected; Agents and cloud backups need a connection.")
+      :m("同 Wi-Fi 测试时，电脑需保持开机并运行服务。离线可暂存手动账目；Agent 和云备份需要连接服务。","同じWi-FiでのテストはPCとサービスの起動が必要です。オフラインでは手動取引を保存できます。","For Wi-Fi testing, keep the computer and service running. Manual entries can be queued offline; Agents and cloud backups need a connection.");
+    content+='<section class="panel installation"><div class="install-symbol">'+icon("plus")+'</div><h3>'+m("让记账住进你的主屏幕","ホーム画面に家計簿を","A place on your Home Screen")+'</h3><ol><li>'+m("在 iPhone Safari 打开当前 HTTPS 地址。","iPhoneのSafariでこのHTTPSアドレスを開きます。","Open this HTTPS address in Safari on iPhone.")+'</li><li>'+m("点“分享”，选择“添加到主屏幕”。","共有から「ホーム画面に追加」を選択。","Tap Share, then Add to Home Screen.")+'</li><li>'+m("开启“作为网页 App 打开”（如有），再点“添加”。","表示される場合はWebアプリとして開くを有効にし「追加」。","Enable Open as Web App if shown, then tap Add.")+'</li></ol><p>'+installHelp+'</p><p class="address-display">'+e(location.origin)+'</p>'+(cloud?"":'<a class="button secondary" href="/test-ca.cer">'+m("下载本机测试证书","テスト証明書を取得","Download test certificate")+'</a>')+'</section>';
+  }
   root.innerHTML=content;
 }
 function trendChart() {
@@ -297,13 +320,14 @@ async function openForm(title, fields, submit, options={}) {
     try{await submit(data);dialog.close();}catch(error){showToast(error.message,true);}
     finally{delete $("#editorForm").dataset.busy;$("#editorSave").disabled=false;}
   };
+  options.onReady?.();
 }
 async function guarded(callback){try{return await callback();}catch(error){showToast(error.message,true);}}
 async function confirmOnce(target,impact) {
   return confirm(target+"\n\n"+impact);
 }
 async function runAction(action,data={},progress=null,refresh=true) {
-  if(!navigator.onLine||!serverReachable)throw new Error(m("此操作需要连接电脑服务；内容还在当前编辑页。","この操作にはサービスへの接続が必要です。入力は編集画面に残っています。","This action needs the computer service. Your input remains in the editor."));
+  if(!navigator.onLine||!serverReachable)throw new Error(m("此操作需要连接服务；内容还在当前编辑页。","この操作にはサービスへの接続が必要です。入力は編集画面に残っています。","This action needs a connection. Your input remains in the editor."));
   const owner=currentUser?.id;if(!owner)throw new Error(t("login"));
   const opId=crypto.randomUUID();
   let job=await api("/api/action",{method:"POST",body:JSON.stringify({action,data,opId})});
@@ -478,6 +502,11 @@ async function handleMobileClick(event) {
     if(action==="workspace-retry"){workspaceError="";renderMobile();return loadWorkspace(true);}
     if(action==="asset-tab"){assetTab=id;renderAssetTabs();return;}
     if(action==="module-back"){moreTab="";renderMore();return;}
+    if(action==="favorites-edit"){favoritesEditing=!favoritesEditing;renderMore();return;}
+    if(action==="favorites-add"){favoritesEditing=true;renderMore();document.querySelector(".favorite-picker")?.scrollIntoView({behavior:"smooth",block:"nearest"});return;}
+    if(action==="favorite-remove"){saveFavorites(getFavorites().filter(item=>item!==id));showToast(m("已移除常用功能","ショートカットを削除しました","Shortcut removed"));renderMore();return;}
+    if(action==="favorite-add"){const values=getFavorites();if(!values.includes(id)&&values.length<8){values.push(id);saveFavorites(values);showToast(m("已添加常用功能","ショートカットを追加しました","Shortcut added"));}else if(values.length>=8)showToast(m("最多添加 8 个常用功能","ショートカットは8件までです","You can add up to 8 shortcuts"),true);favoritesEditing=false;renderMore();return;}
+    if(action==="favorite")return openFavorite(id);
     if(action==="module"){navigate("more");if(id==="settings")return editSettings();if(id==="rules")return editRules();moreTab=id;renderMore();return;}
     if(action==="add-card"){navigate("assets");assetTab="cash";renderAssetTabs();$("#accountForm").classList.remove("hidden");$("#accountForm [name=type]").value="credit";$("#accountForm [name=name]").focus();return;}
     if(action==="backup"){await runAction("backup");showToast(m("备份已创建","バックアップを作成しました","Backup created"));return;}
@@ -536,8 +565,47 @@ async function handleMobileClick(event) {
     if(action==="tx-detail"){
       const row=[...(ledgerRangeRows||[]),...workspace.transactions].find(row=>row.id===id);if(!row)return;
       $("#editorTitle").textContent=m("账单详情","取引の詳細","Entry details");$("#editorCancel").textContent=m("关闭","閉じる","Close");$("#editorSave").classList.add("hidden");$("#editorFooter").replaceChildren();$("#editorForm").onsubmit=event=>event.preventDefault();
-      $("#editorBody").innerHTML='<strong class="detail-amount">'+money(row.amount_minor,row.currency,row.currency_minor_digits)+'</strong><p class="prewrap">'+e(row.description)+'</p>'+["occurred_on","category_name","account_name","to_account_name","balance_effect"].map(key=>row[key]?'<div class="report-row"><span>'+e({occurred_on:t("date"),category_name:t("category"),account_name:t("fromAccount"),to_account_name:t("toAccount"),balance_effect:t("status")}[key])+'</span><strong>'+e(row[key])+'</strong></div>':"").join("")+'<div class="button-row">'+(row.needs_review==="1"?b("tx-review",m("核对并确认","確認する","Review & confirm"),id):"")+b("tx-delete",m("删除这笔账","取引を削除","Delete this entry"),id,"button danger-text")+'</div>';
+      const sign=row.kind==="income"?"+":row.kind==="expense"?"−":"";
+      $("#editorBody").innerHTML='<strong class="detail-amount kind-'+e(row.kind)+'">'+sign+money(row.amount_minor,row.currency,row.currency_minor_digits)+'</strong><p class="prewrap">'+e(row.description)+'</p>'+["occurred_on","category_name","account_name","to_account_name","balance_effect"].map(key=>row[key]?'<div class="report-row"><span>'+e({occurred_on:t("date"),category_name:t("category"),account_name:t("fromAccount"),to_account_name:t("toAccount"),balance_effect:t("status")}[key])+'</span><strong>'+e(row[key])+'</strong></div>':"").join("")+'<div class="button-row">'+(row.needs_review==="1"?b("tx-review",m("核对并确认","確認する","Review & confirm"),id):"")+b("tx-edit",m("编辑账单","取引を編集","Edit entry"),id)+b("tx-delete",m("删除这笔账","取引を削除","Delete this entry"),id,"button danger-text")+'</div>';
       $("#editorDialog").showModal();$("#editorDialog").addEventListener("close",()=>$("#editorSave").classList.remove("hidden"),{once:true});return;
+    }
+    if(action==="tx-edit"){
+      const row=[...(ledgerRangeRows||[]),...workspace.transactions].find(row=>row.id===id);if(!row)return;
+      const accounts=(cachedBootstrap?.accounts||[]).map(account=>[account.name,account.name+" · "+account.currency]);
+      const accountOptions=[["",m("不指定账户","口座なし","No account")],...accounts];
+      const currencies=[...new Set([row.currency,...(cachedBootstrap?.accounts||[]).map(account=>account.currency)])].map(code=>[code,code]);
+      const categories=(cachedBootstrap?.categories||[]).map(item=>[item.name,item.display_name,item.kind]);
+      if(row.category_name&&!categories.some(item=>item[0]===row.category_name))categories.push([row.category_name,row.category_name,row.kind]);
+      const categoryOptions=[["",m("请选择类别","カテゴリを選択","Choose a category")],...categories.filter(item=>item[2]===row.kind||item[0]===row.category_name).map(([name,label])=>[name,label])];
+      const digits=Number(row.currency_minor_digits??row.minor_digits??(row.currency==="CNY"?2:0));
+      const toDigits=Number(row.to_minor_digits??digits);
+      return openForm(m("编辑账单","取引を編集","Edit entry"),[
+        field("date",t("date"),"date",row.occurred_on),
+        field("kind",t("type"),"select",row.kind,[["expense",t("expense")],["income",t("income")],["transfer",t("transfer")]]),
+        field("description",m("说明","内容","Description"),"text",row.description||""),
+        field("currency",t("currency"),"select",row.currency,currencies),
+        amountField("amount",t("amount"),plainAmount(row.amount_minor,digits)),
+        {...field("account_name",t("account"),"select",row.account_name||"",accountOptions),optional:true},
+        {...field("category_name",t("category"),"select",row.category_name||"",categoryOptions),optional:true},
+        {...field("to_account_name",m("转入账户","振込先口座","Destination account"),"select",row.to_account_name||"",accountOptions),optional:true},
+        {...amountField("to_amount",m("转入金额（跨币种时填写）","入金額（異なる通貨の場合）","Destination amount (for FX transfers)"),row.to_amount_minor?plainAmount(row.to_amount_minor,toDigits):""),optional:true},
+        field("memo_only",m("备查记录（不影响账户余额）","メモ記録（残高に反映しない）","Memo only (does not affect balances)"),"checkbox",row.balance_effect==="memo"),
+        field("needs_review",m("待核对","要確認","Needs review"),"checkbox",row.needs_review==="1"),
+      ],async data=>{const result=await runAction("edit_transaction",{id,...data});showToast(m("账单已保存，修改前备份已保留。","取引を保存し、変更前のバックアップを保管しました。","Entry saved. A pre-edit backup was kept."));return result;},{note:m("保存前会自动完整备份；信用卡自动还款流水需在还款计划中修改。","保存前に完全バックアップします。カード自動返済の流水は返済予定から変更してください。","A full backup is created before saving. Automatic card repayment entries must be changed in the repayment plan."),onReady:()=>{
+        const kindSelect=$("#edit-kind"),categorySelect=$("#edit-category_name"),categoryLabel=categorySelect?.closest("label.field");
+        const toggleKind=()=>{
+          const transfer=kindSelect.value==="transfer";
+          for(const name of ["category_name","to_account_name","to_amount","memo_only"]){const input=$("#edit-"+name),label=input?.closest("label");if(label)label.classList.toggle("hidden",transfer?!["to_account_name","to_amount"].includes(name):["to_account_name","to_amount"].includes(name));}
+          if(categoryLabel)categoryLabel.classList.toggle("hidden",transfer);
+          if(categorySelect){const previous=categorySelect.value;const choices=categories.filter(item=>item[2]===kindSelect.value).map(([name,label])=>[name,label]);categorySelect.replaceChildren(new Option(m("请选择类别","カテゴリを選択","Choose a category"),""),...choices.map(([name,label])=>new Option(label,name)));if(choices.some(([name])=>name===previous))categorySelect.value=previous;}
+          if(categorySelect)categorySelect.required=!transfer;
+          const destination=$("#edit-to_account_name");if(destination)destination.required=transfer;
+          if(accountSelect)accountSelect.required=transfer||!memo?.checked;
+        };
+        const memo=$("#edit-memo_only"),accountSelect=$("#edit-account_name");
+        kindSelect?.addEventListener("change",toggleKind);toggleKind();
+        memo?.addEventListener("change",()=>{if(accountSelect)accountSelect.required=kindSelect.value==="transfer"||!memo.checked;});
+      }});
     }
     if(action==="tx-delete"){const row=[...(ledgerRangeRows||[]),...workspace.transactions].find(row=>row.id===id);if(await confirmOnce(m("删除账目：","取引を削除：","Delete entry: ")+row.description,m("账户余额与相关额度恢复点会重新计算；操作前保留完整备份。","残高と関連する利用枠を再計算します。先に完全バックアップします。","Balances and related credit recovery points will be recalculated after a full backup."))){await runAction("delete_transaction",{id,confirmed:true});$("#editorDialog").close();}return;}
     if(action==="tx-review"){const row=[...(ledgerRangeRows||[]),...workspace.transactions].find(row=>row.id===id);if(row.balance_effect==="memo"){return openForm(m("确认实际账户","実際の口座を確認","Confirm actual account"),[accountField()],data=>runAction("review_transaction",{id,...data}));}await runAction("review_transaction",{id});$("#editorDialog").close();}

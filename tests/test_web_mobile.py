@@ -62,6 +62,33 @@ class MobileWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(scope), 7)
         self.assertTrue(all(scope.values()))
 
+    def test_mobile_can_edit_transaction_and_keeps_pre_edit_backup(self):
+        db_path = self.ws.db_path(self.uid)
+        db = Database(db_path)
+        transaction_id = db.add_transaction(
+            occurred_on="2026-10-22", kind="expense", amount="12",
+            currency="JPY", description="Before edit", category_name="餐饮",
+            account_name="Test bank",
+        )
+        db.close()
+
+        result = self.action("edit_transaction", {
+            "id": transaction_id, "date": "2026-10-23", "kind": "expense",
+            "amount": "30", "currency": "JPY", "description": "Corrected entry",
+            "category_name": "餐饮", "account_name": "Test bank",
+            "needs_review": False,
+        })["result"]
+
+        db = Database(db_path)
+        row = db.connection.execute(
+            "SELECT occurred_on,amount_minor,description FROM transactions WHERE id=?",
+            (transaction_id,),
+        ).fetchone()
+        db.close()
+        self.assertEqual(tuple(row), ("2026-10-23", 30, "Corrected entry"))
+        self.assertTrue(result["backup"].endswith(".sqlite3"))
+        self.assertTrue((db_path.parent / "backups" / result["backup"]).is_file())
+
     def test_migrated_skills_use_current_account_files(self):
         folder = self.ws.folder(self.uid)
         restored = folder / "restored_skills"
@@ -284,6 +311,19 @@ class MobileWorkspaceTests(unittest.TestCase):
                 opener.open(bad)
             self.assertEqual(error.exception.code, 403)
             error.exception.close()
+        finally:
+            self.server.shutdown()
+            thread.join(3)
+
+    def test_cloud_runtime_is_reported_to_the_mobile_install_screen(self):
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{self.server.server_port}"
+            with patch.dict("os.environ", {"HOUSEHOLD_WEB_CLOUD_RUNTIME": "1"}):
+                with urllib.request.urlopen(base + "/api/config") as response:
+                    config = json.load(response)
+            self.assertEqual(config["deploymentMode"], "cloud")
         finally:
             self.server.shutdown()
             thread.join(3)
