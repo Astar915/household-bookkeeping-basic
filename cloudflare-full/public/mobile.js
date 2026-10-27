@@ -343,6 +343,7 @@ async function runAction(action,data={},progress=null,refresh=true) {
   if(currentUser?.id!==owner)throw new Error(t("logout"));
   localStorage.removeItem("hh-active-job:"+owner);activeJob="";
   if(job.state!=="done")throw new Error(localizeServerError(job.result?.error||job.message||m("操作未完成","操作未完了","Action did not complete")));
+  if(job.cloudSnapshotSaved===false)showToast(m("操作已完成，但云端快照未能保存。请保持服务运行并稍后重试备份。","操作は完了しましたが、クラウドスナップショットを保存できませんでした。サービスを終了せず、後でバックアップを再試行してください。","The action completed, but its cloud snapshot was not saved. Keep the service running and retry the backup later."),true);
   if(refresh){await fetchBootstrap();await loadWorkspace(true);if($("#historyStart").value||$("#historyEnd").value)await loadLedgerRange();}
   return job.result;
 }
@@ -426,6 +427,7 @@ async function editSettings() {
   settingsDraft=deepCopy(workspace.preferences);
   const cfg=settingsDraft;
   const skillWarning=agent=>cfg.skillErrors?.[agent]?'<p role="alert" class="fineprint">'+m("此 Agent 的 Skill 无法读取。请恢复默认文本或粘贴有效内容后保存；账本仍可正常查看。","このAgentのSkillを読み込めません。初期値を復元するか内容を貼り付けて保存してください。台帳は引き続き表示できます。","This agent's skill cannot be read. Restore the default text or paste valid content and save. The ledger remains available.")+'</p>':"";
+  const cloudRuntime=typeof runtimeConfig!=="undefined"&&runtimeConfig?.deploymentMode==="cloud";
   let appearanceDraft=window.HouseholdAppearance.mode;
   const render=()=>{
     $("#editorTitle").textContent=m("设置与 Skill","設定とSkill","Settings & skills");
@@ -436,7 +438,7 @@ async function editSettings() {
       '<label class="check-row"><input type="checkbox" data-profile-key="thinking_enabled" '+(p.thinking_enabled?"checked":"")+'><span>'+m("思考模式（支持的服务）","思考モード（対応API）","Thinking mode (supported providers)")+'</span></label><label class="field"><span>'+m("思考强度","思考強度","Reasoning effort")+'</span><select data-profile-key="reasoning_effort">'+["low","high","max"].map(value=>'<option '+(p.reasoning_effort===value?"selected":"")+'>'+value+'</option>').join("")+'</select></label></section>').join("")+'</div>'+
       ["bookkeeping","food_health"].map(agent=>'<section class="skill-editor"><h3>'+ (agent==="bookkeeping"?m("记账 Agent","記帳Agent","Ledger agent"):m("饮食健康 Agent","食生活Agent","Food agent"))+'</h3>'+["agents","visionAgents"].map(group=>'<label class="field"><span>'+ (group==="agents"?m("文字服务","テキスト用","Text service"):m("图片服务","画像用","Image service"))+'</span><select data-agent="'+agent+'" data-group="'+group+'"><option value="">'+m("请选择","選択してください","Choose a service")+'</option>'+cfg.profiles.map(p=>'<option value="'+e(p.id)+'" '+(cfg[group][agent]===p.id?"selected":"")+'>'+e(p.name)+'</option>').join("")+'</select></label>').join("")+
       skillWarning(agent)+'<div class="spread"><label for="skill-'+agent+'">'+m("Skill 文本 · 复制粘贴后编辑","Skillテキスト・貼り付けて編集","Skill text · paste and edit")+'</label>'+b("skill-default",m("恢复默认","初期値に戻す","Restore default"),agent,"text-button accent")+'</div><textarea id="skill-'+agent+'" class="skill-text" data-skill="'+agent+'" spellcheck="false" rows="12">'+e(cfg.skills[agent]||"")+'</textarea><p class="fineprint">'+m("此文本会随该 Agent 的请求发送给你选择的模型服务。","このテキストは選択したモデルへのリクエストに含まれます。","This text is included in requests to the model service you select.")+'</p></section>').join("")+
-      '<label class="check-row"><input id="settings-save-images" type="checkbox" '+(cfg.saveImages?"checked":"")+'><span>'+m("保存记账小票图片","記帳画像を保存","Save receipt images")+'</span></label>';
+      (cloudRuntime?"":'<label class="check-row"><input id="settings-save-images" type="checkbox" '+(cfg.saveImages?"checked":"")+'><span>'+m("保存记账小票图片","記帳画像を保存","Save receipt images")+'</span></label>');
     $("#editorFooter").innerHTML=b("settings-apply",m("应用","適用","Apply"),"","button primary");
   };
   const capture=()=>{
@@ -447,7 +449,7 @@ async function editSettings() {
       if(cfg.skillErrors?.[agent]&&!input.value.trim())delete cfg.skills[agent];
       else cfg.skills[agent]=input.value;
     });
-    cfg.saveImages=$("#settings-save-images").checked;
+    const imageSaveToggle=$("#settings-save-images");if(imageSaveToggle)cfg.saveImages=imageSaveToggle.checked;
     appearanceDraft=$("#settings-appearance").value;
   };
   render();$("#editorDialog").showModal();

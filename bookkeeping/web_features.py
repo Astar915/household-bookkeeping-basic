@@ -128,6 +128,10 @@ class MobileWorkspace:
     def db_path(self, uid):
         return self.server.ledger_dir / f"{uid}.sqlite3"
 
+    @staticmethod
+    def receipt_image_archive_enabled():
+        return os.environ.get("HOUSEHOLD_WEB_DISABLE_RECEIPT_IMAGE_ARCHIVE") != "1"
+
     def config(self, uid):
         path = self.folder(uid) / "settings.enc"
         if path.exists():
@@ -139,7 +143,9 @@ class MobileWorkspace:
         value.setdefault("visionAgents", dict(value["agents"]))
         value.setdefault("scope", dict(DEFAULT_BACKUP_SCOPE))
         value.setdefault("autoSync", True)
-        value.setdefault("saveImages", True)
+        value.setdefault("saveImages", self.receipt_image_archive_enabled())
+        if not self.receipt_image_archive_enabled():
+            value["saveImages"] = False
         value.setdefault("cloud", {})
         return value
 
@@ -259,6 +265,7 @@ class MobileWorkspace:
             body = create_sync_bundle(
                 self.db_path(uid), folder / name, **self.stores(uid),
                 include_scope=DEFAULT_BACKUP_SCOPE if full else cfg["scope"],
+                include_receipt_images=self.receipt_image_archive_enabled(),
                 max_bundle_bytes=512 * 1024 * 1024 if full else 60 * 1024 * 1024,
             )
         return name, body
@@ -582,7 +589,10 @@ class MobileWorkspace:
         if not any(cfg["scope"].values()):
             raise LedgerError("至少选择一项备份内容。")
         cfg["autoSync"] = bool(data.get("autoSync", cfg["autoSync"]))
-        cfg["saveImages"] = bool(data.get("saveImages", cfg["saveImages"]))
+        cfg["saveImages"] = (
+            self.receipt_image_archive_enabled()
+            and bool(data.get("saveImages", cfg["saveImages"]))
+        )
         for agent in ("bookkeeping", "food_health"):
             if self.conversations.get((uid, agent), {}).get("pending"):
                 raise LedgerError("请先完成或取消当前记账，再更改设置。")

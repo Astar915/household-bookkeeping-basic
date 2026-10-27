@@ -120,6 +120,9 @@ async function api(path, options = {}) {
     error.status = response.status;
     throw error;
   }
+  if (response.headers.get("X-Bookkeeping-Cloud-Saved") === "false" && value && typeof value === "object") {
+    Object.defineProperty(value, "cloudSnapshotSaved", {value:false});
+  }
   serverReachable = true;
   updateConnection();
   return value;
@@ -489,6 +492,7 @@ async function syncQueue() {
     for (let start = 0; start < queue.length; start += 100) {
       const batch = queue.slice(start,start + 100);
       const response = await api("/api/sync", {method:"POST", body:JSON.stringify({operations:batch.map(({opId,type,data,ownerId}) => ({opId,type,data,ownerId}))})});
+      if(response.cloudSnapshotSaved===false){const error=new Error(currentLanguage==="ja-JP"?"クラウドスナップショットを保存できませんでした。取引は端末の同期キューに残っています。後でもう一度お試しください。":currentLanguage==="en-US"?"The cloud snapshot was not saved. Entries remain in this device's sync queue; retry later.":"云端快照未保存；记录仍保留在本机待同步队列，请稍后重试。");error.cloudSnapshotFailed=true;throw error;}
       const results = new Map((response.results || []).map(item => [item.opId,item]));
       for (const item of batch) {
         const result = results.get(item.opId);
@@ -505,6 +509,13 @@ async function syncQueue() {
       showToast(t("syncFailed"), true);
     }
   } catch (error) {
+    if (error.cloudSnapshotFailed) {
+      const latest = await outboxAll();
+      await Promise.all(latest.map(item => outboxPut({...item,error:error.message})));
+      await renderOutbox();
+      showToast(error.message,true);
+      return;
+    }
     serverReachable = false;
     const latest = await outboxAll();
     await Promise.all(latest.map(item => outboxPut({...item,error:error.message || "offline"})));

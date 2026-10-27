@@ -4,6 +4,11 @@ const DATA_KEY = "household-bookkeeping/full-app/state.tar.gz";
 const INTERNAL_PREFIX = "/__internal/";
 const INTERNAL_TOKEN_KEY = "internal-token";
 const BUILD_KEY = "container-build";
+const R2_USAGE_KEY = "r2-free-usage-window";
+const R2_WINDOW_MS = 32 * 24 * 60 * 60 * 1000;
+const R2_RESERVATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const R2_FREE_GUARD = { classA: 100_000, classB: 1_000_000 };
+const MAX_R2_ARCHIVE_BYTES = 1024 * 1024 * 1024;
 const MUTATING_POSTS = new Set([
   "/api/auth/github/finish", "/api/register", "/api/login", "/api/recover",
   "/api/action", "/api/cancel-job", "/api/restore-bundle", "/api/logout",
@@ -36,6 +41,15 @@ function randomToken() {
   return [...value].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+class R2QuotaPause extends Error {
+  constructor(kind) {
+    super(kind === "classB"
+      ? "云端备份读取已达到免费安全额度，云端账本暂时休眠以避免 R2 超额费用；已保存数据不会删除，额度恢复后可继续使用。"
+      : "云端备份已达到免费安全额度，为避免 R2 超额费用，本次变更尚未写入云端。已有的离线队列仍保留，额度恢复后可重试。");
+    this.name = "R2QuotaPause";
+  }
+}
+
 export class BookkeepingRuntime extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -50,17 +64,60 @@ export class BookkeepingRuntime extends DurableObject {
     if (!sameOriginWrite(request)) return response("请求来源校验失败。", 403);
 
     return this.serial(async () => {
+      let reservationId = null;
+      let reservationType = "request";
+      let preserveReservation = false;
+      let temporaryJobReservation = false;
       try {
         await this.ensureStarted();
+        const method = request.method.toUpperCase();
+        const actionStart = path === "/api/action" && method === "POST";
+        const jobPoll = path === "/api/job" && method === "GET";
+        const directMutation = method === "POST" && MUTATING_POSTS.has(path) && !actionStart;
+
+        if (actionStart) {
+          // Reserve capacity for the acceptance snapshot and the final job
+          // snapshot before letting the Python app begin any ledger changes.
+          reservationId = await this.reserveClassA(2, "action");
+        } else if (directMutation) {
+          reservationId = await this.reserveClassA(1, "request");
+        } else if (jobPoll) {
+          reservationId = await this.findJobReservation();
+          if (!reservationId) {
+            reservationId = await this.reserveClassA(1, "job");
+            temporaryJobReservation = true;
+          }
+          reservationType = "job";
+        }
+
         const requestForContainer = this.forwardedRequest(request);
         const upstream = await this.port().fetch(requestForContainer);
+        if (!upstream.ok) {
+          if (reservationId && (!jobPoll || temporaryJobReservation)) await this.releaseClassA(reservationId);
+          return upstream;
+        }
         let persisted = null;
         if (isMutation(request, upstream)) {
-          if (path === "/api/job") {
-            const job = await upstream.clone().json().catch(() => null);
-            if (job?.state === "running") return upstream;
+          let job = null;
+          if (jobPoll) {
+            job = await upstream.clone().json().catch(() => null);
+            if (job?.state === "running") {
+              if (temporaryJobReservation && reservationId) await this.releaseClassA(reservationId);
+              return upstream;
+            }
+          } else if (actionStart) {
+            job = await upstream.clone().json().catch(() => null);
           }
-          persisted = await this.persistState();
+          if (!reservationId) reservationId = await this.reserveClassA(1, reservationType);
+          const actionStillRunning = actionStart && (!job || job.state === "running");
+          persisted = await this.persistState(reservationId, actionStillRunning ? "job" : null);
+          if (actionStillRunning) {
+            preserveReservation = true;
+          } else if (reservationId) {
+            await this.releaseClassA(reservationId);
+          }
+        } else if (reservationId) {
+          await this.releaseClassA(reservationId);
         }
         const headers = new Headers(upstream.headers);
         if (persisted !== null) headers.set("X-Bookkeeping-Cloud-Saved", persisted ? "true" : "false");
@@ -70,6 +127,10 @@ export class BookkeepingRuntime extends DurableObject {
           headers,
         });
       } catch (error) {
+        if (reservationId && !preserveReservation) await this.releaseClassA(reservationId).catch(() => {});
+        if (error instanceof R2QuotaPause) {
+          return response(error.message, 429, { "retry-after": "86400" });
+        }
         console.error("Bookkeeping cloud runtime request failed", error instanceof Error ? error.name : "unknown");
         return response("云端服务暂时不可用，请稍后重试。", 503, { "retry-after": "3" });
       }
@@ -83,6 +144,129 @@ export class BookkeepingRuntime extends DurableObject {
     await previous;
     try { return await task(); }
     finally { release(); }
+  }
+
+  async r2Usage() {
+    const now = Date.now();
+    const cutoff = new Date(now - R2_WINDOW_MS).toISOString().slice(0, 10);
+    const state = await this.ctx.storage.get(R2_USAGE_KEY) || { days: {} };
+    state.days ||= {};
+    let changed = false;
+    for (const [day, bucket] of Object.entries(state.days)) {
+      if (day < cutoff) {
+        delete state.days[day];
+        changed = true;
+        continue;
+      }
+      bucket.classA = Math.max(0, Number(bucket.classA) || 0);
+      bucket.classB = Math.max(0, Number(bucket.classB) || 0);
+      bucket.reservations ||= {};
+      for (const [id, reservation] of Object.entries(bucket.reservations)) {
+        if (Number(reservation.expiresAt) <= now || Number(reservation.count) <= 0) {
+          delete bucket.reservations[id];
+          changed = true;
+        }
+      }
+    }
+    if (changed) await this.ctx.storage.put(R2_USAGE_KEY, state);
+    return state;
+  }
+
+  r2Totals(state, kind) {
+    let used = 0;
+    let reserved = 0;
+    for (const bucket of Object.values(state.days)) {
+      used += Number(bucket[kind]) || 0;
+      if (kind === "classA") {
+        for (const reservation of Object.values(bucket.reservations || {})) {
+          reserved += Math.max(0, Number(reservation.count) || 0);
+        }
+      }
+    }
+    return { used, reserved };
+  }
+
+  async reserveClassA(count, type) {
+    const state = await this.r2Usage();
+    const totals = this.r2Totals(state, "classA");
+    if (totals.used + totals.reserved + count > R2_FREE_GUARD.classA) throw new R2QuotaPause("classA");
+    const now = Date.now();
+    const day = new Date(now).toISOString().slice(0, 10);
+    const bucket = state.days[day] ||= { classA: 0, classB: 0, reservations: {} };
+    bucket.reservations ||= {};
+    const id = randomToken();
+    bucket.reservations[id] = { count, type, expiresAt: now + R2_RESERVATION_TTL_MS };
+    await this.ctx.storage.put(R2_USAGE_KEY, state);
+    return id;
+  }
+
+  async findJobReservation() {
+    const state = await this.r2Usage();
+    const candidates = [];
+    for (const bucket of Object.values(state.days)) {
+      for (const [id, reservation] of Object.entries(bucket.reservations || {})) {
+        if (reservation.type === "job" && Number(reservation.count) > 0) {
+          candidates.push({ id, expiresAt: Number(reservation.expiresAt) || 0 });
+        }
+      }
+    }
+    candidates.sort((a, b) => a.expiresAt - b.expiresAt);
+    return candidates[0]?.id || null;
+  }
+
+  async releaseClassA(id) {
+    const state = await this.r2Usage();
+    let changed = false;
+    for (const bucket of Object.values(state.days)) {
+      if (bucket.reservations && Object.hasOwn(bucket.reservations, id)) {
+        delete bucket.reservations[id];
+        changed = true;
+      }
+    }
+    if (changed) await this.ctx.storage.put(R2_USAGE_KEY, state);
+  }
+
+  async recordClassB() {
+    const state = await this.r2Usage();
+    const totals = this.r2Totals(state, "classB");
+    if (totals.used + 1 > R2_FREE_GUARD.classB) throw new R2QuotaPause("classB");
+    const day = new Date().toISOString().slice(0, 10);
+    const bucket = state.days[day] ||= { classA: 0, classB: 0, reservations: {} };
+    bucket.classB += 1;
+    await this.ctx.storage.put(R2_USAGE_KEY, state);
+  }
+
+  async assertClassBCapacity() {
+    const state = await this.r2Usage();
+    const totals = this.r2Totals(state, "classB");
+    if (totals.used + 1 > R2_FREE_GUARD.classB) throw new R2QuotaPause("classB");
+  }
+
+  async recordClassA(id = null, remainingType = null) {
+    const state = await this.r2Usage();
+    let reservationBucket;
+    let reservation;
+    if (id) {
+      for (const bucket of Object.values(state.days)) {
+        const candidate = bucket.reservations?.[id];
+        if (candidate) { reservationBucket = bucket; reservation = candidate; break; }
+      }
+    }
+    if (reservation && Number(reservation.count) > 0) {
+      reservation.count -= 1;
+      if (reservation.count === 0) delete reservationBucket.reservations[id];
+      else {
+        reservation.type = remainingType || reservation.type;
+        reservation.expiresAt = Date.now() + R2_RESERVATION_TTL_MS;
+      }
+    } else {
+      const totals = this.r2Totals(state, "classA");
+      if (totals.used + totals.reserved + 1 > R2_FREE_GUARD.classA) throw new R2QuotaPause("classA");
+    }
+    const day = new Date().toISOString().slice(0, 10);
+    const bucket = state.days[day] ||= { classA: 0, classB: 0, reservations: {} };
+    bucket.classA += 1;
+    await this.ctx.storage.put(R2_USAGE_KEY, state);
   }
 
   port() {
@@ -125,6 +309,9 @@ export class BookkeepingRuntime extends DurableObject {
     }
 
     if (!container.running) {
+      // Refuse a cold start before paying container compute when the R2 read
+      // safety allowance is exhausted.
+      await this.assertClassBCapacity();
       container.start({
         image: container.images.base,
         instance: "basic",
@@ -135,6 +322,7 @@ export class BookkeepingRuntime extends DurableObject {
           HOUSEHOLD_WEB_DATA_DIR: "/data",
           HOUSEHOLD_WEB_ALLOW_REMOTE: "1",
           HOUSEHOLD_WEB_PUBLIC_ORIGIN: String(this.env.PUBLIC_ORIGIN || ""),
+          HOUSEHOLD_WEB_DISABLE_RECEIPT_IMAGE_ARCHIVE: "1",
           HOUSEHOLD_PERSIST_SECRET: token,
         },
       });
@@ -153,6 +341,9 @@ export class BookkeepingRuntime extends DurableObject {
         await container.setInactivityTimeout(120_000);
         return;
       }
+      // Count this read before the request. A read that fails still consumes
+      // quota on some billing paths, so the guard is deliberately conservative.
+      await this.recordClassB();
       const previous = await this.env.LEDGER_ARCHIVE.get(DATA_KEY);
       const headers = new Headers({
         "x-household-persist-secret": token,
@@ -209,13 +400,21 @@ export class BookkeepingRuntime extends DurableObject {
     });
   }
 
-  async persistState() {
+  async persistState(reservationId = null, remainingType = null) {
     const token = await this.ctx.storage.get(INTERNAL_TOKEN_KEY);
     const exported = await this.port().fetch(new Request("http://container/__internal/export", {
       headers: { "x-household-persist-secret": token },
     }));
     if (!exported.ok || !exported.body) return false;
+    const archiveSize = Number(exported.headers.get("content-length"));
+    if (!Number.isFinite(archiveSize) || archiveSize < 0 || archiveSize > MAX_R2_ARCHIVE_BYTES) {
+      console.error("Bookkeeping cloud snapshot exceeded the application storage safety limit");
+      return false;
+    }
     try {
+      // Count before sending the write, so retries cannot exceed the safety
+      // ceiling even if Cloudflare bills a request that returns an error.
+      await this.recordClassA(reservationId, remainingType);
       await this.env.LEDGER_ARCHIVE.put(DATA_KEY, exported.body, {
         httpMetadata: { contentType: "application/gzip", cacheControl: "private, no-store" },
         customMetadata: { format: "household-web-state-v1", savedAt: new Date().toISOString() },

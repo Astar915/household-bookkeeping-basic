@@ -831,6 +831,7 @@ def create_sync_bundle(
     food_skill_store: FoodHealthSkillStore | None = None,
     receipt_image_directory: Path | None = None,
     include_scope: dict[str, bool] | None = None,
+    include_receipt_images: bool = True,
     max_bundle_bytes: int | None = MAX_SYNC_BUNDLE_BYTES,
     max_bundle_error: str | None = None,
 ) -> bytes:
@@ -879,7 +880,7 @@ def create_sync_bundle(
                     skills[archive_name] = loaded["content"].encode("utf-8")
 
         image_files: list[Path] = []
-        if scope["bills"] and image_dir.exists():
+        if include_receipt_images and scope["bills"] and image_dir.exists():
             image_files = [
                 path for path in image_dir.rglob("*")
                 if path.is_file() and not path.is_symlink()
