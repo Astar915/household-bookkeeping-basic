@@ -1,54 +1,69 @@
-# 家庭记账系统
+<div align="center">
+  <img src="assets/household-bookkeeping.png" alt="家庭记账" width="96" />
+  <h1>🏡 家庭记账｜每一笔，都清清楚楚</h1>
+  <p><strong>少一点“钱去哪了”，多一点心里有数。</strong></p>
+  <p>像聊天一样记账，把账户、预算和报表放在一起；账本默认留在自己的电脑，选择权一直在你手里。</p>
+  <p>
+    <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest">🪟 下载 Windows 免安装版</a> ·
+    <a href="#第一次使用">🧭 第一次使用</a> ·
+    <a href="#数据与隐私">🔐 数据与隐私</a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/Windows-免安装版-0078D4?style=for-the-badge&logo=windows" alt="Windows 免安装版" />
+    <img src="https://img.shields.io/badge/账本-本地优先-7C3AED?style=for-the-badge" alt="本地优先" />
+    <img src="https://img.shields.io/badge/AI-可选配置-EC4899?style=for-the-badge" alt="AI 可选配置" />
+    <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge" alt="MIT License" />
+  </p>
+  <p><strong>当前版本：0.2.0 · 初始公开版本</strong></p>
+</div>
 
-[简体中文](README.md) · [English](README.en.md) · [日本語](README.ja.md)
+> 💬 **记账可以很简单：**“昨晚晚餐 850 日元，现金支付。”检查候选记录，确认后保存。自然语言记账需要你自行配置本机 Ollama 或兼容模型；不用 AI，也能打开并管理本地账本。
 
-**当前版本：0.2.0 · 初始公开版本**
+## ✨ 这本账能帮你做什么
 
-家庭记账系统是一款以本地账本为中心的开源家庭财务管理软件。它帮助个人或家庭记录收入、支出和转账，管理多个账户与信用卡，并查看账期报表、预算和余额变化。桌面版使用 Python、Tkinter 和 SQLite；账本保存在自己的电脑上，不连接银行，也不会替你实际付款或还款。
+- 💸 记录收入、支出、转账和余额盘点，JPY、CNY 分开核算
+- 💳 管理银行、现金、钱包、交通卡、积分、信用卡和固定资产
+- 📊 查看账单、资产负债表、利润表、分类支出和预算进度
+- 🧾 编辑或删除录错的流水，收据图片可辅助识别
+- 💾 创建本地备份；需要多设备同步时，再自行连接 GitHub 或 Gitee
+- 🌙 支持中、英、日界面，以及白天、暗色和跟随系统外观
 
-记账可以通过自然语言完成，例如“昨天午饭 850 JPY，使用现金”。你也可以附上收据图片。自然语言识别是可选功能，需要配置本机 Ollama 或自己选择的 OpenAI 兼容模型服务；提交前请检查识别结果，信息不够时软件会继续询问。
+## 🧭 第一次使用
 
-## 能做什么
+1. **下载并打开软件**：Windows 用户按下方“免安装启动”操作，不需要安装 Python。
+2. **登记自己的账户和真实余额**：在“资产”及“更多”中设置银行、钱包、信用卡等账户。新用户从空账本开始。
+3. **记一笔**：打开“记录 → 记账”，输入日期、用途、金额、币种和账户；检查识别结果，确认后才会写入本地账本。
+4. **随时核对**：在“账单”中筛选或修正记录；在“更多 → 家庭财务报表”看报表，在首页看预算进度。
+5. **先备份，再换设备**：在“设置 → 账本与备份”创建本地备份。GitHub/Gitee 同步是可选项，连接前请先看同步说明。
 
-- 记录收入、支出、账户间转账和余额盘点，支持 JPY、CNY 分币种核算
-- 管理银行、现金、钱包、预付卡、交通卡、积分和信用卡账户
-- 查看账单流水，按日期筛选，并手动编辑或删除错误记录
-- 查看资产负债表、利润表、分类支出和预算进度；账期默认为每月 15 日至次月 14 日
-- 管理定期收支、信用卡额度快照与本地还款计划；信用卡欠款是账内估算，不是银行实时数据
-- 登记固定资产并查看按月折旧后的账面价值
-- 用本地备份保护账本；桌面版也可选择连接 GitHub 或 Gitee 私有仓库同步
-- 可选使用网页/PWA 版本；自然语言记账、云同步和网页服务需要各自配置
+> 🔒 软件不会连接银行，也不会替你付款或还款。默认情况下，账本留在这台电脑；只有你主动配置远程模型或云同步时，相关内容才会发送到对应服务。
 
-## Windows 桌面版：安装与启动
+## ⬇️ Windows 免安装版（零编程）
 
-需要 Windows、Git（或下载 GitHub ZIP）以及 **Python 3.11 或更新版本**，并确保 Python 安装包含 Tkinter。
+**下载、解压、双击，三步打开：**
 
-在 PowerShell 中运行：
+1. [点此下载 Windows 绿色版 ZIP](https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.zip)
+2. 解压 ZIP 中的**全部文件**到一个文件夹，不要单独移动 EXE。
+3. 双击 <code>HouseholdBookkeeping.exe</code>。无需安装 Python、Git 或其他开发工具。
 
-```powershell
+首次运行会自动创建空账本。账本和设置保存在当前 Windows 用户的 <code>%APPDATA%\HouseholdBookkeeping-Portable</code>，不会打包在 EXE 里。想用自然语言记账时，再到“设置 → API 服务”配置模型；未配置模型也可以打开软件、浏览和维护本地数据。
+
+> 🪟 如果 Windows 提示“未知发布者”，是因为当前版本没有代码签名。请只从本仓库的 Releases 下载，并确认文件名为 <code>HouseholdBookkeeping-Windows-x64.zip</code> 后再运行。
+
+### 🧑‍💻 开发者：从源码启动
+
+需要 Windows、Python 3.11 或更新版本（安装时包含 Tkinter）；可用 Git 克隆，也可下载 GitHub ZIP 后解压。在项目目录打开 PowerShell：
+
+~~~powershell
 git clone https://github.com/Astar915/household-bookkeeping-basic.git
 cd household-bookkeeping-basic
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m bookkeeping.cli init
 .\.venv\Scripts\pythonw.exe -m bookkeeping.gui
-```
+~~~
 
-如果通过 GitHub 的 **Download ZIP** 下载，请先解压，并在解压后的项目目录打开 PowerShell；这种方式下跳过上面的 `git clone` 和 `cd household-bookkeeping-basic` 两行。
-
-初始化会创建一个空账本：`data/household_bookkeeping.sqlite3`。如果只想先体验界面，可以在**新的空账本**上用 `python -m bookkeeping.cli init --seed-demo` 代替普通初始化；这会写入虚构的演示数据。不要对已有账本使用演示初始化。
-
-完成依赖安装后，也可以双击项目根目录的 `launch-bookkeeping.vbs` 启动桌面窗口。
-
-## 第一次使用
-
-1. **添加账户和期初余额。** 在“资产”中管理账户；现金、银行、钱包、预付/券和交通卡等资金账户可在“更多 → 现金管理”中维护。信用卡单独在“更多 → 信用卡管理”中登记，并填写你掌握的额度快照。只录入自己的实际账户与余额。
-2. **设置语言和记账服务。** 界面语言可在设置中更改。若要用自然语言记账，在“设置 → API 服务”添加本机 Ollama 或你选择的 OpenAI 兼容服务，再到“Agent 配置与 Skill”分配给记账 Agent。仅使用本机 Ollama 时，内容留在本机；远程服务会收到提交的文字或图片。
-3. **记录一笔收支。** 打开“记录 → 记账”，用自然语言说明发生日期、用途、金额、币种和账户；缺少必要信息时先回答软件的追问。检查候选记录并确认后，记录才写入本地账本。图片识别可帮助读取收据，不应代替你核对金额和实际付款账户。
-4. **核对和查看。** 在“账单”中查找、筛选或修正流水；在“更多 → 家庭财务报表”查看资产负债表与利润表，在首页查看预算进度。现金余额盘点和信用卡额度快照应按实际记录，软件不会查询银行。
-5. **创建备份。** 打开“设置 → 账本与备份”手动创建本地备份。需要多设备同步时，再自行连接 GitHub 或 Gitee；同步范围、恢复行为及限制请先阅读对应说明。
-
-如果暂时没有配置模型服务，桌面程序仍可打开并查看、管理本地账本；软件内的自然语言记账需要先配置模型服务。不使用模型时，也可以通过 CLI 的 `income`、`expense` 和 `transfer` 命令直接记账，运行对应命令的 `--help` 查看必填字段。
+如果使用 GitHub ZIP，跳过 <code>git clone</code> 和 <code>cd</code> 两行。只在新空账本上体验演示数据时，可把初始化命令替换为 <code>python -m bookkeeping.cli init --seed-demo</code>；**不要对已有账本运行演示初始化**。依赖安装完成后，也可以双击项目目录中的 <code>launch-bookkeeping.vbs</code>。
 
 ## 可选：网页/PWA 版本
 

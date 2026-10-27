@@ -188,6 +188,10 @@ def _mask_display_numbers(value: object) -> str:
 class BookkeepingWindow:
     def __init__(self, root: tk.Tk, database_path: Path = DEFAULT_DB) -> None:
         self.root = root
+        self._ui_callbacks: queue.SimpleQueue = queue.SimpleQueue()
+        self._ui_dispatch_closed = False
+        self._ui_heartbeat_at = time.monotonic()
+        self._watchdog_stop = threading.Event()
         self.appearance_mode = load_appearance()
         self.language = load_language()
         install_tk_localization(root, self.language)
@@ -234,6 +238,9 @@ class BookkeepingWindow:
         }
         self.recurring_results: queue.Queue[tuple[list[dict[str, Any]], str | None]] = queue.Queue()
         self._recurring_processing = False
+        self.credit_repayment_results: queue.Queue[tuple[list[dict[str, Any]], str | None]] = queue.Queue()
+        self._credit_repayment_processing = False
+        self._scheduled_db_work_lock = threading.Lock()
         self._request_process: multiprocessing.Process | None = None
         self._request_results = queue.Queue()
         self._request_started = 0.0
@@ -390,9 +397,75 @@ class BookkeepingWindow:
         self.root.after(100, self._poll_results)
         self.root.after(0, self._start_startup_cloud_pull)
         self.root.after(150, self._poll_recurring_transaction_results)
+        self.root.after(150, self._poll_credit_repayment_results)
         self.root.after(1000, self._check_due_credit_repayments)
         self.root.after(1200, self._check_due_recurring_transactions)
         self.root.after(2000, self._poll_appearance)
+        self.root.after(16, self._poll_ui_callbacks)
+        self.root.after(250, self._ui_heartbeat_tick)
+        threading.Thread(
+            target=self._ui_stall_watchdog, name="ui-stall-watchdog", daemon=True,
+        ).start()
+
+    def _ui_heartbeat_tick(self) -> None:
+        self._ui_heartbeat_at = time.monotonic()
+        try:
+            if self.root.winfo_exists():
+                self.root.after(250, self._ui_heartbeat_tick)
+        except tk.TclError:
+            pass
+
+    def _ui_stall_watchdog(self) -> None:
+        """Save stack locations for a sustained UI stall without reading locals."""
+        reported = False
+        while not self._watchdog_stop.wait(1.0):
+            stalled_for = time.monotonic() - self._ui_heartbeat_at
+            if stalled_for < 8.0:
+                reported = False
+                continue
+            if reported:
+                continue
+            reported = True
+            try:
+                folder = app_data_directory()
+                folder.mkdir(parents=True, exist_ok=True)
+                frames = sys._current_frames()
+                with (folder / "ui-stalls.log").open("a", encoding="utf-8") as stream:
+                    stream.write(
+                        f"\n{datetime.now().isoformat()} UI heartbeat paused for "
+                        f"{stalled_for:.1f}s; thread stacks follow (no local values recorded).\n"
+                    )
+                    for thread in threading.enumerate():
+                        frame = frames.get(thread.ident)
+                        if frame is None:
+                            continue
+                        stream.write(f"Thread {thread.name} ({thread.ident})\n")
+                        stream.writelines(traceback.format_stack(frame))
+            except (OSError, RuntimeError, ValueError):
+                pass
+
+    def post_to_ui(self, callback) -> None:
+        """Queue worker results; only the Tk main-thread pump may call Tk."""
+        if not self._ui_dispatch_closed:
+            self._ui_callbacks.put(callback)
+
+    def _poll_ui_callbacks(self) -> None:
+        if self._ui_dispatch_closed:
+            return
+        try:
+            for _ in range(64):
+                try:
+                    callback = self._ui_callbacks.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback()
+                except Exception:
+                    self._report_ui_exception(*sys.exc_info())
+            if self.root.winfo_exists():
+                self.root.after(16, self._poll_ui_callbacks)
+        except tk.TclError:
+            self._ui_dispatch_closed = True
 
     def _report_ui_exception(self, kind, value, trace):
         # Store stack locations only: no model payloads, financial input or keys.
@@ -1218,58 +1291,84 @@ class BookkeepingWindow:
             except tk.TclError:
                 pass
             return
+        if self._credit_repayment_processing:
+            self.root.after(60_000, self._check_due_credit_repayments)
+            return
+
+        self._credit_repayment_processing = True
+
+        def process() -> None:
+            events: list[dict[str, Any]] = []
+            error: str | None = None
+            try:
+                with self._scheduled_db_work_lock:
+                    database = Database(self.database_path)
+                    try:
+                        database.initialize()
+                        events = process_due_credit_repayments(database, _today_japan())
+                    finally:
+                        database.close()
+            except Exception as exc:
+                error = str(exc)
+            self.credit_repayment_results.put((events, error))
+
         try:
-            database = Database(self.database_path)
-            try:
-                database.initialize()
-                events = process_due_credit_repayments(database, _today_japan())
-            finally:
-                database.close()
-            for event in events:
-                if event["status"] == "posted":
-                    amount = minor_to_text(
-                        int(event["amount_minor"]),
-                        0 if event["currency"] == "JPY" else 2,
-                        event["currency"],
-                    )
-                    self._append_message(
-                        "助手",
-                        f"已按本期单独填写的金额在本地账本记入 #{event['transaction_id']}："
-                        f"{event['source_name']} → {event['card_name']}，{amount}。"
-                        "这只是账本记录，不代表软件从银行实际扣款。",
-                        agent_mode="bookkeeping",
-                    )
-                elif event["status"] == "insufficient":
-                    self.status.configure(
-                        text=f"{event['card_name']}本期填写的还款金额超过扣款账户余额，未记账；请核对。"
-                    )
-                elif event["status"] == "missed":
-                    self.status.configure(
-                        text=f"信用卡每月应还日期 {event['due_date']} 已过，软件未自动补记；请核对实际扣款。"
-                    )
-                elif event["status"] == "amount_missing":
-                    self.status.configure(
-                        text=f"{event['card_name']}今天是还款日，但本期金额未填写，未记账。"
-                    )
-                elif event["status"] == "partial_payment":
-                    self.status.configure(
-                        text=f"{event['card_name']}今天已有部分还款记录，软件没有自动补差；请核对本期金额。"
-                    )
-                elif event["status"] == "already_paid":
-                    self.status.configure(
-                        text=f"{event['card_name']}今天已有还款记录，本期计划没有重复记账。"
-                    )
-                elif event["status"] == "invalid":
-                    self.status.configure(text=f"{event['card_name']}的每月应还计划设置有误，未记账。")
-            if any(event["status"] == "posted" for event in events):
-                self._queue_github_auto_sync()
-        except (LedgerError, OSError, sqlite3.Error) as exc:
-            self.status.configure(text=f"自动还款计划检查失败：{exc}")
-        finally:
-            try:
-                self.root.after(60_000, self._check_due_credit_repayments)
-            except tk.TclError:
-                pass
+            threading.Thread(target=process, name="credit-repayment-check", daemon=True).start()
+        except RuntimeError as exc:
+            self._credit_repayment_processing = False
+            self.status.configure(text=f"自动还款计划检查无法启动：{exc}")
+        try:
+            self.root.after(60_000, self._check_due_credit_repayments)
+        except tk.TclError:
+            pass
+
+    def _poll_credit_repayment_results(self) -> None:
+        try:
+            events, error = self.credit_repayment_results.get_nowait()
+        except queue.Empty:
+            events, error = None, None
+        if events is not None:
+            self._credit_repayment_processing = False
+            if error:
+                self.status.configure(text=f"自动还款计划检查失败：{error}")
+            else:
+                for event in events:
+                    if event["status"] == "posted":
+                        amount = minor_to_text(
+                            int(event["amount_minor"]),
+                            0 if event["currency"] == "JPY" else 2,
+                            event["currency"],
+                        )
+                        self._append_message(
+                            "助手",
+                            f"已按本期单独填写的金额在本地账本记入 #{event['transaction_id']}："
+                            f"{event['source_name']} → {event['card_name']}，{amount}。"
+                            "这只是账本记录，不代表软件从银行实际扣款。",
+                            agent_mode="bookkeeping",
+                        )
+                    elif event["status"] == "insufficient":
+                        self.status.configure(
+                            text=f"{event['card_name']}本期填写的还款金额超过扣款账户余额，未记账；请核对。"
+                        )
+                    elif event["status"] == "missed":
+                        self.status.configure(
+                            text=f"信用卡每月应还日期 {event['due_date']} 已过，软件未自动补记；请核对实际扣款。"
+                        )
+                    elif event["status"] == "amount_missing":
+                        self.status.configure(text=f"{event['card_name']}今天是还款日，但本期金额未填写，未记账。")
+                    elif event["status"] == "partial_payment":
+                        self.status.configure(text=f"{event['card_name']}今天已有部分还款记录，软件没有自动补差；请核对本期金额。")
+                    elif event["status"] == "already_paid":
+                        self.status.configure(text=f"{event['card_name']}今天已有还款记录，本期计划没有重复记账。")
+                    elif event["status"] == "invalid":
+                        self.status.configure(text=f"{event['card_name']}的每月应还计划设置有误，未记账。")
+                if any(event["status"] == "posted" for event in events):
+                    self._queue_github_auto_sync()
+        try:
+            if self.root.winfo_exists():
+                self.root.after(150, self._poll_credit_repayment_results)
+        except tk.TclError:
+            pass
 
     def _check_due_recurring_transactions(self) -> None:
         if self.busy or self._recurring_processing or self._github_restore_in_progress:
@@ -1282,20 +1381,19 @@ class BookkeepingWindow:
         self._recurring_processing = True
 
         def process() -> None:
-            database: Database | None = None
+            events: list[dict[str, Any]] = []
+            error: str | None = None
             try:
-                database = Database(self.database_path)
-                database.initialize()
-                events = process_due_recurring_transactions(database, _today_japan())
-                self.recurring_results.put((events, None))
-            except Exception as exc:
-                self.recurring_results.put(([], str(exc)))
-            finally:
-                if database is not None:
+                with self._scheduled_db_work_lock:
+                    database = Database(self.database_path)
                     try:
+                        database.initialize()
+                        events = process_due_recurring_transactions(database, _today_japan())
+                    finally:
                         database.close()
-                    except sqlite3.Error:
-                        pass
+            except Exception as exc:
+                error = str(exc)
+            self.recurring_results.put((events, error))
 
         threading.Thread(target=process, name="recurring-transactions", daemon=True).start()
         try:
@@ -1378,7 +1476,7 @@ class BookkeepingWindow:
                                  revision or local_revision(self.database_path, **self._cloud_stores()))
 
     def _start_startup_cloud_pull(self):
-        if self.busy or self._recurring_processing:
+        if self.busy or self._recurring_processing or self._credit_repayment_processing:
             self.root.after(500, self._start_startup_cloud_pull)
             return
         if self._github_restore_in_progress:
@@ -1418,8 +1516,9 @@ class BookkeepingWindow:
                         self._startup_applying = True
                         if self._startup_cancelled.is_set():
                             raise LedgerError('自动下载已取消，本机账本保持原样。')
-                        return restore_sync_bundle(body, self.database_path,
-                            **self._cloud_stores(), backup_provider=provider)
+                        with self._scheduled_db_work_lock:
+                            return restore_sync_bundle(body, self.database_path,
+                                **self._cloud_stores(), backup_provider=provider)
                     with self._github_upload_lock, github_sync_process_lock():
                         result = automatic_pull(self.database_path, candidates, self._pull_state(),
                             restore,
@@ -1658,10 +1757,7 @@ class BookkeepingWindow:
             except tk.TclError:
                 pass
 
-        try:
-            self.root.after(0, update_status)
-        except tk.TclError:
-            pass
+        self.post_to_ui(update_status)
 
     def _build_widgets(self) -> None:
         configure_styles(self.root, self.ui_font_family)
@@ -3662,6 +3758,7 @@ class BookkeepingWindow:
             self.database_path,
             self.ui_font_family,
             container=container,
+            database_lock=self._scheduled_db_work_lock,
         )
 
     def open_financial_statements(self, container: tk.Misc | None = None) -> None:
@@ -3704,7 +3801,6 @@ class BookkeepingWindow:
         notebook.add(balance_page, text="资产负债表")
         notebook.add(profit_page, text="本期利润表")
         notebook.add(savings_page, text=translate("预算管理", self.language))
-        self.open_savings_plan(savings_page)
 
         balance_summary = ttk.Label(
             balance_page, style="Hint.TLabel", wraplength=900, justify="left"
@@ -3781,26 +3877,101 @@ class BookkeepingWindow:
         report_status.pack(side="left", fill="x", expand=True)
 
         balance_asset_rows: dict[str, tuple[int, bool]] = {}
+        report_results: queue.Queue[tuple[str, Any, str | None]] = queue.Queue()
+        report_state = {
+            "loading": False,
+            "refresh_pending": False,
+            "asset_toggle_running": False,
+            "budget_started": False,
+            "poll_after": None,
+        }
 
-        def refresh() -> None:
-            report_status.configure(text="正在读取账本…")
-            database = Database(self.database_path)
-            try:
-                database.initialize()
-                today = _today_japan()
-                balance = build_balance_sheet(database, today)
-                profit = build_profit_statement(database, today)
-                currency_digits = {
-                    row["code"]: int(row["minor_digits"])
-                    for row in database.connection.execute("SELECT code,minor_digits FROM currencies")
-                }
-            except (LedgerError, ValueError) as exc:
-                messagebox.showerror("无法读取报表", str(exc), parent=dialog)
-                report_status.configure(text="读取失败。")
+        def schedule_report_poll() -> None:
+            if report_state["poll_after"] is not None:
                 return
-            finally:
-                database.close()
+            try:
+                if dialog.winfo_exists():
+                    report_state["poll_after"] = dialog.after(40, poll_report_results)
+            except tk.TclError:
+                report_state["poll_after"] = None
 
+        def load_report() -> None:
+            database: Database | None = None
+            result = None
+            error = None
+            try:
+                with self._scheduled_db_work_lock:
+                    database = Database(self.database_path)
+                    try:
+                        database.initialize()
+                        today = _today_japan()
+                        balance = build_balance_sheet(database, today)
+                        profit = build_profit_statement(database, today)
+                        currency_digits = {
+                            row["code"]: int(row["minor_digits"])
+                            for row in database.connection.execute("SELECT code,minor_digits FROM currencies")
+                        }
+                        result = (balance, profit, currency_digits)
+                    finally:
+                        database.close()
+                        database = None
+            except Exception as exc:
+                error = str(exc)
+            report_results.put(("report", result, error))
+
+        def poll_report_results() -> None:
+            report_state["poll_after"] = None
+            try:
+                if not dialog.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            while True:
+                try:
+                    kind, payload, error = report_results.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "report":
+                    report_state["loading"] = False
+                    if error:
+                        messagebox.showerror("无法读取报表", error, parent=dialog)
+                        report_status.configure(text="读取失败。")
+                    else:
+                        refresh(payload)
+                    if not report_state["budget_started"]:
+                        report_state["budget_started"] = True
+                        self.open_savings_plan(savings_page)
+                elif kind == "asset-toggle":
+                    report_state["asset_toggle_running"] = False
+                    if error:
+                        messagebox.showerror("更新失败", error, parent=dialog)
+                        report_status.configure(text="固定资产计入状态更新失败。")
+                    else:
+                        report_state["refresh_pending"] = True
+            if report_state["refresh_pending"] and not report_state["loading"] and not report_state["asset_toggle_running"]:
+                report_state["refresh_pending"] = False
+                refresh()
+            if report_state["loading"] or report_state["asset_toggle_running"]:
+                schedule_report_poll()
+
+        def refresh(report_data=None) -> None:
+            if report_data is None:
+                if report_state["loading"] or report_state["asset_toggle_running"]:
+                    report_state["refresh_pending"] = True
+                    return
+                report_state["loading"] = True
+                report_status.configure(text="正在读取账本…")
+                try:
+                    threading.Thread(target=load_report, name="financial-report-reader", daemon=True).start()
+                except RuntimeError as exc:
+                    report_state["loading"] = False
+                    report_status.configure(text="读取失败。")
+                    messagebox.showerror("无法读取报表", str(exc), parent=dialog)
+                    return
+                schedule_report_poll()
+                return
+
+            balance, profit, currency_digits = report_data
             def grouped_amounts(values: dict[str, int]) -> str:
                 return "；".join(
                     minor_to_text(int(values.get(code, 0)), currency_digits[code], code)
@@ -4028,17 +4199,35 @@ class BookkeepingWindow:
             asset_info = balance_asset_rows.get(item_id)
             if asset_info is None:
                 return None
-            asset_id, currently_included = asset_info
-            database = Database(self.database_path)
-            try:
-                database.initialize()
-                database.set_fixed_asset_inclusion(asset_id, not currently_included)
-            except (LedgerError, sqlite3.Error, OSError) as exc:
-                messagebox.showerror("更新失败", str(exc), parent=dialog)
+            if report_state["asset_toggle_running"]:
                 return "break"
-            finally:
-                database.close()
-            refresh()
+            asset_id, currently_included = asset_info
+            report_state["asset_toggle_running"] = True
+            report_status.configure(text="正在更新固定资产设置…")
+
+            def update_asset_inclusion() -> None:
+                database: Database | None = None
+                error = None
+                try:
+                    with self._scheduled_db_work_lock:
+                        database = Database(self.database_path)
+                        try:
+                            database.initialize()
+                            database.set_fixed_asset_inclusion(asset_id, not currently_included)
+                        finally:
+                            database.close()
+                            database = None
+                except Exception as exc:
+                    error = str(exc)
+                report_results.put(("asset-toggle", None, error))
+
+            try:
+                threading.Thread(target=update_asset_inclusion, name="financial-report-asset-update", daemon=True).start()
+                schedule_report_poll()
+            except RuntimeError as exc:
+                report_state["asset_toggle_running"] = False
+                report_status.configure(text="固定资产计入状态更新失败。")
+                messagebox.showerror("更新失败", str(exc), parent=dialog)
             return "break"
 
         balance_tree.bind("<Button-1>", toggle_fixed_asset, add="+")
@@ -6950,6 +7139,11 @@ class BookkeepingWindow:
                 choose_ledger: bool = False,
             ) -> None:
                 github_sync_busy["value"] = False
+                try:
+                    if not dialog.winfo_exists() or not auth_dialog.winfo_exists():
+                        return
+                except tk.TclError:
+                    return
                 github_status.configure(text=message)
                 if auth_dialog.winfo_exists():
                     auth_dialog.destroy()
@@ -7020,7 +7214,7 @@ class BookkeepingWindow:
                         copy_code_button.configure(state="normal")
                         open_auth_button.configure(state="normal")
 
-                    dialog.after(0, show_device_code)
+                    self.post_to_ui(show_device_code)
                     credentials = poll_device_token(
                         client_id,
                         str(device["device_code"]),
@@ -7076,24 +7270,23 @@ class BookkeepingWindow:
                             "已连接 GitHub；该私有仓库已有数据，请选择上传或恢复。",
                             self.language,
                         )
-                    dialog.after(0, lambda: auth_done(result, success=True, repository=repository,
-                                                     choose_ledger=has_cloud_backup))
+                    self.post_to_ui(lambda: auth_done(result, success=True, repository=repository,
+                                                      choose_ledger=has_cloud_backup))
                 except Exception as exc:
                     if auth_cancelled.is_set():
-                        dialog.after(0, lambda: auth_done(translate("GitHub 授权已取消。", self.language)))
+                        self.post_to_ui(lambda: auth_done(translate("GitHub 授权已取消。", self.language)))
                     else:
                         error = str(exc)
                         status_text = translate("GitHub 连接失败：{error}", self.language).format(
                             error=translate(error, self.language)
                         )
-                        dialog.after(
-                            0,
+                        self.post_to_ui(
                             lambda: auth_done(
                                 status_text,
                                 success=bool(connected_repository),
                                 repository=connected_repository,
                                 error=error,
-                            ),
+                            )
                         )
 
             threading.Thread(target=authorize_worker, name="github-device-auth", daemon=True).start()
@@ -7109,7 +7302,9 @@ class BookkeepingWindow:
         def sync_github(direction: str, *, confirmed_download: bool = False) -> None:
             if github_sync_busy["value"]:
                 return
-            if direction == "download" and (self.busy or self._recurring_processing):
+            if direction == "download" and (
+                self.busy or self._recurring_processing or self._credit_repayment_processing
+            ):
                 messagebox.showinfo(
                     translate("稍后重试", self.language),
                     translate("记账或定期收支正在处理中，请等处理完成后再从 GitHub 恢复。", self.language),
@@ -7220,13 +7415,14 @@ class BookkeepingWindow:
                     else:
                         with self._github_upload_lock, github_sync_process_lock():
                             bundle, cloud_sha = client.download_bundle_with_revision(repository)
-                            result_backup = str(
-                                restore_sync_bundle(
-                                    bundle,
-                                    self.database_path,
-                                    receipt_image_directory=self.database_path.parent / "receipt_images",
+                            with self._scheduled_db_work_lock:
+                                result_backup = str(
+                                    restore_sync_bundle(
+                                        bundle,
+                                        self.database_path,
+                                        receipt_image_directory=self.database_path.parent / "receipt_images",
+                                    )
                                 )
-                            )
                             settings_store = GitHubSyncSettingsStore()
                             current_settings = settings_store.load()
                             settings_store.save(
@@ -7242,13 +7438,13 @@ class BookkeepingWindow:
                             "云端数据已恢复。本机恢复前备份：{path}。软件即将重启。",
                             self.language,
                         ).format(path=result_backup)
-                    dialog.after(0, lambda: sync_done(message, error="", restart=(direction == "download")))
+                    self.post_to_ui(lambda: sync_done(message, error="", restart=(direction == "download")))
                 except Exception as exc:
                     error = str(exc)
                     message = translate("GitHub 数据同步失败：{error}", self.language).format(
                         error=translate(error, self.language)
                     )
-                    dialog.after(0, lambda: sync_done(message, error=error, restart=False))
+                    self.post_to_ui(lambda: sync_done(message, error=error, restart=False))
 
             def sync_done(message: str, *, error: str, restart: bool) -> None:
                 github_sync_busy["value"] = False
@@ -7256,6 +7452,14 @@ class BookkeepingWindow:
                     self._github_restore_in_progress = False
                     self.send_button.configure(state="normal")
                     self.input_box.configure(state="normal")
+                try:
+                    dialog_exists = bool(dialog.winfo_exists())
+                except tk.TclError:
+                    dialog_exists = False
+                if not dialog_exists:
+                    if restart and not error:
+                        self.root.after(700, lambda: self.restart_application(require_confirmation=False))
+                    return
                 github_status.configure(text=message)
                 try:
                     connected = is_github_app_user_token(github_token_store.load()) and bool(
@@ -7470,6 +7674,13 @@ class BookkeepingWindow:
                 repository: str = "",
             ) -> None:
                 gitee_sync_busy["value"] = False
+                try:
+                    if not dialog.winfo_exists() or not token_dialog.winfo_exists():
+                        if success and self.root.winfo_exists():
+                            self._start_startup_cloud_pull()
+                        return
+                except tk.TclError:
+                    return
                 gitee_status.configure(text=message)
                 if success:
                     gitee_saved_settings["repository_name"] = DEFAULT_GITEE_BACKUP_REPOSITORY_NAME
@@ -7557,25 +7768,23 @@ class BookkeepingWindow:
                                 else "Gitee 已连接，同步文件已首次上传。",
                                 self.language,
                             )
-                        token_dialog.after(
-                            0,
+                        self.post_to_ui(
                             lambda: finish_gitee_connection(
                                 result, success=True, repository=repository
-                            ),
+                            )
                         )
                     except Exception as exc:
                         error = str(exc)
                         message = translate("Gitee 连接失败：{error}", self.language).format(
                             error=translate(error, self.language)
                         )
-                        token_dialog.after(
-                            0,
+                        self.post_to_ui(
                             lambda: finish_gitee_connection(
                                 message,
                                 success=bool(connected_repository),
                                 repository=connected_repository,
                                 error=error,
-                            ),
+                            )
                         )
 
                 threading.Thread(target=connect_worker, name="gitee-connect", daemon=True).start()
@@ -7603,7 +7812,9 @@ class BookkeepingWindow:
         def sync_gitee(direction: str) -> None:
             if gitee_sync_busy["value"]:
                 return
-            if direction == "download" and (self.busy or self._recurring_processing):
+            if direction == "download" and (
+                self.busy or self._recurring_processing or self._credit_repayment_processing
+            ):
                 messagebox.showinfo(
                     translate("稍后重试", self.language),
                     translate("记账或定期收支正在处理中，请等处理完成后再从 Gitee 恢复。", self.language),
@@ -7697,14 +7908,15 @@ class BookkeepingWindow:
                     else:
                         with self._github_upload_lock, github_sync_process_lock():
                             bundle, cloud_sha = client.download_bundle_with_revision(repository)
-                            result_backup = str(
-                                restore_sync_bundle(
-                                    bundle,
-                                    self.database_path,
-                                    receipt_image_directory=self.database_path.parent / "receipt_images",
-                                    backup_provider="gitee",
+                            with self._scheduled_db_work_lock:
+                                result_backup = str(
+                                    restore_sync_bundle(
+                                        bundle,
+                                        self.database_path,
+                                        receipt_image_directory=self.database_path.parent / "receipt_images",
+                                        backup_provider="gitee",
+                                    )
                                 )
-                            )
                             current_settings = gitee_settings_store.load()
                             gitee_settings_store.save(
                                 repository_name=current_settings.get(
@@ -7718,13 +7930,13 @@ class BookkeepingWindow:
                             "云端数据已恢复。本机恢复前备份：{path}。软件即将重启。",
                             self.language,
                         ).format(path=result_backup)
-                    dialog.after(0, lambda: sync_done(message, error="", restart=(direction == "download")))
+                    self.post_to_ui(lambda: sync_done(message, error="", restart=(direction == "download")))
                 except Exception as exc:
                     error = str(exc)
                     message = translate("Gitee 数据同步失败：{error}", self.language).format(
                         error=translate(error, self.language)
                     )
-                    dialog.after(0, lambda: sync_done(message, error=error, restart=False))
+                    self.post_to_ui(lambda: sync_done(message, error=error, restart=False))
 
             def sync_done(message: str, *, error: str, restart: bool) -> None:
                 gitee_sync_busy["value"] = False
@@ -7732,6 +7944,14 @@ class BookkeepingWindow:
                     self._github_restore_in_progress = False
                     self.send_button.configure(state="normal")
                     self.input_box.configure(state="normal")
+                try:
+                    dialog_exists = bool(dialog.winfo_exists())
+                except tk.TclError:
+                    dialog_exists = False
+                if not dialog_exists:
+                    if restart and not error:
+                        self.root.after(700, lambda: self.restart_application(require_confirmation=False))
+                    return
                 gitee_status.configure(text=message)
                 try:
                     connected_now = bool(
@@ -9436,6 +9656,8 @@ class BookkeepingWindow:
         # Do not remove the disposable snapshot while its child might still use it.
         if worker is None or not worker.is_alive():
             self._cleanup_request_worker()
+        self._watchdog_stop.set()
+        self._ui_dispatch_closed = True
         self.progress.stop()
         self.root.destroy()
 

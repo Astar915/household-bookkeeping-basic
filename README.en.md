@@ -1,54 +1,69 @@
-# Household Bookkeeping
+<div align="center">
+  <img src="assets/household-bookkeeping.png" alt="Household Bookkeeping" width="96" />
+  <h1>🏡 Household Bookkeeping · Every entry, crystal clear</h1>
+  <p><strong>Less “Where did the money go?” More peace of mind.</strong></p>
+  <p>Record transactions in plain language and bring accounts, budgets, and reports together. Your ledger stays on your computer by default.</p>
+  <p>
+    <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest">🪟 Get the Windows portable app</a> ·
+    <a href="#first-use">🧭 First use</a> ·
+    <a href="#data-and-privacy">🔐 Data and privacy</a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/Windows-Portable-0078D4?style=for-the-badge&logo=windows" alt="Windows portable app" />
+    <img src="https://img.shields.io/badge/Ledger-Local--first-7C3AED?style=for-the-badge" alt="Local first" />
+    <img src="https://img.shields.io/badge/AI-Optional-EC4899?style=for-the-badge" alt="AI is optional" />
+    <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge" alt="MIT License" />
+  </p>
+  <p><strong>Current version: 0.2.0 · Initial public release</strong></p>
+</div>
 
-[简体中文](README.md) · [English](README.en.md) · [日本語](README.ja.md)
+> 💬 **Bookkeeping can be this simple:** “Dinner yesterday, 850 JPY, paid in cash.” Review the suggested entry and confirm to save. Natural-language entry needs a model service you configure; you can still open and manage your local ledger without AI.
 
-**Current version: 0.2.0 · Initial public release**
+## ✨ What you can do
 
-Household Bookkeeping is an open-source, local-first app for managing personal and family finances. Use it to record income, expenses, and transfers; manage accounts and credit cards; and review budgets, balances, and period reports. The desktop app uses Python, Tkinter, and SQLite. Your ledger stays on your computer by default. The app does not connect to banks or make payments or repayments.
+- 💸 Record income, expenses, transfers, and balance counts; JPY and CNY stay separate
+- 💳 Manage bank, cash, wallet, transit, points, credit-card, and fixed-asset records
+- 📊 Review transactions, balance sheets, income statements, category spending, and budgets
+- 🧾 Edit or delete an incorrect entry; attach receipt images to help with recognition
+- 💾 Create local backups; connect GitHub or Gitee only if you want multi-device sync
+- 🌙 Use Chinese, English, or Japanese, with light, dark, and system appearance options
 
-You can enter transactions in natural language, for example, “Lunch yesterday, 850 JPY, paid in cash,” or attach a receipt image. Natural-language entry is optional and requires a local Ollama model or an OpenAI-compatible model service that you configure. Review the suggested details before confirming; the app asks follow-up questions when required information is missing.
+## 🧭 First use
 
-## What it can do
+1. **Download and open the app.** Follow the portable Windows steps below; Python is not required.
+2. **Add your accounts and real balances.** Set up bank, wallet, and credit-card accounts under **Assets** and **More**. New installations start with an empty ledger.
+3. **Record an entry.** Open **Record → Bookkeeping** and enter the date, purpose, amount, currency, and account. Review the suggestion and confirm it before it is saved locally.
+4. **Review anytime.** Filter or correct entries under **Ledger**; find reports under **More → Household Financial Reports** and budget progress on the home page.
+5. **Back up before changing devices.** Create a local backup under **Settings → Ledger and Backups**. GitHub/Gitee sync is optional; read its guide before connecting.
 
-- Record income, expenses, account transfers, and balance counts, with JPY and CNY tracked separately
-- Manage bank, cash, wallet, prepaid, transit, points, and credit-card accounts
-- Search transactions by date and manually edit or delete an incorrect entry
-- Review balance sheets, income statements, category spending, and budget progress; the default accounting period runs from the 15th through the 14th
-- Manage recurring transactions, credit-limit snapshots, and local repayment schedules; credit-card debt figures are ledger estimates, not live bank data
-- Register fixed assets and view their monthly depreciated book value
-- Create local backups; the desktop app can also be connected to a private GitHub or Gitee repository for sync
-- Optionally run a web/PWA client; natural-language entry, cloud sync, and web hosting each require configuration
+> 🔒 The app does not connect to banks or make payments. Your ledger stays on this computer by default; data is sent to a remote model or cloud only when you configure and use those services.
 
-## Windows desktop app: install and launch
+## ⬇️ Portable Windows app (no coding)
 
-You need Windows, Git (or the GitHub ZIP download), and **Python 3.11 or newer** with Tkinter included.
+**Download, extract, double-click:**
 
-Run these commands in PowerShell:
+1. [Download the Windows portable ZIP](https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.zip).
+2. Extract **all files** from the ZIP into a folder. Keep the EXE beside its _internal folder.
+3. Double-click <code>HouseholdBookkeeping.exe</code>. You do not need Python, Git, or developer tools.
 
-```powershell
+The first launch creates an empty ledger. Your ledger and settings are stored under <code>%APPDATA%\HouseholdBookkeeping-Portable</code>, outside the app bundle. To use natural-language entry, configure a model under **Settings → API Services**. The app can open and manage the local ledger without one.
+
+> 🪟 Windows may show an “Unknown publisher” warning because this build is not code-signed. Download it only from this repository’s Releases and check that the filename is <code>HouseholdBookkeeping-Windows-x64.zip</code>.
+
+### 🧑‍💻 Developers: run from source
+
+You need Windows and **Python 3.11 or newer** with Tkinter. Clone the repository or download and extract its GitHub ZIP. Open PowerShell in the project folder:
+
+~~~powershell
 git clone https://github.com/Astar915/household-bookkeeping-basic.git
 cd household-bookkeeping-basic
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m bookkeeping.cli init
 .\.venv\Scripts\pythonw.exe -m bookkeeping.gui
-```
+~~~
 
-If you use GitHub's **Download ZIP** option, extract the archive and open PowerShell in the extracted project folder. Skip the `git clone` and `cd household-bookkeeping-basic` commands.
-
-Initialization creates an empty ledger at `data/household_bookkeeping.sqlite3`. To explore the interface, you can use `python -m bookkeeping.cli init --seed-demo` **instead of** the normal initialization on a new, empty ledger. It adds fictional demo data. Do not use demo initialization on a ledger that already contains your data.
-
-After installing the dependencies, you can also double-click `launch-bookkeeping.vbs` in the project folder to open the desktop window.
-
-## First-use guide
-
-1. **Add accounts and opening balances.** Manage accounts from **Assets**. Cash, bank, wallet, prepaid, and transit accounts can be maintained under **More → Cash Management**. Add credit cards separately under **More → Credit Card Management**, using credit-limit snapshots you have verified. Enter only your own accounts and actual balances.
-2. **Choose a language and configure an agent.** Change the interface language in Settings. To use natural-language entry, add Ollama or an OpenAI-compatible service under **Settings → API Services**, then assign it to the Bookkeeping Agent under **Agent and Skill Settings**. With local Ollama, requests stay on your computer; a remote provider receives the text or images you submit.
-3. **Record a transaction.** Open **Record → Bookkeeping** and describe the date, purpose, amount, currency, and account. Answer follow-up questions if the app needs more information. Check the suggested transaction and confirm it to save it to the local ledger. Receipt recognition can help read an image, but you should still verify the amount and payment account.
-4. **Review your ledger.** Use the transactions page to find, filter, and correct entries. Use **More → Household Financial Reports** for the balance sheet and income statement, and the home page for budget progress. Enter cash counts and credit-limit snapshots from actual records; the app does not query your bank.
-5. **Back up your data.** Create a local backup under **Settings → Ledger and Backups**. To sync across devices, connect GitHub or Gitee yourself and review the scope and recovery behavior in the linked documentation first.
-
-The desktop app can open and manage a local ledger without a model service, but natural-language entry inside the app requires one. Without a model, you can enter transactions directly with the CLI's `income`, `expense`, and `transfer` commands; run the relevant command with `--help` to see its required fields.
+With the ZIP download, skip <code>git clone</code> and <code>cd</code>. To explore fictional demo data, replace the initialization command only on a new empty ledger with <code>python -m bookkeeping.cli init --seed-demo</code>. **Never run demo initialization on an existing ledger.** After installing dependencies, you can also double-click <code>launch-bookkeeping.vbs</code>.
 
 ## Optional web/PWA client
 

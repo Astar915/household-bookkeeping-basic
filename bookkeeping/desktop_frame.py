@@ -5,8 +5,10 @@ See https://learn.microsoft.com/en-us/windows/win32/dwm/customframe
 """
 from __future__ import annotations
 import os
+import queue
 import tkinter as tk
 from tkinter import ttk
+import weakref
 
 
 def center_window(window, relative_to=None):
@@ -82,6 +84,7 @@ class DesktopFrame:
         self.root = root
         self.installed = False
         self.callback = None
+        self.getter = None
         self._resize_listeners = []
         self._drag_state = None
         self._drag_after = None
@@ -91,8 +94,25 @@ class DesktopFrame:
         self._size_position = None
         self._size_refresh_after = None
         self._resize_grips = {}
+        self._native_resize_events = queue.SimpleQueue()
         if os.name == "nt":
+            # The Windows procedure only writes to this thread-safe queue.  Tk
+            # consumes it from a timer already running on the UI thread.
+            root.after(16, self._poll_native_resize_events)
             root.after(80, self.install)
+
+    def _poll_native_resize_events(self):
+        try:
+            while True:
+                active = self._native_resize_events.get_nowait()
+                self._notify_resize_listeners(active)
+        except queue.Empty:
+            pass
+        try:
+            if self.root.winfo_exists():
+                self.root.after(16, self._poll_native_resize_events)
+        except tk.TclError:
+            pass
 
     def add_resize_listener(self, callback):
         """Register for the start and end of Windows' interactive size loop."""
@@ -130,6 +150,9 @@ class DesktopFrame:
             return
         setter=u.SetWindowLongPtrW if c.sizeof(c.c_void_p)==8 else u.SetWindowLongW
         setter.argtypes=[w.HWND,c.c_int,c.c_void_p];setter.restype=c.c_void_p
+        getter=u.GetWindowLongPtrW if c.sizeof(c.c_void_p)==8 else u.GetWindowLongW
+        getter.argtypes=[w.HWND,c.c_int];getter.restype=c.c_void_p
+        self.getter=getter
         u.CallWindowProcW.argtypes=[c.c_void_p,w.HWND,w.UINT,w.WPARAM,w.LPARAM]
         u.CallWindowProcW.restype=c.c_ssize_t
         u.GetWindowRect.argtypes=[w.HWND,c.POINTER(RECT)]
@@ -142,7 +165,7 @@ class DesktopFrame:
         def procedure(hwnd,msg,wp,lp):
             try:
                 if msg == 0x0231:  # WM_ENTERSIZEMOVE
-                    self._notify_resize_listeners(True)
+                    self._native_resize_events.put(True)
                 if msg==0x0083 and wp:  # WM_NCCALCSIZE: use the entire frame as client.
                     if u.IsZoomed(hwnd):
                         info=MONITORINFO();info.cbSize=c.sizeof(info)
@@ -158,8 +181,14 @@ class DesktopFrame:
                     # child controls without reliably starting a size loop.
                     return 1
                 if msg==0x0082:  # Restore Tk's original procedure before destruction.
-                    setter(hwnd,-4,self.previous)
+                    self._native_resize_events.put(False)
+                    if getter(hwnd,-4) == c.cast(self.callback,c.c_void_p).value:
+                        setter(hwnd,-4,self.previous)
                     self.installed=False
+                elif msg in (0x001F, 0x0215):  # WM_CANCELMODE / WM_CAPTURECHANGED
+                    self._native_resize_events.put(False)
+                elif msg == 0x0018 and not wp:  # WM_SHOWWINDOW: hidden/minimized
+                    self._native_resize_events.put(False)
             except Exception:
                 pass
             result = u.CallWindowProcW(self.previous,hwnd,msg,wp,lp)
@@ -167,10 +196,7 @@ class DesktopFrame:
                 info = c.cast(lp, c.POINTER(MINMAXINFO)).contents
                 info.ptMinTrackSize.x, info.ptMinTrackSize.y = self._minimum_size
             if msg == 0x0232:  # WM_EXITSIZEMOVE: flush after the final native size is applied.
-                try:
-                    self.root.after_idle(lambda: self._notify_resize_listeners(False))
-                except tk.TclError:
-                    pass
+                self._native_resize_events.put(False)
             return result
         self.callback=proto(procedure)
         c.set_last_error(0)
@@ -431,37 +457,115 @@ class ResizeRenderCoordinator:
 
     def __init__(self, root):
         self.root = root
-        self.active_sources = set()
+        self.active_sources = {}
         self.pending = {}
+        self._source_windows = {}
+        self._native_events = queue.SimpleQueue()
+        self._retained_hooks = set()
+        root.after(16, self._poll_native_events)
 
     @property
     def active(self):
-        return bool(self.active_sources)
+        return any(self.active_sources.values())
 
-    def defer(self, key, callback):
-        if not self.active:
+    def defer(self, key, callback, *, window=None, target=None):
+        window = window or self.root
+        if not self.active_sources.get(window):
             return False
-        self.pending[key] = callback
+        try:
+            target_ref = weakref.ref(target) if target is not None else None
+        except TypeError:
+            target_ref = lambda target=target: target
+        self.pending.setdefault(window, {})[key] = (target_ref, callback)
         return True
 
     def set_active(self, active):
-        self.set_source_active("main-window-native-size-move", active)
+        self.set_source_active("main-window-native-size-move", active, window=self.root)
 
-    def set_source_active(self, source, active):
+    def set_source_active(self, source, active, *, window=None):
+        window = window or self._source_windows.get(source) or self.root
+        old_window = self._source_windows.get(source)
+        if active and old_window is not None and old_window is not window:
+            self.active_sources.get(old_window, set()).discard(source)
         if active:
-            self.active_sources.add(source)
+            self._source_windows[source] = window
+            self.active_sources.setdefault(window, set()).add(source)
             return
-        self.active_sources.discard(source)
-        if self.active:
-            return
-        callbacks = tuple(self.pending.values())
-        self.pending.clear()
+        self.active_sources.get(window, set()).discard(source)
+        self._source_windows.pop(source, None)
+        self._flush_window(window)
+
+    def post_native_event(self, window, source, active, *, destroyed=False, retire=None):
+        """Queue WndProc notifications without calling any Tk API in the hook."""
+        self._native_events.put((window, source, bool(active), bool(destroyed), retire))
+
+    def _poll_native_events(self):
+        try:
+            while True:
+                window, source, active, destroyed, retire = self._native_events.get_nowait()
+                if destroyed:
+                    self.clear_window(window)
+                else:
+                    self.set_source_active(source, active, window=window)
+                if retire is not None:
+                    retire()
+        except queue.Empty:
+            pass
         try:
             if self.root.winfo_exists():
-                for callback in callbacks:
-                    self.root.after_idle(callback)
+                self.root.after(16, self._poll_native_events)
         except tk.TclError:
             pass
+
+    def _flush_window(self, window):
+        if self.active_sources.get(window):
+            return
+        callbacks = tuple(self.pending.pop(window, {}).values())
+        try:
+            if self.root.winfo_exists():
+                for target_ref, callback in callbacks:
+                    def invoke(target_ref=target_ref, callback=callback):
+                        try:
+                            target = target_ref() if target_ref is not None else None
+                            if target_ref is not None and (target is None or not target.winfo_exists()):
+                                return
+                            callback()
+                        except tk.TclError:
+                            return
+                    self.root.after_idle(invoke)
+        except tk.TclError:
+            pass
+
+    def clear_window(self, window):
+        """Drop a window's pause and stale work when it is hidden or destroyed."""
+        self.active_sources.pop(window, None)
+        self.pending.pop(window, None)
+        for source, owner in tuple(self._source_windows.items()):
+            if owner is window:
+                self._source_windows.pop(source, None)
+        self._flush_window(window)
+
+    def resume_window(self, window):
+        """Release a hidden window's pause while retaining its latest valid redraw."""
+        self.active_sources.pop(window, None)
+        for source, owner in tuple(self._source_windows.items()):
+            if owner is window:
+                self._source_windows.pop(source, None)
+        self._flush_window(window)
+
+    def discard_widget(self, widget):
+        for window, pending in tuple(self.pending.items()):
+            for key, (target_ref, _callback) in tuple(pending.items()):
+                if target_ref is not None and target_ref() is widget:
+                    pending.pop(key, None)
+            if not pending:
+                self.pending.pop(window, None)
+
+    def retain_hook(self, hook):
+        self._retained_hooks.add(hook)
+
+    def release_hook(self, hook):
+        self._retained_hooks.discard(hook)
 
 
 def defer_during_interactive_resize(widget, key, callback):
@@ -469,7 +573,8 @@ def defer_during_interactive_resize(widget, key, callback):
     try:
         root = widget._root()
         coordinator = getattr(root, "_bk_resize_coordinator", None)
-        return coordinator.defer(key, callback) if coordinator is not None else False
+        window = widget.winfo_toplevel()
+        return coordinator.defer(key, callback, window=window, target=widget) if coordinator is not None else False
     except tk.TclError:
         return False
 
@@ -484,9 +589,11 @@ class WindowResizeMessageHook:
         self.hwnd = None
         self.user = None
         self.setter = None
+        self.getter = None
         self.previous = None
         self.callback = None
         self.installed = False
+        self.native_destroyed = False
 
     def install(self):
         if os.name != "nt" or self.installed:
@@ -505,6 +612,9 @@ class WindowResizeMessageHook:
             setter = user.SetWindowLongPtrW if c.sizeof(c.c_void_p) == 8 else user.SetWindowLongW
             setter.argtypes = [w.HWND, c.c_int, c.c_void_p]
             setter.restype = c.c_void_p
+            getter = user.GetWindowLongPtrW if c.sizeof(c.c_void_p) == 8 else user.GetWindowLongW
+            getter.argtypes = [w.HWND, c.c_int]
+            getter.restype = c.c_void_p
             hwnd = user.GetAncestor(self.window.winfo_id(), 2)  # GA_ROOT
             if not hwnd:
                 return False
@@ -514,21 +624,29 @@ class WindowResizeMessageHook:
             def procedure(handle, message, wparam, lparam):
                 try:
                     if message == 0x0231:  # WM_ENTERSIZEMOVE
-                        self.coordinator.set_source_active(self.source, True)
+                        self.coordinator.post_native_event(self.window, self.source, True)
                 except Exception:
                     pass
                 if message == 0x0082:  # WM_NCDESTROY
+                    self.native_destroyed = True
                     try:
-                        setter(handle, -4, self.previous)
+                        if getter(handle, -4) == c.cast(callback, c.c_void_p).value:
+                            setter(handle, -4, self.previous)
                         self.installed = False
                     except (OSError, ValueError):
                         pass
+                elif message in (0x001F, 0x0215):  # WM_CANCELMODE / WM_CAPTURECHANGED
+                    self.coordinator.post_native_event(self.window, self.source, False)
+                elif message == 0x0018 and not wparam:  # WM_SHOWWINDOW: hidden/minimized
+                    self.coordinator.post_native_event(self.window, self.source, False)
                 result = user.CallWindowProcW(self.previous, handle, message, wparam, lparam)
                 if message == 0x0232:  # WM_EXITSIZEMOVE
-                    try:
-                        self.coordinator.set_source_active(self.source, False)
-                    except Exception:
-                        pass
+                    self.coordinator.post_native_event(self.window, self.source, False)
+                if message == 0x0082:  # Retire only after the native call chain has returned.
+                    self.coordinator.post_native_event(
+                        self.window, self.source, False, destroyed=True,
+                        retire=self._release_callback_after_destroy,
+                    )
                 return result
 
             callback = proto(procedure)
@@ -536,7 +654,7 @@ class WindowResizeMessageHook:
             previous = setter(hwnd, -4, c.cast(callback, c.c_void_p))  # GWLP_WNDPROC
             if not previous:
                 return False
-            self.user, self.setter, self.hwnd = user, setter, hwnd
+            self.user, self.setter, self.getter, self.hwnd = user, setter, getter, hwnd
             self.previous, self.callback = previous, callback
             self.installed = True
             return True
@@ -544,11 +662,33 @@ class WindowResizeMessageHook:
             return False
 
     def detach(self):
-        self.coordinator.set_source_active(self.source, False)
+        self.coordinator.set_source_active(self.source, False, window=self.window)
+        if self.native_destroyed:
+            self.coordinator.retain_hook(self)
+            return False
         if self.installed and self.setter is not None and self.hwnd:
             try:
-                self.setter(self.hwnd, -4, self.previous)
-            except (OSError, TypeError, ValueError):
-                pass
+                import ctypes as c
+                current = self.getter(self.hwnd, -4)
+                callback_address = c.cast(self.callback, c.c_void_p).value
+                if current != callback_address:
+                    # A later subclass may be above us. Keep this callback alive
+                    # until WM_NCDESTROY rather than breaking that chain.
+                    self.coordinator.retain_hook(self)
+                    return False
+                c.set_last_error(0)
+                restored = self.setter(self.hwnd, -4, self.previous)
+                if not restored and c.get_last_error():
+                    raise OSError(c.get_last_error(), "Unable to restore the window procedure")
+            except (AttributeError, OSError, TypeError, ValueError):
+                self.coordinator.retain_hook(self)
+                return False
         self.installed = False
         self.callback = None
+        self.coordinator.release_hook(self)
+        return True
+
+    def _release_callback_after_destroy(self):
+        self.installed = False
+        self.callback = None
+        self.coordinator.release_hook(self)

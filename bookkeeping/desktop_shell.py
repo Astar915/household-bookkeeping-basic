@@ -9,6 +9,7 @@ import math
 import queue
 import re
 import threading
+from functools import lru_cache
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -67,6 +68,7 @@ class RoundedProgressBar(tk.Canvas):
         self.gradient = gradient
         self.fill_color = fill or "#7da7e0"
         self._bar_image = None
+        self._draw_key = None
         self._draw_pending = None
         self.bind("<Configure>", self._redraw)
         self.after_idle(self._draw)
@@ -107,25 +109,35 @@ class RoundedProgressBar(tk.Canvas):
             return
         if defer_during_interactive_resize(self, self, self._draw):
             return
-        self.delete("all")
         width = self.winfo_width()
         canvas_height = self.winfo_height()
         if width < 2 or canvas_height < 2:
             return
+        fill_pixels = round(width * self.value)
+        draw_key = (
+            width, canvas_height, self.bar_height, fill_pixels,
+            self.track_color, self.gradient, self.fill_color,
+        )
+        if draw_key == self._draw_key:
+            return
+        self.delete("all")
         try:
             from PIL import ImageTk
         except ImportError:
             self._draw_canvas_fallback(width, canvas_height)
+            self._draw_key = draw_key
             return
 
         rendered = self._render_image(
-            width, canvas_height, self.bar_height, self.value,
+            width, canvas_height, self.bar_height, fill_pixels / width,
             self.track_color, self.gradient, self.fill_color,
         )
         self._bar_image = ImageTk.PhotoImage(rendered, master=self)
         self.create_image(0, 0, image=self._bar_image, anchor="nw")
+        self._draw_key = draw_key
 
     @staticmethod
+    @lru_cache(maxsize=32)
     def _render_image(width, canvas_height, bar_height, value, track_color, use_gradient, fill_color):
         from PIL import Image, ImageDraw
 
@@ -411,6 +423,7 @@ class DesktopShell:
         self.root.bind_all("<Configure>", self._track_window_resize, add="+")
         self.root.bind_all("<Map>", self._attach_window_resize_hook, add="+")
         self.root.bind_all("<Destroy>", self._forget_window_resize, add="+")
+        self.root.bind_all("<Unmap>", self._clear_unmapped_window_resize, add="+")
         self.shell = ttk.Frame(self.root, style="App.TFrame")
         self.shell.pack(fill="both", expand=True)
         self.shell.rowconfigure(1, weight=1)
@@ -513,14 +526,14 @@ class DesktopShell:
             if previous is None or previous == size:
                 return
             source = ("tk-window-configure", id(window))
-            self.resize_coordinator.set_source_active(source, True)
+            self.resize_coordinator.set_source_active(source, True, window=window)
             pending = self._resize_source_after.pop(source, None)
             if pending is not None:
                 self.root.after_cancel(pending)
 
-            def finish_resize(source_key=source):
+            def finish_resize(source_key=source, owner=window):
                 self._resize_source_after.pop(source_key, None)
-                self.resize_coordinator.set_source_active(source_key, False)
+                self.resize_coordinator.set_source_active(source_key, False, window=owner)
 
             self._resize_source_after[source] = self.root.after(120, finish_resize)
         except tk.TclError:
@@ -541,9 +554,12 @@ class DesktopShell:
 
     def _forget_window_resize(self, event):
         window = getattr(event, "widget", None)
+        self.resize_coordinator.discard_widget(window)
         hook = self._resize_message_hooks.pop(window, None)
         if hook is not None:
             hook.detach()
+        if isinstance(window, (tk.Tk, tk.Toplevel)):
+            self.resize_coordinator.clear_window(window)
         if window not in self._tracked_window_sizes:
             return
         self._tracked_window_sizes.pop(window, None)
@@ -554,7 +570,21 @@ class DesktopShell:
                 self.root.after_cancel(pending)
             except tk.TclError:
                 pass
-        self.resize_coordinator.set_source_active(source, False)
+        self.resize_coordinator.set_source_active(source, False, window=window)
+
+    def _clear_unmapped_window_resize(self, event):
+        window = getattr(event, "widget", None)
+        if not isinstance(window, (tk.Tk, tk.Toplevel)):
+            return
+        try:
+            if window.winfo_toplevel() is window:
+                self.resize_coordinator.resume_window(window)
+                source = ("tk-window-configure", id(window))
+                pending = self._resize_source_after.pop(source, None)
+                if pending is not None:
+                    self.root.after_cancel(pending)
+        except tk.TclError:
+            pass
 
     def _restore_sidebar_width(self) -> None:
         if not self.panes.winfo_exists():
@@ -904,12 +934,13 @@ class DesktopShell:
     def _poll(self):
         try:
             changed = self.palette != PALETTE or self.locale != self.app.language
+            render_needed = False
             if changed:
                 self.palette, self.locale = dict(PALETTE), self.app.language
                 self.update_icons()
                 for key,button in self.nav_buttons.items():
                     button.configure(image=self.nav_icons[(key,key==self.page)])
-                self.render(self.page)
+                render_needed = True
             try:
                 data, self.error = self.results.get_nowait()
                 self.loading = False
@@ -919,9 +950,11 @@ class DesktopShell:
                 else:
                     changed = True
                 if changed and not (self.page=="ledger" and isinstance(self.root.focus_get(),ttk.Entry)):
-                    self.render(self.page)
+                    render_needed = True
             except queue.Empty:
                 pass
+            if render_needed:
+                self.render(self.page)
             self.poll_count += 1
             if self.poll_count % 10 == 0:
                 try:
@@ -989,6 +1022,11 @@ class DesktopShell:
         if page == "entry":
             return
         body = self.contents[page]
+        if self.resize_coordinator.defer(
+            ("page-render", page), lambda value=page: self.render(value),
+            window=self.root, target=body,
+        ):
+            return
         position = self.canvases[page].yview()[0]
         for child in body.winfo_children():
             child.destroy()

@@ -5,7 +5,10 @@ from .desktop_frame import defer_during_interactive_resize
 
 import json
 import math
+import queue
 import re
+import threading
+from contextlib import nullcontext
 import tkinter as tk
 import unicodedata
 import zlib
@@ -297,70 +300,188 @@ def open_savings_plan(
     font_family: str = "Segoe UI",
     *,
     container: tk.Misc | None = None,
+    database_lock: Any = None,
 ) -> None:
-    today = date.fromisoformat(_today_japan())
-    cycle_start, cycle_end = billing_cycle(today)
-    end_day = min(cycle_end, today)
-    month_starts = _month_starts(today)
-    setting_key = f"savings_plan:{cycle_start.isoformat()}"
+    if container is None:
+        dialog = tk.Toplevel(parent)
+        dialog.title(translate("预算管理"))
+        dialog.geometry("1080x660")
+        dialog.minsize(960, 560)
+        dialog.transient(parent)
+        dialog.configure(bg=color("#f3f5f8"))
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        layout_parent: tk.Misc = dialog
+    else:
+        dialog = container.winfo_toplevel()
+        layout_parent = container
 
-    database: Database | None = None
+    loading = ttk.Label(
+        layout_parent, text=translate("正在读取预算数据…"), style="Hint.TLabel",
+    )
+    loading.grid(row=0, column=0, sticky="w", padx=16, pady=16)
+    results: queue.Queue[tuple[dict[str, Any] | None, str | None]] = queue.Queue()
+
+    def load_data() -> None:
+        database: Database | None = None
+        result = None
+        error = None
+        try:
+            today = date.fromisoformat(_today_japan())
+            cycle_start, cycle_end = billing_cycle(today)
+            end_day = min(cycle_end, today)
+            month_starts = _month_starts(today)
+            setting_key = f"savings_plan:{cycle_start.isoformat()}"
+            with (database_lock if database_lock is not None else nullcontext()):
+                database = Database(database_path)
+                categories = [
+                    str(row["name"]) for row in database.connection.execute(
+                        "SELECT name FROM categories WHERE kind='expense' AND is_active=1 ORDER BY name COLLATE NOCASE"
+                    ).fetchall()
+                ]
+                ledger_categories = set(categories)
+                rows = database.report_rows(month_starts[0].isoformat(), today.isoformat())
+                plan = _normalize_plan_categories(
+                    _read_plan(database, setting_key, _MONTHLY_PLAN_KEY), ledger_categories
+                )
+                database.close()
+                database = None
+            categories = sorted(ledger_categories)
+            category_colors = {
+                name: _PALETTE[index % len(_PALETTE)]
+                for index, name in enumerate(categories)
+            }
+            category_colors[str(translate("其他"))] = category_colors.get("其他", _PALETTE[-1])
+
+            daily = [0] * ((end_day - cycle_start).days + 1)
+            monthly_totals = {month: 0 for month in month_starts}
+            actual_by_category: dict[str, int] = {}
+            missing_fx_count = 0
+            for row in rows:
+                if row["kind"] != "expense" or row["balance_effect"] != "posted":
+                    continue
+                amount = _jpy_amount(row)
+                if amount is None:
+                    missing_fx_count += 1
+                    continue
+                if amount <= 0:
+                    continue
+                occurred = date.fromisoformat(str(row["occurred_on"]))
+                month_start = date(occurred.year, occurred.month, 1)
+                if month_start in monthly_totals:
+                    monthly_totals[month_start] += amount
+                if cycle_start <= occurred <= end_day:
+                    index = (occurred - cycle_start).days
+                    if 0 <= index < len(daily):
+                        daily[index] += amount
+                    category = str(row["category_name"] or "未分类")
+                    actual_by_category[category] = actual_by_category.get(category, 0) + amount
+            result = {
+                "today": today,
+                "cycle_start": cycle_start,
+                "cycle_end": cycle_end,
+                "end_day": end_day,
+                "month_starts": month_starts,
+                "setting_key": setting_key,
+                "categories": categories,
+                "ledger_categories": ledger_categories,
+                "plan": plan,
+                "category_colors": category_colors,
+                "daily": daily,
+                "daily_labels": [
+                    date.fromordinal(cycle_start.toordinal() + index).strftime("%m/%d")
+                    for index in range(len(daily))
+                ],
+                "monthly_values": [monthly_totals[month] for month in month_starts],
+                "monthly_labels": [month.strftime("%Y-%m") for month in month_starts],
+                "actual_by_category": actual_by_category,
+                "missing_fx_count": missing_fx_count,
+            }
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            if database is not None:
+                try:
+                    database.close()
+                except Exception as exc:
+                    if error is None:
+                        error = str(exc)
+        results.put((result, error))
+
     try:
-        database = Database(database_path)
-        categories = [
-            str(row["name"]) for row in database.connection.execute(
-                "SELECT name FROM categories WHERE kind='expense' AND is_active=1 ORDER BY name COLLATE NOCASE"
-            ).fetchall()
-        ]
-        ledger_categories = set(categories)
-        rows = database.report_rows(month_starts[0].isoformat(), today.isoformat())
-        plan = _normalize_plan_categories(
-            _read_plan(database, setting_key, _MONTHLY_PLAN_KEY), ledger_categories
-        )
-        categories = sorted(ledger_categories)
-        category_colors = {
-            name: _PALETTE[index % len(_PALETTE)]
-            for index, name in enumerate(categories)
-        }
-        other_color = category_colors.get("其他", _PALETTE[-1])
-        category_colors[str(translate("其他"))] = other_color
-    except Exception as exc:
-        if database is not None:
-            database.close()
+        threading.Thread(target=load_data, name="savings-plan-reader", daemon=True).start()
+    except RuntimeError as exc:
+        loading.destroy()
         messagebox.showerror("无法打开", f"{translate('预算管理无法读取：')}{exc}", parent=parent)
+        if container is None:
+            dialog.destroy()
         return
-    assert database is not None
 
-    daily = [0] * ((end_day - cycle_start).days + 1)
-    daily_labels = [
-        date.fromordinal(cycle_start.toordinal() + index).strftime("%m/%d")
-        for index in range(len(daily))
-    ]
-    monthly_totals = {month: 0 for month in month_starts}
-    monthly_values: list[int] = []
-    monthly_labels = [month.strftime("%Y-%m") for month in month_starts]
-    actual_by_category: dict[str, int] = {}
-    missing_fx_count = 0
-    for row in rows:
-        if row["kind"] != "expense" or row["balance_effect"] != "posted":
-            continue
-        amount = _jpy_amount(row)
-        if amount is None:
-            missing_fx_count += 1
-            continue
-        if amount <= 0:
-            continue
-        occurred = date.fromisoformat(str(row["occurred_on"]))
-        month_start = date(occurred.year, occurred.month, 1)
-        if month_start in monthly_totals:
-            monthly_totals[month_start] += amount
-        if cycle_start <= occurred <= end_day:
-            index = (occurred - cycle_start).days
-            if 0 <= index < len(daily):
-                daily[index] += amount
-            category = str(row["category_name"] or "未分类")
-            actual_by_category[category] = actual_by_category.get(category, 0) + amount
-    monthly_values = [monthly_totals[month] for month in month_starts]
+    def poll_results() -> None:
+        try:
+            if not layout_parent.winfo_exists():
+                return
+            data, error = results.get_nowait()
+        except queue.Empty:
+            try:
+                layout_parent.after(40, poll_results)
+            except tk.TclError:
+                pass
+            return
+        except tk.TclError:
+            return
+        try:
+            loading.destroy()
+        except tk.TclError:
+            pass
+        if error:
+            messagebox.showerror("无法打开", f"{translate('预算管理无法读取：')}{error}", parent=parent)
+            if container is None:
+                try:
+                    dialog.destroy()
+                except tk.TclError:
+                    pass
+            else:
+                ttk.Label(
+                    layout_parent, text=translate("预算数据无法加载，请关闭后重试。"), style="Hint.TLabel",
+                ).grid(row=0, column=0, sticky="w", padx=16, pady=16)
+            return
+        _build_savings_plan_loaded(
+            parent, database_path, font_family, container=layout_parent,
+            database_lock=database_lock, _loaded_data=data,
+        )
+
+    try:
+        layout_parent.after(40, poll_results)
+    except tk.TclError:
+        pass
+
+
+def _build_savings_plan_loaded(
+    parent: tk.Misc,
+    database_path: Path,
+    font_family: str = "Segoe UI",
+    *,
+    container: tk.Misc | None = None,
+    database_lock: Any = None,
+    _loaded_data: dict[str, Any],
+) -> None:
+    today = _loaded_data["today"]
+    cycle_start = _loaded_data["cycle_start"]
+    cycle_end = _loaded_data["cycle_end"]
+    end_day = _loaded_data["end_day"]
+    month_starts = _loaded_data["month_starts"]
+    setting_key = _loaded_data["setting_key"]
+    categories = _loaded_data["categories"]
+    ledger_categories = _loaded_data["ledger_categories"]
+    plan = _loaded_data["plan"]
+    category_colors = _loaded_data["category_colors"]
+    daily = _loaded_data["daily"]
+    daily_labels = _loaded_data["daily_labels"]
+    monthly_values = _loaded_data["monthly_values"]
+    monthly_labels = _loaded_data["monthly_labels"]
+    actual_by_category = _loaded_data["actual_by_category"]
+    missing_fx_count = _loaded_data["missing_fx_count"]
 
     if container is None:
         dialog = tk.Toplevel(parent)
@@ -553,8 +674,79 @@ def open_savings_plan(
     plan_pie_canvas.grid(row=0, column=0, sticky="nsew")
     plan_pie_empty = ttk.Label(plan_frame, text=translate("添加类别预算后显示预算分配"), style="Hint.TLabel")
 
-    def persist_plan() -> None:
-        database.set_setting(setting_key, json.dumps({"items": plan}, ensure_ascii=False), "本期各类别预算（JPY）")
+    save_results: queue.Queue[tuple[dict[str, int], str | None]] = queue.Queue()
+    save_state = {"running": False, "poll_after": None, "previous_plan": None}
+
+    def schedule_save_poll() -> None:
+        if save_state["poll_after"] is not None:
+            return
+        try:
+            if dialog.winfo_exists():
+                save_state["poll_after"] = dialog.after(50, poll_save_results)
+        except tk.TclError:
+            save_state["poll_after"] = None
+
+    def poll_save_results() -> None:
+        save_state["poll_after"] = None
+        try:
+            if not dialog.winfo_exists():
+                return
+            previous_plan, error = save_results.get_nowait()
+        except queue.Empty:
+            if save_state["running"]:
+                schedule_save_poll()
+            return
+        except tk.TclError:
+            return
+        save_state["running"] = False
+        for button in (edit_button, add_budget_button, remove_button):
+            button.configure(state="normal")
+        if error:
+            plan.clear()
+            plan.update(previous_plan)
+            refresh_plan()
+            messagebox.showerror("无法保存", f"{translate('类别预算保存失败：')}{error}", parent=dialog)
+
+    def persist_plan(previous_plan: dict[str, int]) -> bool:
+        if save_state["running"]:
+            return False
+        save_state["running"] = True
+        save_state["previous_plan"] = dict(previous_plan)
+        for button in (edit_button, add_budget_button, remove_button):
+            button.configure(state="disabled")
+        payload = json.dumps({"items": dict(plan)}, ensure_ascii=False)
+
+        def save() -> None:
+            database: Database | None = None
+            error = None
+            try:
+                with (database_lock if database_lock is not None else nullcontext()):
+                    database = Database(database_path)
+                    try:
+                        database.set_setting(setting_key, payload, "本期各类别预算（JPY）")
+                    finally:
+                        database.close()
+                        database = None
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                if database is not None:
+                    try:
+                        database.close()
+                    except Exception:
+                        pass
+            save_results.put((dict(previous_plan), error))
+
+        try:
+            threading.Thread(target=save, name="savings-plan-writer", daemon=True).start()
+        except RuntimeError as exc:
+            save_state["running"] = False
+            for button in (edit_button, add_budget_button, remove_button):
+                button.configure(state="normal")
+            messagebox.showerror("无法保存", f"{translate('类别预算保存失败：')}{exc}", parent=dialog)
+            return False
+        schedule_save_poll()
+        return True
 
     def refresh_plan() -> None:
         tree.delete(*tree.get_children())
@@ -674,10 +866,14 @@ def open_savings_plan(
                     parent=editor,
                 )
                 return
+            previous_plan = dict(plan)
             if editing:
                 plan.pop(category, None)
             plan[selected_category] = amount
-            persist_plan()
+            if not persist_plan(previous_plan):
+                plan.clear()
+                plan.update(previous_plan)
+                return
             refresh_plan()
             tree.selection_set(selected_category)
             remaining_tree.selection_set(selected_category)
@@ -712,8 +908,12 @@ def open_savings_plan(
             impact="只移除该类别本期预算设定，不会删除账务流水。",
         ):
             return
+        previous_plan = dict(plan)
         plan.pop(category, None)
-        persist_plan()
+        if not persist_plan(previous_plan):
+            plan.clear()
+            plan.update(previous_plan)
+            return
         refresh_plan()
 
     edit_button.configure(command=lambda: open_category_budget_dialog(editing=True))
@@ -835,7 +1035,6 @@ def open_savings_plan(
         if closed:
             return
         closed = True
-        database.close()
         if container is None:
             dialog.destroy()
 
