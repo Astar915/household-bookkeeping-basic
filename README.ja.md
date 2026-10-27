@@ -4,7 +4,7 @@
   <p><strong>「お金はどこへ？」を減らして、家計に安心を。</strong></p>
   <p>自然な文章で記帳し、口座・予算・レポートを一か所に。台帳は初期設定では自分の PC に保存されます。</p>
   <p>
-    <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest">🪟 Windows ポータブル版</a> ·
+    <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.exe">🪟 Windows EXE を直接ダウンロード</a> ·
     <a href="#初めて使うとき">🧭 初めて使うとき</a> ·
     <a href="#データとプライバシー">🔐 データとプライバシー</a>
   </p>
@@ -30,7 +30,7 @@
 
 ## 🧭 初めて使うとき
 
-1. **ダウンロードして起動**：下の Windows ポータブル版の手順を確認します。Python は不要です。
+1. **ダウンロードして起動**：下の Windows 単一ファイル版の手順を確認します。Python は不要です。
 2. **自分の口座と実際の残高を登録**：「資産」や「その他」で銀行、ウォレット、クレジットカードなどを設定します。新規利用時は空の台帳から始まります。
 3. **取引を記録**：「記録 → 家計簿」を開き、日付、用途、金額、通貨、口座を入力します。候補を確認して確定するとローカル台帳に保存されます。
 4. **いつでも確認**：「明細」で検索・修正、「その他 → 家計財務レポート」でレポートを確認し、ホーム画面で予算の進捗を見ます。
@@ -38,17 +38,16 @@
 
 > 🔒 銀行とは接続せず、支払いや返済を実行することもありません。台帳は初期設定ではこの PC に保存されます。リモートモデルやクラウドへデータが送信されるのは、利用者が設定して使用した場合のみです。
 
-## ⬇️ Windows ポータブル版（プログラミング不要）
+## ⬇️ Windows 単一ファイル版（プログラミング不要）
 
-**ダウンロード、展開、ダブルクリックの3ステップ：**
+**EXE をダウンロードしてダブルクリック：**
 
-1. [Windows ポータブル版 ZIP をダウンロード](https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.zip)
-2. ZIP の**すべてのファイル**をフォルダーに展開します。EXE だけを別の場所に移動しないでください。
-3. <code>HouseholdBookkeeping.exe</code> をダブルクリックします。Python、Git、開発ツールは不要です。
+1. [Windows x64 単一ファイル版を直接ダウンロード](https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.exe)
+2. <code>HouseholdBookkeeping-Windows-x64.exe</code> をダブルクリックします。初回起動時は実行ファイルを準備するため、起動まで少しお待ちください。展開、Python、Git、開発ツールは不要です。
 
 初回起動時に空の台帳が自動作成されます。台帳と設定は <code>%APPDATA%\HouseholdBookkeeping-Portable</code> に保存され、アプリ本体には含まれません。自然言語入力を使う場合は「設定 → API サービス」でモデルを設定してください。未設定でもローカル台帳の閲覧・管理はできます。
 
-> 🪟 コード署名がないため、Windows が「発行元不明」と表示する場合があります。このリポジトリの Releases からのみダウンロードし、ファイル名が <code>HouseholdBookkeeping-Windows-x64.zip</code> であることを確認してください。
+> 🪟 コード署名がないため、Windows が「発行元不明」と表示する場合があります。このリポジトリの Releases からのみダウンロードし、ファイル名が <code>HouseholdBookkeeping-Windows-x64.exe</code> であることを確認してください。
 
 ### 🧑‍💻 開発者：ソースから起動
 

@@ -4,8 +4,7 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $BuildEnvironment = Join-Path ([System.IO.Path]::GetTempPath()) "household-bookkeeping-pyinstaller"
 $BuildPython = Join-Path $BuildEnvironment "Scripts\python.exe"
 $DistPath = Join-Path $Root "dist"
-$AppDirectory = Join-Path $DistPath "HouseholdBookkeeping"
-$ArchivePath = Join-Path $DistPath "HouseholdBookkeeping-Windows-x64.zip"
+$ExecutablePath = Join-Path $DistPath "HouseholdBookkeeping-Windows-x64.exe"
 $WorkPath = Join-Path ([System.IO.Path]::GetTempPath()) "household-bookkeeping-pyinstaller-work"
 $SpecPath = Join-Path ([System.IO.Path]::GetTempPath()) "household-bookkeeping-pyinstaller-spec"
 
@@ -35,10 +34,10 @@ if (-not (Test-Path -LiteralPath $BundledSkill)) {
 $Arguments = @(
     "--noconfirm"
     "--clean"
-    "--onedir"
+    "--onefile"
     "--windowed"
     "--name"
-    "HouseholdBookkeeping"
+    "HouseholdBookkeeping-Windows-x64"
     "--icon"
     (Join-Path $Root "assets\desktop-mark.ico")
     "--add-data"
@@ -67,32 +66,8 @@ finally {
     Pop-Location
 }
 
-$ExecutablePath = Join-Path $AppDirectory "HouseholdBookkeeping.exe"
 if (-not (Test-Path -LiteralPath $ExecutablePath)) {
     throw "PyInstaller completed but the executable was not found: $ExecutablePath"
 }
 
-Copy-Item -LiteralPath (Join-Path $Root "LICENSE") -Destination $AppDirectory -Force
-$QuickStart = @'
-家庭记账 · Windows 免安装版
-
-1. 保持本文件、HouseholdBookkeeping.exe 和 _internal 文件夹在一起。
-2. 双击 HouseholdBookkeeping.exe 启动。
-3. 首次启动会创建空账本；账本和个人设置保存在当前 Windows 用户的 AppData 中。
-4. 自然语言记账需要自行配置模型服务；没有模型也能浏览和管理账本。
-
-软件不会连接银行或代为付款。请在“设置 → 账本与备份”创建备份。
-'@
-[System.IO.File]::WriteAllText(
-    (Join-Path $AppDirectory "快速开始.txt"),
-    $QuickStart,
-    [System.Text.UTF8Encoding]::new($false)
-)
-
-Compress-Archive -Path (Join-Path $AppDirectory "*") -DestinationPath $ArchivePath -Force
-if (-not (Test-Path -LiteralPath $ArchivePath)) {
-    throw "The Windows distribution archive was not created."
-}
-
 Write-Host "Windows app: $ExecutablePath"
-Write-Host "Download archive: $ArchivePath"

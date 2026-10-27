@@ -4,7 +4,7 @@
   <p><strong>Less “Where did the money go?” More peace of mind.</strong></p>
   <p>Record transactions in plain language and bring accounts, budgets, and reports together. Your ledger stays on your computer by default.</p>
   <p>
-    <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest">🪟 Get the Windows portable app</a> ·
+    <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.exe">🪟 Download the Windows EXE</a> ·
     <a href="#first-use">🧭 First use</a> ·
     <a href="#data-and-privacy">🔐 Data and privacy</a>
   </p>
@@ -30,7 +30,7 @@
 
 ## 🧭 First use
 
-1. **Download and open the app.** Follow the portable Windows steps below; Python is not required.
+1. **Download and open the app.** Follow the single-file Windows steps below; Python is not required.
 2. **Add your accounts and real balances.** Set up bank, wallet, and credit-card accounts under **Assets** and **More**. New installations start with an empty ledger.
 3. **Record an entry.** Open **Record → Bookkeeping** and enter the date, purpose, amount, currency, and account. Review the suggestion and confirm it before it is saved locally.
 4. **Review anytime.** Filter or correct entries under **Ledger**; find reports under **More → Household Financial Reports** and budget progress on the home page.
@@ -38,17 +38,16 @@
 
 > 🔒 The app does not connect to banks or make payments. Your ledger stays on this computer by default; data is sent to a remote model or cloud only when you configure and use those services.
 
-## ⬇️ Portable Windows app (no coding)
+## ⬇️ Single-file Windows app (no coding)
 
-**Download, extract, double-click:**
+**Download the EXE and double-click:**
 
-1. [Download the Windows portable ZIP](https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.zip).
-2. Extract **all files** from the ZIP into a folder. Keep the EXE beside its _internal folder.
-3. Double-click <code>HouseholdBookkeeping.exe</code>. You do not need Python, Git, or developer tools.
+1. [Download the single-file Windows x64 app](https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.exe).
+2. Double-click <code>HouseholdBookkeeping-Windows-x64.exe</code>. On first launch, it prepares its runtime files; give it a moment to open. No extraction, Python, Git, or developer tools are needed.
 
 The first launch creates an empty ledger. Your ledger and settings are stored under <code>%APPDATA%\HouseholdBookkeeping-Portable</code>, outside the app bundle. To use natural-language entry, configure a model under **Settings → API Services**. The app can open and manage the local ledger without one.
 
-> 🪟 Windows may show an “Unknown publisher” warning because this build is not code-signed. Download it only from this repository’s Releases and check that the filename is <code>HouseholdBookkeeping-Windows-x64.zip</code>.
+> 🪟 Windows may show an “Unknown publisher” warning because this build is not code-signed. Download it only from this repository’s Releases and check that the filename is <code>HouseholdBookkeeping-Windows-x64.exe</code>.
 
 ### 🧑‍💻 Developers: run from source
 

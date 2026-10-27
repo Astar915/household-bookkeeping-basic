@@ -4,7 +4,7 @@
   <p><strong>少一点“钱去哪了”，多一点心里有数。</strong></p>
   <p>像聊天一样记账，把账户、预算和报表放在一起；账本默认留在自己的电脑，选择权一直在你手里。</p>
   <p>
-    <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest">🪟 下载 Windows 免安装版</a> ·
+    <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.exe">🪟 直接下载 Windows EXE</a> ·
     <a href="#第一次使用">🧭 第一次使用</a> ·
     <a href="#数据与隐私">🔐 数据与隐私</a>
   </p>
@@ -30,7 +30,7 @@
 
 ## 🧭 第一次使用
 
-1. **下载并打开软件**：Windows 用户按下方“免安装启动”操作，不需要安装 Python。
+1. **下载并打开软件**：Windows 用户按下方“单文件启动”操作，不需要安装 Python。
 2. **登记自己的账户和真实余额**：在“资产”及“更多”中设置银行、钱包、信用卡等账户。新用户从空账本开始。
 3. **记一笔**：打开“记录 → 记账”，输入日期、用途、金额、币种和账户；检查识别结果，确认后才会写入本地账本。
 4. **随时核对**：在“账单”中筛选或修正记录；在“更多 → 家庭财务报表”看报表，在首页看预算进度。
@@ -38,17 +38,16 @@
 
 > 🔒 软件不会连接银行，也不会替你付款或还款。默认情况下，账本留在这台电脑；只有你主动配置远程模型或云同步时，相关内容才会发送到对应服务。
 
-## ⬇️ Windows 免安装版（零编程）
+## ⬇️ Windows 单文件版（零编程）
 
-**下载、解压、双击，三步打开：**
+**下载 EXE，双击即可启动：**
 
-1. [点此下载 Windows 绿色版 ZIP](https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.zip)
-2. 解压 ZIP 中的**全部文件**到一个文件夹，不要单独移动 EXE。
-3. 双击 <code>HouseholdBookkeeping.exe</code>。无需安装 Python、Git 或其他开发工具。
+1. [直接下载 Windows x64 单文件版](https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.exe)
+2. 下载完成后双击 <code>HouseholdBookkeeping-Windows-x64.exe</code>。首次启动会先准备运行文件，稍等片刻即可打开；无需解压、安装 Python、Git 或其他开发工具。
 
 首次运行会自动创建空账本。账本和设置保存在当前 Windows 用户的 <code>%APPDATA%\HouseholdBookkeeping-Portable</code>，不会打包在 EXE 里。想用自然语言记账时，再到“设置 → API 服务”配置模型；未配置模型也可以打开软件、浏览和维护本地数据。
 
-> 🪟 如果 Windows 提示“未知发布者”，是因为当前版本没有代码签名。请只从本仓库的 Releases 下载，并确认文件名为 <code>HouseholdBookkeeping-Windows-x64.zip</code> 后再运行。
+> 🪟 如果 Windows 提示“未知发布者”，是因为当前版本没有代码签名。请只从本仓库的 Releases 下载，并确认文件名为 <code>HouseholdBookkeeping-Windows-x64.exe</code> 后再运行。
 
 ### 🧑‍💻 开发者：从源码启动
 
