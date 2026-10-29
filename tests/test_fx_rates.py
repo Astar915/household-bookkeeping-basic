@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+import importlib.util
+import json
+import sys
 import unittest
 from contextlib import redirect_stdout
 from decimal import Decimal
@@ -76,6 +79,40 @@ class FxRateTests(unittest.TestCase):
             _report(self.db, "2026-10-15", "2026-10-15", None)
         self.assertIn("JPY合并口径（JPY原币 + CNY按交易日汇率折算）", printed.getvalue())
         self.assertIn("费用：-724 JPY", printed.getvalue())
+
+    def test_worker_fx_fetch_yields_to_and_replays_durable_fetch(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        worker_src = project / "cloudflare-full" / "python-d1" / "src"
+
+        def load_module(name: str, path: Path):
+            spec = importlib.util.spec_from_file_location(name, path)
+            self.assertIsNotNone(spec)
+            module = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            return module
+
+        worker_fx = load_module("worker_fx_rates_under_test", worker_src / "bookkeeping" / "fx_rates.py")
+        worker_jobs = load_module("worker_model_jobs_under_test", worker_src / "model_jobs.py")
+        first = worker_jobs.ReplayOpener([], "stable-ledger-revision")
+        self.db.external_opener = first
+
+        with self.assertRaises(worker_jobs.ModelRequestRequired) as requested:
+            worker_fx.resolve_jpy_rate(self.db, "CNY", "2026-10-27")
+
+        envelope = requested.exception.envelope
+        payload = json.dumps([
+            {"base": "EUR", "quote": "CNY", "date": "2026-10-26", "rate": "7.5"},
+            {"base": "EUR", "quote": "JPY", "date": "2026-10-26", "rate": "177"},
+        ]).encode("utf-8")
+        self.db.external_opener = worker_jobs.ReplayOpener([{
+            "requestHash": envelope["requestHash"], "status": 200, "body": payload,
+        }], "stable-ledger-revision")
+        resolved = worker_fx.resolve_jpy_rate(self.db, "CNY", "2026-10-27")
+
+        self.assertEqual(resolved.rate, Decimal("23.6"))
+        self.assertEqual(resolved.rate_date, "2026-10-26")
 
 
 if __name__ == "__main__":

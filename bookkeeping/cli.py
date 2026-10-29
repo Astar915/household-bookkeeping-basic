@@ -76,7 +76,7 @@ def _add_global_parser() -> argparse.ArgumentParser:
     report.add_argument("--to", dest="end", required=True)
     report.add_argument("--currency")
 
-    cycle = sub.add_parser("billing-cycle", help="查询某日所属15日至14日账期")
+    cycle = sub.add_parser("billing-cycle", help="按账本账期设置查询某日所属期间")
     cycle.add_argument("date")
 
     transactions = sub.add_parser("transactions", help="列出收支和转账记录")
@@ -210,7 +210,17 @@ def _report(db: Database, start: str, end: str, currency_filter: str | None) -> 
 
 def run(args: argparse.Namespace) -> int:
     if args.command == "billing-cycle":
-        start, end = billing_cycle(args.date)
+        start_day = 15
+        if args.db.is_file():
+            database = Database(args.db)
+            try:
+                start_day = database.get_billing_cycle_start_day()
+            except sqlite3.Error:
+                # Keep this utility usable for old or not-yet-initialized files.
+                pass
+            finally:
+                database.close()
+        start, end = billing_cycle(args.date, start_day)
         print(f"{start.isoformat()} 至 {end.isoformat()}")
         return 0
 

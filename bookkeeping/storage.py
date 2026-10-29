@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import re
 import sqlite3
 import unicodedata
@@ -346,20 +347,34 @@ def _current_japan_year() -> int:
     return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).year
 
 
-def billing_cycle(value: str | date) -> tuple[date, date]:
+def billing_cycle(value: str | date, start_day: int = 15) -> tuple[date, date]:
+    """Return the billing period containing ``value`` for a monthly start day.
+
+    Months without the selected day use their last calendar day. This keeps
+    periods contiguous (for example, a 31st-day cycle starts on February 28).
+    """
+    if isinstance(start_day, bool) or not isinstance(start_day, int) or not 1 <= start_day <= 31:
+        raise LedgerError("账期起始日必须是1到31之间的整数")
     day = parse_date(value) if isinstance(value, str) else value
-    if day.day >= 15:
-        start = date(day.year, day.month, 15)
+
+    def month_start(year: int, month: int) -> date:
+        effective_day = min(start_day, calendar.monthrange(year, month)[1])
+        return date(year, month, effective_day)
+
+    current_start = month_start(day.year, day.month)
+    if day >= current_start:
+        start = current_start
         if day.month == 12:
-            end = date(day.year + 1, 1, 14)
+            next_start = month_start(day.year + 1, 1)
         else:
-            end = date(day.year, day.month + 1, 14)
+            next_start = month_start(day.year, day.month + 1)
+        end = next_start - timedelta(days=1)
     else:
         if day.month == 1:
-            start = date(day.year - 1, 12, 15)
+            start = month_start(day.year - 1, 12)
         else:
-            start = date(day.year, day.month - 1, 15)
-        end = date(day.year, day.month, 14)
+            start = month_start(day.year, day.month - 1)
+        end = current_start - timedelta(days=1)
     return start, end
 
 
@@ -696,6 +711,24 @@ class Database:
         ).fetchone()
         return str(row["value"]) if row is not None else default
 
+    def get_billing_cycle_start_day(self) -> int:
+        """Read the ledger's configurable cycle day, defaulting safely to 15."""
+        value = self.get_setting("billing_cycle_start_day", "15").strip()
+        try:
+            day = int(value)
+        except (TypeError, ValueError):
+            return 15
+        return day if 1 <= day <= 31 else 15
+
+    def set_billing_cycle_start_day(self, day: int) -> None:
+        if isinstance(day, bool) or not isinstance(day, int) or not 1 <= day <= 31:
+            raise LedgerError("账期起始日必须是1到31之间的整数")
+        self.set_setting(
+            "billing_cycle_start_day",
+            str(day),
+            "Each billing period starts on this day; dates are clamped to month end when needed.",
+        )
+
     def set_setting(self, key: str, value: str, note: str = "") -> None:
         self.connection.execute(
             "INSERT OR REPLACE INTO settings(key,value,note) VALUES (?,?,?)",
@@ -934,7 +967,8 @@ class Database:
             self.connection.execute("UPDATE transactions SET currency='JPY' WHERE currency='PTS'")
             self.connection.execute(
                 "UPDATE currencies SET name='Legacy points unit (stored as JPY equivalent)',"
-                "minor_digits=0,is_monetary=0 WHERE code='PTS'"
+                "minor_digits=0,is_monetary=0 WHERE code='PTS' AND ("
+                "name!='Legacy points unit (stored as JPY equivalent)' OR minor_digits!=0 OR is_monetary!=0)"
             )
 
     def currency(self, code: str) -> sqlite3.Row:

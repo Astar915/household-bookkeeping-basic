@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+from io import BytesIO
 import json
 import os
 import shutil
@@ -516,12 +518,22 @@ def _http_json(
     request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.getcode() == 304:
+                response_headers = {key.lower(): value for key, value in response.headers.items()}
+                response_headers["x-household-not-modified"] = "true"
+                return {}, response_headers
             raw = response.read()
             result = json.loads(raw.decode("utf-8")) if raw else {}
             if not isinstance(result, dict):
                 raise GitHubSyncError("GitHub 返回了无法识别的响应。")
             return result, {key.lower(): value for key, value in response.headers.items()}
     except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            response_headers = {
+                key.lower(): value for key, value in (exc.headers.items() if exc.headers else [])
+            }
+            response_headers["x-household-not-modified"] = "true"
+            return {}, response_headers
         details = ""
         try:
             parsed = json.loads(exc.read().decode("utf-8", errors="replace"))
@@ -657,23 +669,39 @@ class GitHubClient:
         payload: dict[str, Any] | None = None,
         timeout: float = 25,
     ) -> dict[str, Any]:
+        result, _response_headers = self.request_with_headers(
+            path, method=method, payload=payload, timeout=timeout
+        )
+        return result
+
+    def request_with_headers(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 25,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-        headers = self._headers()
+        request_headers = self._headers()
+        request_headers.update(headers or {})
         if body is not None:
-            headers["Content-Type"] = "application/json"
+            request_headers["Content-Type"] = "application/json"
         try:
-            result, _ = _http_json(
-                GITHUB_API + path, method=method, headers=headers, body=body, timeout=timeout
+            result, response_headers = _http_json(
+                GITHUB_API + path, method=method, headers=request_headers, body=body, timeout=timeout
             )
         except GitHubAuthError:
             self._refresh_access_token()
-            headers = self._headers()
+            request_headers = self._headers()
+            request_headers.update(headers or {})
             if body is not None:
-                headers["Content-Type"] = "application/json"
-            result, _ = _http_json(
-                GITHUB_API + path, method=method, headers=headers, body=body, timeout=timeout
+                request_headers["Content-Type"] = "application/json"
+            result, response_headers = _http_json(
+                GITHUB_API + path, method=method, headers=request_headers, body=body, timeout=timeout
             )
-        return result
+        return result, response_headers
 
     def _refresh_access_token(self) -> None:
         if not self.refresh_token or not self.client_id:
@@ -799,6 +827,73 @@ class GitHubClient:
             raise GitHubSyncError("GitHub 未返回同步文件版本编号。")
         return sha
 
+    def bundle_sha_with_etag(
+        self,
+        repository: str,
+        etag: str | None = None,
+    ) -> tuple[str | None, str | None, bool]:
+        """Read the current blob SHA, reusing a cached ETag when the file is unchanged."""
+        sha, current_etag, unchanged, _body = self._bundle_metadata(repository, etag)
+        return sha, current_etag, unchanged
+
+    def bundle_snapshot_with_etag(
+        self,
+        repository: str,
+        etag: str | None = None,
+    ) -> tuple[str | None, str | None, bool, bytes | None]:
+        """Read version metadata and reuse any small-file body returned with it."""
+        try:
+            return self._bundle_metadata(
+                repository, etag, include_body=True
+            )
+        except GitHubNotFound:
+            return None, None, False, None
+
+    def _bundle_metadata(
+        self,
+        repository: str,
+        etag: str | None = None,
+        *,
+        include_body: bool = False,
+    ) -> tuple[str | None, str | None, bool, bytes | None]:
+        headers = {"If-None-Match": etag} if etag else None
+        try:
+            result, response_headers = self.request_with_headers(
+                self._bundle_contents_path(repository), headers=headers
+            )
+        except GitHubNotFound:
+            return None, None, False, None
+        if response_headers.get("x-household-not-modified") == "true":
+            return None, response_headers.get("etag") or etag, True, None
+        sha = result.get("sha")
+        if not isinstance(sha, str) or not sha:
+            raise GitHubSyncError("GitHub 未返回同步文件版本编号。")
+        body = None
+        encoded = result.get("content")
+        if include_body and result.get("encoding") == "base64" and isinstance(encoded, str) and encoded.strip():
+            try:
+                body = base64.b64decode(encoded)
+            except (ValueError, TypeError) as exc:
+                raise GitHubSyncError("GitHub 返回的账本内容无法解码。") from exc
+            if len(body) > MAX_SYNC_BUNDLE_BYTES:
+                raise GitHubSyncError("GitHub 同步包超过 60 MB，无法下载。")
+            reported_size = result.get("size")
+            if isinstance(reported_size, int) and not isinstance(reported_size, bool) and reported_size != len(body):
+                raise GitHubSyncError("GitHub 返回的账本内容长度不匹配。")
+            actual_sha = hashlib.sha1(f"blob {len(body)}\0".encode("ascii") + body).hexdigest()
+            if actual_sha != sha:
+                raise GitHubSyncError("GitHub 返回的账本内容校验失败。")
+        return sha, response_headers.get("etag"), False, body
+
+    @staticmethod
+    def _bundle_blob_path(repository: str, sha: str) -> str:
+        owner, repo = repository.split("/", 1)
+        return "/repos/{}/{}/git/blobs/{}".format(
+            urllib.parse.quote(owner, safe=""),
+            urllib.parse.quote(repo, safe=""),
+            urllib.parse.quote(sha, safe=""),
+        )
+
     def sync_bundle_exists(self, repository: str) -> bool:
         return self.bundle_sha(repository) is not None
 
@@ -806,20 +901,61 @@ class GitHubClient:
         data, _sha = self.download_bundle_with_revision(repository)
         return data
 
-    def download_bundle_with_revision(self, repository: str) -> tuple[bytes, str]:
+    def download_bundle_with_revision(
+        self,
+        repository: str,
+        *,
+        initial_sha: str | None = None,
+        initial_etag: str | None = None,
+        initial_data: bytes | None = None,
+    ) -> tuple[bytes, str]:
         """Download one stable cloud version and return its blob SHA checkpoint."""
-        path = self._bundle_contents_path(repository)
         for _attempt in range(3):
-            before_sha = self.bundle_sha(repository)
+            if initial_sha:
+                before_sha, before_etag, data = initial_sha, initial_etag, initial_data
+                initial_sha = initial_etag = initial_data = None
+            else:
+                before_sha, before_etag, not_modified, data = self._bundle_metadata(
+                    repository, include_body=True
+                )
+                if not_modified:
+                    before_sha, before_etag, not_modified, data = self._bundle_metadata(repository)
             if before_sha is None:
                 raise GitHubNotFound("GitHub 仓库中还没有账本备份。")
-            data = self.request_raw(path)
-            after_sha = self.bundle_sha(repository)
-            if before_sha == after_sha:
-                if len(data) > MAX_SYNC_BUNDLE_BYTES:
-                    raise GitHubSyncError("GitHub 同步包超过 60 MB，无法下载。")
+            if data is None:
+                data = self.request_raw(self._bundle_blob_path(repository, before_sha))
+            if len(data) > MAX_SYNC_BUNDLE_BYTES:
+                raise GitHubSyncError("GitHub 同步包超过 60 MB，无法下载。")
+            actual_sha = hashlib.sha1(f"blob {len(data)}\0".encode("ascii") + data).hexdigest()
+            if actual_sha != before_sha:
+                raise GitHubSyncError("GitHub 返回的账本内容校验失败。")
+            after_sha, _after_etag, unchanged, _unused = self._bundle_metadata(
+                repository, before_etag
+            )
+            if unchanged or before_sha == after_sha:
                 return data, before_sha
         raise GitHubSyncConflict("下载期间 GitHub 云端同步文件发生变化，请重新恢复。")
+
+
+def sync_bundle_created_at(bundle: bytes) -> str:
+    """Read and validate the timestamp embedded in a sync bundle manifest."""
+    try:
+        with zipfile.ZipFile(BytesIO(bundle)) as archive:
+            item = archive.getinfo("manifest.json")
+            if item.file_size > 1024 * 1024:
+                raise GitHubSyncError("云端备份清单过大。")
+            manifest = json.loads(archive.read(item))
+        created = manifest.get("created_at", "")
+        if not isinstance(created, str) or not created:
+            raise GitHubSyncError("云端备份清单缺少创建时间。")
+        parsed = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise GitHubSyncError("云端备份时间缺少时区。")
+        return created
+    except GitHubSyncError:
+        raise
+    except (AttributeError, KeyError, ValueError, TypeError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        raise GitHubSyncError("云端账本备份清单无效。") from exc
 
 
 def create_sync_bundle(
@@ -1073,9 +1209,39 @@ def restore_sync_bundle(
             with staged_database.open("rb+") as stream:
                 os.fsync(stream.fileno())
             os.replace(staged_database, database_path)
+        except PermissionError as replace_error:
+            # Windows may refuse to rename an SQLite file while a short-lived
+            # reader still has it open. Keep the validated staged database and
+            # let SQLite replace the contents under its own locking protocol.
+            source_connection = None
+            destination_connection = None
+            try:
+                source_connection = sqlite3.connect(staged_database, timeout=30)
+                destination_connection = sqlite3.connect(database_path, timeout=30)
+                destination_connection.execute("PRAGMA busy_timeout = 30000")
+                source_connection.backup(destination_connection, pages=256, sleep=0.05)
+                integrity = destination_connection.execute("PRAGMA integrity_check").fetchone()
+                foreign_keys = destination_connection.execute("PRAGMA foreign_key_check").fetchall()
+                if not integrity or integrity[0] != "ok" or foreign_keys:
+                    raise sqlite3.DatabaseError("restored ledger integrity check failed")
+            except (OSError, sqlite3.Error) as fallback_error:
+                staged_database.unlink(missing_ok=True)
+                raise GitHubSyncError(
+                    "无法替换本机账本；SQLite 安全恢复也未完成。"
+                    f"系统错误：{replace_error}；回退错误：{fallback_error}。"
+                    f"恢复前备份保存在：{local_backup}"
+                ) from fallback_error
+            finally:
+                if destination_connection is not None:
+                    destination_connection.close()
+                if source_connection is not None:
+                    source_connection.close()
+            staged_database.unlink(missing_ok=True)
         except OSError as exc:
             staged_database.unlink(missing_ok=True)
-            raise GitHubSyncError(f"无法替换本机账本；恢复前备份保存在：{local_backup}") from exc
+            raise GitHubSyncError(
+                f"无法替换本机账本；系统错误：{exc}。恢复前备份保存在：{local_backup}"
+            ) from exc
 
         try:
             if payment is not None:

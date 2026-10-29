@@ -213,7 +213,7 @@ def _completeness_label(value: str) -> str:
 def build_profit_statement(database: Database, as_of: str | date) -> dict[str, Any]:
     """Summarize native-currency activity and a transaction-date JPY total."""
     as_of_date = parse_date(as_of) if isinstance(as_of, str) else as_of
-    start, end = billing_cycle(as_of_date)
+    start, end = billing_cycle(as_of_date, database.get_billing_cycle_start_day())
     through = min(end, as_of_date)
     rows = database.report_rows(start.isoformat(), through.isoformat())
     currency_codes = {row["currency"] for row in rows}

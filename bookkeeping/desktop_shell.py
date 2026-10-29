@@ -6,16 +6,21 @@ through the existing, confirmed desktop workflows; it never imports a web ledger
 from __future__ import annotations
 
 import math
+import base64
 import queue
 import re
+import struct
 import threading
+import zlib
 from functools import lru_cache
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .credit_management import credit_card_overview
-from .desktop_theme import PALETTE, RoundedPanel
+from .desktop_theme import (
+    PALETTE, RoundedPanel, pillow_photo_available, pillow_photo_image,
+)
 from .desktop_frame import (
     DesktopFrame, DesktopPanedWindow, ResizeRenderCoordinator, WindowResizeMessageHook, center_window,
     defer_during_interactive_resize,
@@ -32,7 +37,61 @@ from .natural_language import _today_japan
 from .storage import Database, minor_to_text
 
 
-def read_overview(path):
+HERO_CORNER_RADIUS = 20
+
+
+def _hero_gradient_png_data(width, height, radius, start, end, supersample=4):
+    """Return a cached-friendly, antialiased rounded gradient PNG for Tk."""
+    width, height = max(1, int(width)), max(1, int(height))
+    radius = max(0.0, min(float(radius), width / 2, height / 2))
+    colors = [
+        tuple(round(a + (b - a) * x / max(1, width - 1)) for a, b in zip(start, end))
+        for x in range(width)
+    ]
+
+    def corner_alpha(x, y):
+        if radius <= 0:
+            return 255
+        in_left = x < radius
+        in_right = x >= width - radius
+        in_top = y < radius
+        in_bottom = y >= height - radius
+        if not ((in_left or in_right) and (in_top or in_bottom)):
+            return 255
+
+        cx = radius if in_left else width - radius
+        cy = radius if in_top else height - radius
+        inside = 0
+        samples = supersample * supersample
+        for sy in range(supersample):
+            py = y + (sy + 0.5) / supersample
+            for sx in range(supersample):
+                px = x + (sx + 0.5) / supersample
+                if (px - cx) ** 2 + (py - cy) ** 2 <= radius ** 2:
+                    inside += 1
+        return round(255 * inside / samples)
+
+    scanlines = bytearray()
+    for y in range(height):
+        scanlines.append(0)  # PNG filter: None
+        for x, rgb in enumerate(colors):
+            alpha = corner_alpha(x, y)
+            scanlines.extend((*rgb, alpha))
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data +
+                struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">2I5B", width, height, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes(scanlines), 6))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode("ascii")
+
+
+def read_overview(path, transaction_limit=2000):
     database = Database(path)
     try:
         database.connection.execute("PRAGMA query_only=ON")
@@ -48,7 +107,8 @@ def read_overview(path):
                LEFT JOIN accounts a ON a.id=t.account_id
                LEFT JOIN accounts b ON b.id=t.to_account_id
                JOIN currencies currency ON currency.code=t.currency
-               ORDER BY t.occurred_on DESC,t.id DESC LIMIT 2000"""
+               ORDER BY t.occurred_on DESC,t.id DESC LIMIT ?""",
+            (max(0, int(transaction_limit)),),
         )]
         cards = credit_card_overview(database, as_of=today)
         return {"balance": balance, "profit": profit, "settings": settings,
@@ -122,17 +182,17 @@ class RoundedProgressBar(tk.Canvas):
             return
         self.delete("all")
         try:
-            from PIL import ImageTk
-        except ImportError:
+            rendered = self._render_image(
+                width, canvas_height, self.bar_height, fill_pixels / width,
+                self.track_color, self.gradient, self.fill_color,
+            )
+            self._bar_image = pillow_photo_image(rendered, master=self)
+        except Exception:
+            self._bar_image = None
+        if self._bar_image is None:
             self._draw_canvas_fallback(width, canvas_height)
             self._draw_key = draw_key
             return
-
-        rendered = self._render_image(
-            width, canvas_height, self.bar_height, fill_pixels / width,
-            self.track_color, self.gradient, self.fill_color,
-        )
-        self._bar_image = ImageTk.PhotoImage(rendered, master=self)
         self.create_image(0, 0, image=self._bar_image, anchor="nw")
         self._draw_key = draw_key
 
@@ -322,81 +382,124 @@ class GradientHero(tk.Canvas):
 
     def _draw_gradient_background(self, width, height):
         """Supersample the card gradient and rounded edge to remove Canvas stair steps."""
-        try:
-            from PIL import Image, ImageDraw, ImageTk
-        except ImportError:
-            start,end=((30,50,76),(61,65,98)) if PALETTE["background"]=="#11131b" else ((24,46,80),(62,76,119))
-            for x in range(0, width, 2):
-                ratio = x / max(1, width-1)
-                rgb = tuple(round(a+(b-a)*ratio) for a,b in zip(start,end))
-                self.create_rectangle(x, 0, x+2, height, fill="#%02x%02x%02x" % rgb, outline="")
-            self.create_arc(0, 0, 28, 28, start=90, extent=90, outline=PALETTE["background"], width=14)
-            self.create_arc(width-28, 0, width, 28, start=0, extent=90, outline=PALETTE["background"], width=14)
-            self.create_arc(width-28, height-28, width, height, start=270, extent=90, outline=PALETTE["background"], width=14)
-            self.create_arc(0, height-28, 28, height, start=180, extent=90, outline=PALETTE["background"], width=14)
-            return
-
         key = (width, height, PALETTE["background"])
-        if self._hero_image_key != key:
-            scale = 4
-            pixel_width, pixel_height = width*scale, height*scale
-            start,end=((30,50,76),(61,65,98)) if PALETTE["background"]=="#11131b" else ((24,46,80),(62,76,119))
-            gradient = Image.new("RGB", (pixel_width, 1))
-            gradient.putdata([
-                tuple(round(a+(b-a)*x/max(1,pixel_width-1)) for a,b in zip(start,end))
-                for x in range(pixel_width)
-            ])
-            bitmap = gradient.resize((pixel_width, pixel_height), Image.Resampling.BILINEAR).convert("RGBA")
-            mask = Image.new("L", (pixel_width, pixel_height), 0)
-            ImageDraw.Draw(mask).rounded_rectangle(
-                (0, 0, pixel_width-1, pixel_height-1), radius=14*scale, fill=255
+        if not pillow_photo_available():
+            self._draw_gradient_canvas(width, height)
+            return
+        try:
+            from PIL import Image, ImageDraw
+            if self._hero_image_key != key:
+                scale = 4
+                pixel_width, pixel_height = width*scale, height*scale
+                start,end=((30,50,76),(61,65,98)) if PALETTE["background"]=="#11131b" else ((24,46,80),(62,76,119))
+                gradient = Image.new("RGB", (pixel_width, 1))
+                gradient.putdata([
+                    tuple(round(a+(b-a)*x/max(1,pixel_width-1)) for a,b in zip(start,end))
+                    for x in range(pixel_width)
+                ])
+                bitmap = gradient.resize((pixel_width, pixel_height), Image.Resampling.BILINEAR).convert("RGBA")
+                mask = Image.new("L", (pixel_width, pixel_height), 0)
+                ImageDraw.Draw(mask).rounded_rectangle(
+                    (0, 0, pixel_width-1, pixel_height-1),
+                    radius=HERO_CORNER_RADIUS*scale, fill=255
+                )
+                bitmap.putalpha(mask)
+                bitmap = bitmap.resize((width, height), Image.Resampling.LANCZOS)
+                self._hero_image = pillow_photo_image(bitmap, master=self)
+                self._hero_image_key = key
+                if self._hero_image is None:
+                    self._draw_gradient_canvas(width, height)
+                    return
+            if self._hero_image is None:
+                self._draw_gradient_canvas(width, height)
+                return
+            self.create_image(0, 0, anchor="nw", image=self._hero_image, tags=("hero-background",))
+            self.tag_lower("hero-background")
+        except Exception:
+            self._draw_gradient_canvas(width, height)
+
+    def _draw_gradient_canvas(self, width, height):
+        """Use Tk's PNG decoder for a smooth gradient when Pillow's bridge fails."""
+        start,end=((30,50,76),(61,65,98)) if PALETTE["background"]=="#11131b" else ((24,46,80),(62,76,119))
+        key = (width, height, PALETTE["background"])
+        try:
+            if self._hero_image is None or self._hero_image_key != key:
+                self._hero_image = tk.PhotoImage(
+                    master=self,
+                    data=_hero_gradient_png_data(
+                        width, height, HERO_CORNER_RADIUS, start, end
+                    ),
+                    format="png",
+                )
+                self._hero_image_key = key
+            self.create_image(
+                0, 0, anchor="nw", image=self._hero_image,
+                tags=("hero-background",),
             )
-            bitmap.putalpha(mask)
-            bitmap = bitmap.resize((width, height), Image.Resampling.LANCZOS)
-            self._hero_image = ImageTk.PhotoImage(bitmap, master=self)
-            self._hero_image_key = key
-        self.create_image(0, 0, anchor="nw", image=self._hero_image, tags=("hero-background",))
-        self.tag_lower("hero-background")
+            self.tag_lower("hero-background")
+            return
+        except tk.TclError:
+            self._hero_image = None
+            self._hero_image_key = None
+
+        # Older Tk builds without PNG support retain a dependency-free fallback.
+        radius = min(float(HERO_CORNER_RADIUS), height / 2, width / 2)
+        for x in range(width):
+            midpoint = x + 0.5
+            edge_distance = min(midpoint, width - midpoint)
+            inset = (radius - math.sqrt(max(0.0, radius*radius - (radius-edge_distance)**2))
+                     if edge_distance < radius else 0.0)
+            ratio = midpoint / max(1, width-1)
+            rgb = tuple(round(a+(b-a)*ratio) for a,b in zip(start,end))
+            self.create_rectangle(x, inset, x+1, height-inset,
+                                  fill="#%02x%02x%02x" % rgb, outline="")
 
     def _draw_mode_toggle(self, center_x, center_y, background):
-        try:
-            from PIL import Image, ImageDraw, ImageTk
-        except ImportError:
-            tags = ("hero-mode-toggle",)
-            radius = 13
-            self.create_oval(center_x-radius, center_y-radius, center_x+radius, center_y+radius,
-                             fill=background, outline="#91a9cf", width=1, tags=tags)
-            self.create_arc(center_x-7, center_y-7, center_x+7, center_y+7,
-                            start=45, extent=285, style="arc", outline="#e0e9f7", width=2, tags=tags)
+        if not pillow_photo_available():
+            self._draw_mode_toggle_canvas(center_x, center_y, background)
             return
+        try:
+            from PIL import Image, ImageDraw
+            key = (background, "light", 28)
+            if self._toggle_image_key != key:
+                scale, size = 4, 28
+                image = Image.new("RGBA", (size*scale, size*scale), (0,0,0,0))
+                draw = ImageDraw.Draw(image)
+                draw.ellipse((scale, scale, (size-1)*scale, (size-1)*scale),
+                             fill=(*tuple(int(background[index:index+2],16) for index in (1,3,5)),255),
+                             outline=(145,169,207,255), width=scale)
+                cx = cy = (size*scale)//2
+                radius = 6*scale
+                draw.arc((cx-radius, cy-radius, cx+radius, cy+radius), 45, 325,
+                         fill=(224,233,247,255), width=2*scale)
+                angle = math.radians(325)
+                tip = (cx+radius*math.cos(angle), cy+radius*math.sin(angle))
+                tangent = (-math.sin(angle), math.cos(angle))
+                normal = (-tangent[1], tangent[0])
+                base = (tip[0]-4*scale*tangent[0], tip[1]-4*scale*tangent[1])
+                wing = 2*scale
+                draw.polygon((tip,
+                              (base[0]+wing*normal[0], base[1]+wing*normal[1]),
+                              (base[0]-wing*normal[0], base[1]-wing*normal[1])),
+                             fill=(224,233,247,255))
+                image = image.resize((size, size), Image.Resampling.LANCZOS)
+                self._toggle_image = pillow_photo_image(image, master=self)
+                self._toggle_image_key = key
+            if self._toggle_image is None:
+                self._draw_mode_toggle_canvas(center_x, center_y, background)
+                return
+            self.create_image(center_x-14, center_y-14, anchor="nw", image=self._toggle_image,
+                              tags=("hero-mode-toggle",))
+        except Exception:
+            self._draw_mode_toggle_canvas(center_x, center_y, background)
 
-        key = (background, "light", 28)
-        if self._toggle_image_key != key:
-            scale, size = 4, 28
-            image = Image.new("RGBA", (size*scale, size*scale), (0,0,0,0))
-            draw = ImageDraw.Draw(image)
-            draw.ellipse((scale, scale, (size-1)*scale, (size-1)*scale),
-                         fill=(*tuple(int(background[index:index+2],16) for index in (1,3,5)),255),
-                         outline=(145,169,207,255), width=scale)
-            cx = cy = (size*scale)//2
-            radius = 6*scale
-            draw.arc((cx-radius, cy-radius, cx+radius, cy+radius), 45, 325,
-                     fill=(224,233,247,255), width=2*scale)
-            angle = math.radians(325)
-            tip = (cx+radius*math.cos(angle), cy+radius*math.sin(angle))
-            tangent = (-math.sin(angle), math.cos(angle))
-            normal = (-tangent[1], tangent[0])
-            base = (tip[0]-4*scale*tangent[0], tip[1]-4*scale*tangent[1])
-            wing = 2*scale
-            draw.polygon((tip,
-                          (base[0]+wing*normal[0], base[1]+wing*normal[1]),
-                          (base[0]-wing*normal[0], base[1]-wing*normal[1])),
-                         fill=(224,233,247,255))
-            image = image.resize((size, size), Image.Resampling.LANCZOS)
-            self._toggle_image = ImageTk.PhotoImage(image, master=self)
-            self._toggle_image_key = key
-        self.create_image(center_x-14, center_y-14, anchor="nw", image=self._toggle_image,
-                          tags=("hero-mode-toggle",))
+    def _draw_mode_toggle_canvas(self, center_x, center_y, background):
+        tags = ("hero-mode-toggle",)
+        radius = 13
+        self.create_oval(center_x-radius, center_y-radius, center_x+radius, center_y+radius,
+                         fill=background, outline="#91a9cf", width=1, tags=tags)
+        self.create_arc(center_x-7, center_y-7, center_x+7, center_y+7,
+                        start=45, extent=285, style="arc", outline="#e0e9f7", width=2, tags=tags)
 
 
 class DesktopShell:
@@ -406,6 +509,11 @@ class DesktopShell:
         self.snapshot = None
         self.hidden = False
         self.loading = False
+        self.loading_transaction_limit = 0
+        self.loading_signature = None
+        self.snapshot_signature = None
+        self.snapshot_transaction_limit = 0
+        self.refresh_pending = False
         self.results = queue.Queue()
         self.palette = dict(PALETTE)
         self.locale = app.language
@@ -916,15 +1024,39 @@ class DesktopShell:
             self.canvases[page].after_idle(lambda value=page:self.canvases[value].yview_moveto(0))
             self.refresh()
 
-    def refresh(self):
-        if self.loading or self.app._github_restore_in_progress:
+    def _database_signature(self):
+        paths = (self.app.database_path, Path(str(self.app.database_path) + "-wal"))
+        return tuple(
+            (path.stat().st_mtime_ns, path.stat().st_size) if path.exists() else None
+            for path in paths
+        ) + (_today_japan(),)
+
+    def refresh(self, force=False):
+        if self.page in {"entry", "more"} or self.app._github_restore_in_progress:
             return
+        transaction_limit = 2000 if self.page == "ledger" else 5
+        try:
+            signature = self._database_signature()
+        except OSError:
+            signature = None
+        if self.loading:
+            if (transaction_limit > self.loading_transaction_limit or
+                    (force and signature != self.loading_signature)):
+                self.refresh_pending = True
+            return
+        if (not force and self.snapshot is not None and
+                signature == self.snapshot_signature and
+                transaction_limit <= self.snapshot_transaction_limit):
+            return
+        self.file_signature = signature
         self.loading = True
-        def load():
+        self.loading_transaction_limit = transaction_limit
+        self.loading_signature = signature
+        def load(limit=transaction_limit, db_signature=signature):
             try:
-                self.results.put((read_overview(self.app.database_path), ""))
+                self.results.put((read_overview(self.app.database_path, limit), "", limit, db_signature))
             except Exception as exc:
-                self.results.put((None, str(exc)))
+                self.results.put((None, str(exc), limit, db_signature))
         threading.Thread(target=load, name="desktop-overview-reader", daemon=True).start()
 
     def _focus_refresh(self, event):
@@ -942,12 +1074,25 @@ class DesktopShell:
                     button.configure(image=self.nav_icons[(key,key==self.page)])
                 render_needed = True
             try:
-                data, self.error = self.results.get_nowait()
+                data, error, loaded_limit, loaded_signature = self.results.get_nowait()
                 self.loading = False
+                self.loading_transaction_limit = 0
+                self.loading_signature = None
                 if data is not None:
                     changed = data != self.snapshot
                     self.snapshot = data
+                    self.error = ""
+                    self.snapshot_signature = loaded_signature
+                    self.snapshot_transaction_limit = loaded_limit
+                    if self.page == "ledger" and loaded_limit < 2000:
+                        self.refresh_pending = True
+                    try:
+                        if self._database_signature() != loaded_signature:
+                            self.refresh_pending = True
+                    except OSError:
+                        self.refresh_pending = True
                 else:
+                    self.error = error
                     changed = True
                 if changed and not (self.page=="ledger" and isinstance(self.root.focus_get(),ttk.Entry)):
                     render_needed = True
@@ -958,13 +1103,15 @@ class DesktopShell:
             self.poll_count += 1
             if self.poll_count % 10 == 0:
                 try:
-                    paths = (self.app.database_path, Path(str(self.app.database_path)+"-wal"))
-                    signature = tuple((path.stat().st_mtime_ns,path.stat().st_size) if path.exists() else None for path in paths)+(_today_japan(),)
+                    signature = self._database_signature()
                     if signature != self.file_signature:
                         self.file_signature = signature
-                        self.refresh()
+                        self.refresh(force=True)
                 except OSError:
                     pass
+            if self.refresh_pending:
+                self.refresh_pending = False
+                self.refresh()
             self.root.after(200, self._poll)
         except tk.TclError:
             pass

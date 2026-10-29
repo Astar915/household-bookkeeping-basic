@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .natural_language import (
     ImageAttachment,
@@ -60,6 +60,60 @@ def run_isolated_request(
     result_connection: Any,
 ) -> None:
     """Run one API turn against a disposable copy of the local ledger."""
+    try:
+        message = run_isolated_request_result(
+            live_database_path,
+            baseline_path,
+            candidate_path,
+            client_config,
+            user_text,
+            history_snapshot,
+            pending_snapshot,
+            payment_hints,
+            skill_content,
+            images,
+            agent_mode,
+            response_language,
+        )
+    except Exception:
+        message = (
+            "error",
+            "程序暂时无法完成请求。请检查账本文件和 API 配置后重试。",
+            history_snapshot,
+            pending_snapshot,
+            None,
+        )
+
+    try:
+        result_connection.send(message)
+    finally:
+        result_connection.close()
+
+
+def run_isolated_request_result(
+    live_database_path: str,
+    baseline_path: str,
+    candidate_path: str,
+    client_config: dict[str, Any],
+    user_text: str,
+    history_snapshot: list[dict[str, Any]],
+    pending_snapshot: dict[str, Any] | None,
+    payment_hints: list[dict[str, str]],
+    skill_content: str,
+    images: list[ImageAttachment],
+    agent_mode: str,
+    response_language: str,
+    *,
+    opener: Any = None,
+) -> tuple[str, Any, Any, Any, Any]:
+    """Run one turn and return its result instead of crossing a process pipe.
+
+    Cloudflare Workflows supplies an opener that replays completed model calls
+    and raises ``ModelRequestRequired`` when the next async Worker fetch is
+    needed. That signal must escape this function unchanged so the Workflow
+    can persist the provider response and replay the isolated turn safely.
+    Desktop callers keep using ``run_isolated_request`` above.
+    """
     database: Database | None = None
     client: OpenAICompatibleClient | None = None
     try:
@@ -85,6 +139,7 @@ def run_isolated_request(
             thinking_enabled=client_config.get("thinking_enabled", False),
             reasoning_effort=str(client_config.get("reasoning_effort", "low")),
             timeout=float(client_config["timeout"]),
+            opener=opener,
         )
         session = NaturalLanguageSession(
             database,
@@ -111,10 +166,24 @@ def run_isolated_request(
             pending_snapshot,
             client.usage_snapshot() if client is not None else None,
         )
-    except Exception:
+    except Exception as exc:
+        if opener is not None and exc.__class__.__name__ == "ModelRequestRequired":
+            raise
+        # Keep unexpected failures diagnosable without logging request text,
+        # model responses, credentials, or exception messages (which may
+        # contain provider data). The basename and line number are enough to
+        # locate the failing code in local and Worker logs.
+        import traceback
+        frames = traceback.extract_tb(exc.__traceback__)
+        locations = " -> ".join(
+            f"{frame.filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.lineno}"
+            for frame in frames[-5:]
+        )
+        error_type = type(exc).__name__
+        print(f"Isolated Agent request failed ({error_type}) at {locations}.")
         message = (
             "error",
-            "程序暂时无法完成请求。请检查账本文件和 API 配置后重试。",
+            f"程序处理请求时发生内部错误（{error_type}），本次没有写入账本。请稍后重试。",
             history_snapshot,
             pending_snapshot,
             client.usage_snapshot() if client is not None else None,
@@ -122,11 +191,7 @@ def run_isolated_request(
     finally:
         if database is not None:
             database.close()
-
-    try:
-        result_connection.send(message)
-    finally:
-        result_connection.close()
+    return message
 
 
 def _table_state(connection: sqlite3.Connection) -> dict[str, tuple[list[str], list[str], dict[tuple[Any, ...], tuple[Any, ...]]]]:
@@ -157,8 +222,15 @@ def merge_isolated_database(
     live_database_path: str | Path,
     baseline_path: str | Path,
     candidate_path: str | Path,
+    *,
+    prepare_live_connection: Callable[[sqlite3.Connection], None] | None = None,
+    after_live_commit: Callable[[sqlite3.Connection], None] | None = None,
 ) -> list[int]:
-    """Atomically merge supported request changes after verifying the ledger is unchanged."""
+    """Atomically merge supported request changes after verifying the ledger is unchanged.
+
+    Optional hooks let the isolated D1 adapter observe the rows changed by the
+    merge without changing the desktop caller's default behavior.
+    """
     baseline_uri = Path(baseline_path).resolve().as_uri() + "?mode=ro"
     candidate_uri = Path(candidate_path).resolve().as_uri() + "?mode=ro"
     baseline_connection = sqlite3.connect(baseline_uri, uri=True)
@@ -170,6 +242,8 @@ def merge_isolated_database(
     live_connection.execute("PRAGMA foreign_keys=ON")
     live_connection.execute("PRAGMA busy_timeout=5000")
     try:
+        if prepare_live_connection is not None:
+            prepare_live_connection(live_connection)
         baseline_state = _table_state(baseline_connection)
         candidate_state = _table_state(candidate_connection)
         live_connection.execute("BEGIN IMMEDIATE")
@@ -262,6 +336,8 @@ def merge_isolated_database(
         if violations:
             raise RequestMergeError("账本关联校验未通过，本次结果没有写入。")
         live_connection.commit()
+        if after_live_commit is not None:
+            after_live_commit(live_connection)
         return sorted(inserted_transaction_ids)
     except Exception:
         live_connection.rollback()

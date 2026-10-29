@@ -4,6 +4,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -97,6 +98,46 @@ class CloudPullTests(unittest.TestCase):
         self.assertEqual(db.connection.execute('SELECT name FROM accounts').fetchone()[0], 'Local')
         db.close()
 
+    def test_restore_falls_back_to_sqlite_backup_when_windows_blocks_replace(self):
+        body = self.bundle()
+        reader = sqlite3.connect(self.path)
+        reader.execute('SELECT name FROM accounts').fetchone()
+        real_replace = os.replace
+
+        def block_open_ledger(source, destination):
+            if Path(destination).resolve() == self.path.resolve():
+                error = PermissionError('ledger file is still open')
+                error.winerror = 32
+                raise error
+            return real_replace(source, destination)
+
+        try:
+            with patch('bookkeeping.github_sync.os.replace', side_effect=block_open_ledger):
+                backup = restore_sync_bundle(
+                    body,
+                    self.path,
+                    **self.stores,
+                    backup_directory=self.root / 'backups',
+                    skill_restore_directory=self.root / 'restored',
+                )
+            self.assertTrue(backup.is_file())
+            self.assertEqual(self.names(), ['Remote'])
+        finally:
+            reader.close()
+
+    def test_pull_reports_check_download_and_restore_progress(self):
+        progress = []
+        result = self.pull(
+            [self.candidate(self.bundle())],
+            progress=progress.append,
+        )
+
+        self.assertTrue(result['restored'])
+        self.assertIn('正在检查云端账本版本…', progress)
+        self.assertIn('正在检查 GitHub 云端版本…', progress)
+        self.assertIn('发现云端更新，正在下载并校验…', progress)
+        self.assertIn('下载完成，正在备份本机账本并应用云端数据…', progress)
+
     def test_same_sha_does_not_download_or_overwrite_unsent_local_changes(self):
         candidate = self.candidate(self.bundle())
         self.pull([candidate]); self.edit()
@@ -146,6 +187,51 @@ class CloudPullTests(unittest.TestCase):
         result = self.pull([candidate])
         self.assertFalse(result['restored'])
         self.assertIn('Unsent', self.names())
+
+    def test_unchanged_etag_skips_bundle_download_and_local_revision_scan(self):
+        etag = '"etag-1"'
+        created = '2026-10-23T01:00:00+00:00'
+        self.state.synced('github', 'owner/repo', 'v1', 'baseline', created, etag)
+
+        class ConditionalClient:
+            def bundle_snapshot_with_etag(self, repository, cached_etag=None):
+                self.cached_etag = cached_etag
+                return None, etag, True, None
+
+            def download_bundle_with_revision(self, repository):
+                raise AssertionError('unchanged bundle must not be downloaded')
+
+        client = ConditionalClient()
+        with patch('bookkeeping.cloud_pull.local_revision', side_effect=AssertionError('must not scan ledger')):
+            result = self.pull([('github', 'owner/repo', client, self.saved.append)])
+
+        self.assertEqual(result['status'], 'current')
+        self.assertEqual(client.cached_etag, etag)
+
+    def test_github_metadata_body_is_reused_instead_of_downloading_bundle_twice(self):
+        body = self.bundle()
+
+        class SnapshotClient:
+            def bundle_snapshot_with_etag(self, repository, cached_etag=None):
+                return 'v1', 'etag-1', False, body
+
+            def download_bundle_with_revision(self, repository, **kwargs):
+                self.download_kwargs = kwargs
+                return kwargs['initial_data'], kwargs['initial_sha']
+
+        client = SnapshotClient()
+        result = self.pull([('github', 'owner/repo', client, self.saved.append)])
+
+        self.assertTrue(result['restored'])
+        self.assertEqual(client.download_kwargs['initial_data'], body)
+        self.assertEqual(client.download_kwargs['initial_sha'], 'v1')
+
+    def test_checkpoint_keeps_etag_for_same_blob_and_drops_it_for_new_blob(self):
+        self.state.synced('github', 'owner/repo', 'v1', 'rev-1', '2026-10-23T01:00:00+00:00', 'etag-1')
+        self.state.synced('github', 'owner/repo', 'v1', 'rev-2')
+        self.assertEqual(self.state.load()['clouds']['github:owner/repo']['etag'], 'etag-1')
+        self.state.synced('github', 'owner/repo', 'v2', 'rev-3')
+        self.assertNotIn('etag', self.state.load()['clouds']['github:owner/repo'])
 
     def test_mobile_pull_is_account_isolated_and_does_not_expose_tokens(self):
         from bookkeeping.web import BookkeepingWebServer

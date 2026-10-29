@@ -31,6 +31,8 @@ except ImportError:
     DND_FILES = None
     TkinterDnD = None
 
+_DRAG_DROP_INIT_ERROR: str | None = None
+
 try:
     from PIL import Image, ImageTk
 except ImportError:
@@ -96,6 +98,7 @@ from .github_sync import (
     github_sync_process_lock,
     is_github_app_user_token,
     poll_device_token,
+    sync_bundle_created_at,
     request_device_code,
     restore_sync_bundle,
 )
@@ -135,7 +138,10 @@ from .skill_settings import (
     FoodHealthSkillStore,
 )
 from .ui_fonts import configure_global_fonts, enable_windows_gdi_text_scaling
-from .desktop_theme import PALETTE, RoundedPanel, color, configure_styles, apply_appearance, apply_titlebar
+from .desktop_theme import (
+    PALETTE, RoundedPanel, color, configure_styles, apply_appearance, apply_titlebar,
+    pillow_photo_available, pillow_photo_image,
+)
 from .appearance import APPEARANCE_CHOICES, load_appearance, save_appearance
 from .desktop_theme import fit_management_text, wrap_management_toolbar
 from .desktop_shell import DesktopShell
@@ -249,6 +255,9 @@ class BookkeepingWindow:
         self._startup_results = queue.Queue()
         self._startup_cancelled = threading.Event()
         self._startup_applying = False
+        self._startup_cloud_progress_dialog: tk.Toplevel | None = None
+        self._startup_cloud_progress_label: ttk.Label | None = None
+        self._startup_cloud_progressbar: ttk.Progressbar | None = None
         self._request_committing = False
         self._request_pipe: Any = None
         self._request_workspace: Path | None = None
@@ -398,8 +407,7 @@ class BookkeepingWindow:
         self.root.after(0, self._start_startup_cloud_pull)
         self.root.after(150, self._poll_recurring_transaction_results)
         self.root.after(150, self._poll_credit_repayment_results)
-        self.root.after(1000, self._check_due_credit_repayments)
-        self.root.after(1200, self._check_due_recurring_transactions)
+        self.root.after(1000, self._check_due_scheduled_entries)
         self.root.after(2000, self._poll_appearance)
         self.root.after(16, self._poll_ui_callbacks)
         self.root.after(250, self._ui_heartbeat_tick)
@@ -1284,41 +1292,58 @@ class BookkeepingWindow:
         self._copy_to_clipboard(self._treeview_selection_text(widget))
         return "break"
 
-    def _check_due_credit_repayments(self) -> None:
+    def _check_due_scheduled_entries(self) -> None:
+        """Process both local schedules with one database open, even offline."""
         if self.busy or self._github_restore_in_progress:
             try:
-                self.root.after(60_000, self._check_due_credit_repayments)
+                self.root.after(60_000, self._check_due_scheduled_entries)
             except tk.TclError:
                 pass
             return
-        if self._credit_repayment_processing:
-            self.root.after(60_000, self._check_due_credit_repayments)
+        if self._credit_repayment_processing or self._recurring_processing:
+            self.root.after(60_000, self._check_due_scheduled_entries)
             return
 
         self._credit_repayment_processing = True
+        self._recurring_processing = True
 
         def process() -> None:
-            events: list[dict[str, Any]] = []
-            error: str | None = None
+            credit_events: list[dict[str, Any]] = []
+            recurring_events: list[dict[str, Any]] = []
+            credit_error: str | None = None
+            recurring_error: str | None = None
+            database: Database | None = None
             try:
                 with self._scheduled_db_work_lock:
                     database = Database(self.database_path)
                     try:
                         database.initialize()
-                        events = process_due_credit_repayments(database, _today_japan())
+                        try:
+                            credit_events = process_due_credit_repayments(database, _today_japan())
+                        except Exception as exc:
+                            credit_error = str(exc)
+                        try:
+                            recurring_events = process_due_recurring_transactions(database, _today_japan())
+                        except Exception as exc:
+                            recurring_error = str(exc)
                     finally:
                         database.close()
             except Exception as exc:
-                error = str(exc)
-            self.credit_repayment_results.put((events, error))
+                if credit_error is None:
+                    credit_error = str(exc)
+                if recurring_error is None:
+                    recurring_error = str(exc)
+            self.credit_repayment_results.put((credit_events, credit_error))
+            self.recurring_results.put((recurring_events, recurring_error))
 
         try:
-            threading.Thread(target=process, name="credit-repayment-check", daemon=True).start()
+            threading.Thread(target=process, name="scheduled-ledger-check", daemon=True).start()
         except RuntimeError as exc:
             self._credit_repayment_processing = False
+            self._recurring_processing = False
             self.status.configure(text=f"自动还款计划检查无法启动：{exc}")
         try:
-            self.root.after(60_000, self._check_due_credit_repayments)
+            self.root.after(60_000, self._check_due_scheduled_entries)
         except tk.TclError:
             pass
 
@@ -1367,37 +1392,6 @@ class BookkeepingWindow:
         try:
             if self.root.winfo_exists():
                 self.root.after(150, self._poll_credit_repayment_results)
-        except tk.TclError:
-            pass
-
-    def _check_due_recurring_transactions(self) -> None:
-        if self.busy or self._recurring_processing or self._github_restore_in_progress:
-            try:
-                self.root.after(60_000, self._check_due_recurring_transactions)
-            except tk.TclError:
-                pass
-            return
-
-        self._recurring_processing = True
-
-        def process() -> None:
-            events: list[dict[str, Any]] = []
-            error: str | None = None
-            try:
-                with self._scheduled_db_work_lock:
-                    database = Database(self.database_path)
-                    try:
-                        database.initialize()
-                        events = process_due_recurring_transactions(database, _today_japan())
-                    finally:
-                        database.close()
-            except Exception as exc:
-                error = str(exc)
-            self.recurring_results.put((events, error))
-
-        threading.Thread(target=process, name="recurring-transactions", daemon=True).start()
-        try:
-            self.root.after(60_000, self._check_due_recurring_transactions)
         except tk.TclError:
             pass
 
@@ -1471,9 +1465,83 @@ class BookkeepingWindow:
     def _pull_state(self):
         return PullState(app_data_directory() / 'cloud_pull_state.json')
 
-    def _mark_cloud_checkpoint(self, provider, repository, sha, revision=None):
+    def _mark_cloud_checkpoint(self, provider, repository, sha, revision=None, bundle=None):
         self._pull_state().synced(provider, repository, sha,
-                                 revision or local_revision(self.database_path, **self._cloud_stores()))
+                                 revision or local_revision(self.database_path, **self._cloud_stores()),
+                                 sync_bundle_created_at(bundle) if bundle is not None else None)
+
+    def _show_startup_cloud_progress(self) -> None:
+        self._close_startup_cloud_progress()
+        dialog = tk.Toplevel(self.root)
+        dialog.title(translate("正在检查云端备份", self.language))
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        content = ttk.Frame(dialog, padding=(24, 20))
+        content.pack(fill="both", expand=True)
+        ttk.Label(
+            content,
+            text=translate("正在检查云端备份", self.language),
+            style="SettingsSection.TLabel",
+        ).pack(anchor="w")
+        self._startup_cloud_progress_label = ttk.Label(
+            content,
+            text=translate(
+                "正在连接 GitHub/Gitee 检查云端账本；如果发现更新，会下载、校验并先备份本机账本再应用。请稍候。",
+                self.language,
+            ),
+            style="Hint.TLabel",
+            wraplength=440,
+            justify="left",
+        )
+        self._startup_cloud_progress_label.pack(fill="x", pady=(10, 14))
+        self._startup_cloud_progressbar = ttk.Progressbar(
+            content, mode="indeterminate", length=440
+        )
+        self._startup_cloud_progressbar.pack(fill="x")
+        self._startup_cloud_progress_dialog = dialog
+
+        dialog.update_idletasks()
+        width = max(480, dialog.winfo_reqwidth())
+        height = dialog.winfo_reqheight()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.lift()
+        self._startup_cloud_progressbar.start(12)
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass
+
+    def _update_startup_cloud_progress(self, message: str) -> None:
+        translated = translate(message, self.language)
+        dialog = self._startup_cloud_progress_dialog
+        label = self._startup_cloud_progress_label
+        try:
+            if dialog is None or not dialog.winfo_exists():
+                return
+            self.status.configure(text=translated)
+            if label is not None:
+                label.configure(text=translated)
+        except tk.TclError:
+            pass
+
+    def _close_startup_cloud_progress(self) -> None:
+        progressbar = self._startup_cloud_progressbar
+        dialog = self._startup_cloud_progress_dialog
+        self._startup_cloud_progressbar = None
+        self._startup_cloud_progress_label = None
+        self._startup_cloud_progress_dialog = None
+        try:
+            if progressbar is not None:
+                progressbar.stop()
+            if dialog is not None and dialog.winfo_exists():
+                dialog.grab_release()
+                dialog.destroy()
+        except tk.TclError:
+            pass
 
     def _start_startup_cloud_pull(self):
         if self.busy or self._recurring_processing or self._credit_repayment_processing:
@@ -1481,10 +1549,39 @@ class BookkeepingWindow:
             return
         if self._github_restore_in_progress:
             return
+        cloud_backup_configured = False
+        for settings_store in (GitHubSyncSettingsStore(), GiteeSyncSettingsStore()):
+            try:
+                if settings_store.load().get("repository"):
+                    cloud_backup_configured = True
+                    break
+            except Exception:
+                # Let the normal pull path report a damaged connection setting.
+                cloud_backup_configured = True
+                break
+        if cloud_backup_configured and not messagebox.askyesno(
+            translate("检查云端备份", self.language),
+            translate(
+                "检测到已连接云端备份，是否检查并下载最新账本？确认后会检查 GitHub/Gitee；如有更新，会先完整备份本机账本再恢复。取消则跳过本次检查，继续使用本机账本。",
+                self.language,
+            ),
+            parent=self.root,
+        ):
+            self.status.configure(
+                text=translate("已跳过本次云端检查；本机账本保持不变。", self.language)
+            )
+            return
         self._github_restore_in_progress = True
         self.send_button.configure(state='disabled')
         self.input_box.configure(state='disabled')
-        self.status.configure(text=translate('正在检查云端最新账本…', self.language))
+        self._show_startup_cloud_progress()
+        self._update_startup_cloud_progress('正在检查云端账本版本…')
+
+        def report_progress(message: str) -> None:
+            self.post_to_ui(
+                lambda message=message: self._update_startup_cloud_progress(message)
+            )
+
         def work():
             try:
                 candidates = []
@@ -1522,7 +1619,8 @@ class BookkeepingWindow:
                     with self._github_upload_lock, github_sync_process_lock():
                         result = automatic_pull(self.database_path, candidates, self._pull_state(),
                             restore,
-                            stores=self._cloud_stores(), cancelled=self._startup_cancelled.is_set)
+                            stores=self._cloud_stores(), cancelled=self._startup_cancelled.is_set,
+                            progress=report_progress)
                 else:
                     result = {'status': 'unconnected', 'restored': False}
                 self._startup_results.put((result, ''))
@@ -1530,8 +1628,11 @@ class BookkeepingWindow:
                 self._startup_results.put(({}, str(exc)))
             finally:
                 self._startup_applying = False
-        threading.Thread(target=work, name='startup-cloud-download', daemon=True).start()
         self.root.after(100, self._poll_startup_cloud_pull)
+        try:
+            threading.Thread(target=work, name='startup-cloud-download', daemon=True).start()
+        except RuntimeError as exc:
+            self._startup_results.put(({}, str(exc)))
 
     def _poll_startup_cloud_pull(self):
         try:
@@ -1540,19 +1641,40 @@ class BookkeepingWindow:
             self.root.after(100, self._poll_startup_cloud_pull)
             return
         try:
+            self._close_startup_cloud_progress()
             if result.get('restored'):
                 self._clear_conversation_context()
                 self._reload_payment_profiles()
                 self.loaded_skill = self.skill_store.load()
                 self.loaded_food_health_skill = self.food_health_skill_store.load()
                 self._update_skill_summary()
-                self.status.configure(text=translate('已自动下载最新云端账本，恢复前已备份本机数据。', self.language))
+                backup = str(result.get('backup') or '')
+                message = translate("云端账本下载并恢复完成。恢复前备份：{path}", self.language).format(
+                    path=backup
+                )
+                self.status.configure(text=message)
+                messagebox.showinfo(translate("云端检查完成", self.language), message, parent=self.root)
             elif error:
-                self.status.configure(text=translate('自动下载未完成：{error}', self.language).format(error=translate(error, self.language)))
+                message = translate('自动下载未完成：{error}', self.language).format(
+                    error=translate(error, self.language)
+                )
+                self.status.configure(text=message)
+                messagebox.showerror(translate("云端备份检查失败", self.language), message, parent=self.root)
             elif result.get('status') == 'current':
-                self.status.configure(text=translate('当前已是最新云端账本。', self.language))
+                message = translate("云端账本已是最新，本机账本没有变化。", self.language)
+                self.status.configure(text=message)
+                messagebox.showinfo(translate("云端检查完成", self.language), message, parent=self.root)
+            elif result.get('status') == 'unconnected':
+                message = translate(
+                    "没有可用的 GitHub/Gitee 授权，本次没有下载；本机账本保持不变。",
+                    self.language,
+                )
+                self.status.configure(text=message)
+                messagebox.showwarning(translate("云端检查未完成", self.language), message, parent=self.root)
             else:
-                self.status.configure(text='')
+                message = translate("本次没有应用云端账本；本机账本保持不变。", self.language)
+                self.status.configure(text=message)
+                messagebox.showinfo(translate("云端检查完成", self.language), message, parent=self.root)
         finally:
             self._github_restore_in_progress = False
             self.send_button.configure(state='normal')
@@ -1657,7 +1779,7 @@ class BookkeepingWindow:
                         repository=repository,
                         last_sync_sha=new_sha,
                     )
-                    self._mark_cloud_checkpoint('gitee', repository, new_sha, sync_revision)
+                    self._mark_cloud_checkpoint('gitee', repository, new_sha, sync_revision, bundle)
                 self._publish_github_auto_sync_status(
                     translate("账本已记录并同步到 Gitee。", self.language)
                 )
@@ -1732,7 +1854,7 @@ class BookkeepingWindow:
                         repository=repository,
                         last_sync_sha=new_sha,
                     )
-                    self._mark_cloud_checkpoint('github', repository, new_sha, sync_revision)
+                    self._mark_cloud_checkpoint('github', repository, new_sha, sync_revision, bundle)
                 self._publish_github_auto_sync_status(
                     translate("账本已记录并同步到 GitHub。", self.language)
                 )
@@ -1890,12 +2012,12 @@ class BookkeepingWindow:
         self.input_box.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
         self.input_box.edit_modified(False)
         self.input_box.bind("<<Modified>>", self._refresh_input_after_change, add="+")
-        self.input_box.bind("<Control-Return>", self._send_shortcut)
-        self.input_box.bind("<Control-KP_Enter>", self._send_shortcut)
+        self.input_box.bind("<Shift-Return>", self._send_shortcut)
+        self.input_box.bind("<Shift-KP_Enter>", self._send_shortcut)
         self.drag_drop_enabled = False
-        self.drag_drop_error: str | None = None
+        self.drag_drop_error: str | None = _DRAG_DROP_INIT_ERROR
         if DND_FILES is None:
-            self.drag_drop_error = "tkinterdnd2 未安装"
+            self.drag_drop_error = self.drag_drop_error or "tkinterdnd2 未安装"
         else:
             registered_targets = 0
             # Register both the text widget and its surrounding attachment
@@ -2001,7 +2123,7 @@ class BookkeepingWindow:
             self.skill_summary.grid()
             self.hint.grid(row=6, column=0, sticky="ew", pady=(4, 0))
             self.hint.configure(
-                text="饮食健康 Agent 会检索本地饮食回顾，并将记录摘要、此 Agent 单独选择的 Skill 正文和本轮问题发送给当前消息对应的服务；附图消息使用含图片服务，纯文字消息使用纯文字服务。本机 Ollama 留在本机，远程服务会收到这些内容。此模式只提供饮食建议，不会写入记录。Enter 换行，Ctrl+Enter 发送。"
+                text="饮食健康 Agent 会检索本地饮食回顾，并将记录摘要、此 Agent 单独选择的 Skill 正文和本轮问题发送给当前消息对应的服务；附图消息使用含图片服务，纯文字消息使用纯文字服务。本机 Ollama 留在本机，远程服务会收到这些内容。此模式只提供饮食建议，不会写入记录。Enter 换行，Shift+Enter 发送。"
             )
         else:
             self.payment_hint_summary.grid()
@@ -3629,7 +3751,7 @@ class BookkeepingWindow:
                     refresh()
                     if existing_schedule is None:
                         status_var.set(f"定期收支规则 #{schedule_id} 已保存。到期时自动写入本地账本。")
-                        self.root.after(100, self._check_due_recurring_transactions)
+                        self.root.after(100, self._check_due_scheduled_entries)
                     else:
                         tree.selection_set(str(schedule_id))
                         status_var.set("定期收支规则已更新；只影响后续到期项目，已生成的流水不会改变。")
@@ -5706,6 +5828,8 @@ class BookkeepingWindow:
         if not self.image_attachments:
             if self.drag_drop_enabled:
                 hint = "可拖入 JPG/PNG/WebP 图片到输入框或附件栏"
+            elif _DRAG_DROP_INIT_ERROR:
+                hint = "拖放组件受 Windows 安全策略限制；仍可点击添加图片"
             elif DND_FILES is None:
                 hint = "拖放依赖未安装；请点击添加图片"
             else:
@@ -5716,14 +5840,15 @@ class BookkeepingWindow:
         for index, attachment in enumerate(self.image_attachments):
             chip = ttk.Frame(self.attachments_frame, style="App.TFrame", relief="solid", borderwidth=1)
             chip.pack(side="left", padx=(0, 6))
-            if Image is not None and ImageTk is not None:
+            if Image is not None and ImageTk is not None and pillow_photo_available():
                 try:
                     with Image.open(BytesIO(attachment.data)) as source_image:
                         preview = source_image.copy()
                     preview.thumbnail((44, 44))
-                    preview_photo = ImageTk.PhotoImage(preview)
-                    self._image_preview_refs.append(preview_photo)
-                    ttk.Label(chip, image=preview_photo).pack(side="left", padx=(4, 2), pady=3)
+                    preview_photo = pillow_photo_image(preview, master=self.root)
+                    if preview_photo is not None:
+                        self._image_preview_refs.append(preview_photo)
+                        ttk.Label(chip, image=preview_photo).pack(side="left", padx=(4, 2), pady=3)
                 except Exception:
                     pass
             display_name = attachment.name
@@ -5919,15 +6044,71 @@ class BookkeepingWindow:
         pages_host.bind("<Configure>", refresh_page_scrollregion)
         page_canvas.bind("<Configure>", resize_pages_host)
 
-        tk.Label(sidebar, text="⚙  设置", bg=color("#ffffff"), fg=color("#101828"), font=(self.ui_font_family, 16, "bold"), anchor="w").pack(fill="x", padx=21, pady=(14, 2))
-        tk.Label(sidebar, text="管理服务、解析和数据", bg=color("#ffffff"), fg=color("#667085"), font=(self.ui_font_family, 10), anchor="w").pack(fill="x", padx=22, pady=(0, 12))
-        tk.Label(sidebar, text="服务与解析", bg=color("#ffffff"), fg=color("#98a2b3"), font=(self.ui_font_family, 9, "bold"), anchor="w").pack(fill="x", padx=17, pady=(0, 5))
+        sidebar_header = tk.Frame(sidebar, bg=color("#ffffff"))
+        sidebar_header.pack(fill="x")
+        tk.Label(sidebar_header, text="⚙  设置", bg=color("#ffffff"), fg=color("#101828"), font=(self.ui_font_family, 16, "bold"), anchor="w").pack(fill="x", padx=21, pady=(14, 2))
+        tk.Label(sidebar_header, text="管理服务、解析和数据", bg=color("#ffffff"), fg=color("#667085"), font=(self.ui_font_family, 10), anchor="w").pack(fill="x", padx=22, pady=(0, 12))
+
+        sidebar_nav = tk.Frame(sidebar, bg=color("#ffffff"))
+        sidebar_nav.pack(fill="both", expand=True)
+        sidebar_canvas = tk.Canvas(
+            sidebar_nav,
+            bg=color("#ffffff"),
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        sidebar_scrollbar = ttk.Scrollbar(
+            sidebar_nav,
+            orient="vertical",
+            command=sidebar_canvas.yview,
+        )
+        sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
+        sidebar_canvas.pack(side="left", fill="both", expand=True)
+        sidebar_scrollbar.pack(side="right", fill="y")
+        sidebar_items = tk.Frame(sidebar_canvas, bg=color("#ffffff"))
+        sidebar_items_window = sidebar_canvas.create_window(
+            (0, 0), window=sidebar_items, anchor="nw"
+        )
+
+        def refresh_sidebar_scrollregion(_event: Any = None) -> None:
+            sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
+
+        def resize_sidebar_items(event: Any) -> None:
+            sidebar_canvas.itemconfigure(sidebar_items_window, width=event.width)
+
+        def scroll_sidebar(event: Any) -> str:
+            delta = getattr(event, "delta", 0)
+            units = -int(delta / 120) if delta else 0
+            if units == 0 and delta:
+                units = -1 if delta > 0 else 1
+            if units:
+                sidebar_canvas.yview_scroll(units, "units")
+            return "break"
+
+        def scroll_sidebar_up(_event: Any) -> str:
+            sidebar_canvas.yview_scroll(-1, "units")
+            return "break"
+
+        def scroll_sidebar_down(_event: Any) -> str:
+            sidebar_canvas.yview_scroll(1, "units")
+            return "break"
+
+        def bind_sidebar_wheel(widget: tk.Misc) -> None:
+            widget.bind("<MouseWheel>", scroll_sidebar, add="+")
+            widget.bind("<Button-4>", scroll_sidebar_up, add="+")
+            widget.bind("<Button-5>", scroll_sidebar_down, add="+")
+
+        sidebar_items.bind("<Configure>", refresh_sidebar_scrollregion)
+        sidebar_canvas.bind("<Configure>", resize_sidebar_items)
+        bind_sidebar_wheel(sidebar_canvas)
+        bind_sidebar_wheel(sidebar_items)
 
         api_page = tk.Frame(pages_host, bg=color("#f2f4f7"))
         agent_skill_page = tk.Frame(pages_host, bg=color("#f2f4f7"))
         appearance_page = tk.Frame(pages_host, bg=color("#f2f4f7"))
         language_page = tk.Frame(pages_host, bg=color("#f2f4f7"))
         category_page = tk.Frame(pages_host, bg=color("#f2f4f7"))
+        billing_page = tk.Frame(pages_host, bg=color("#f2f4f7"))
         data_page = tk.Frame(pages_host, bg=color("#f2f4f7"))
         pages = {
             "API 服务": api_page,
@@ -5935,15 +6116,23 @@ class BookkeepingWindow:
             "外观": appearance_page,
             "语言": language_page,
             "记账类别": category_page,
+            "账期设置": billing_page,
             "账本与备份": data_page,
         }
         nav_buttons: dict[str, tuple[tk.Frame, tk.Label, tk.Label]] = {}
+        group_pages = {
+            "服务与解析": ("API 服务", "Agent 配置与 Skill"),
+            "显示设置": ("外观", "语言"),
+            "记账设置": ("记账类别", "账期设置"),
+            "数据管理": ("账本与备份",),
+        }
         page_descriptions = {
             "API 服务": "管理可供两个 Agent 选择的模型连接",
             "Agent 配置与 Skill": "统一管理 Agent 模型与 Skill",
             "外观": "浅色、深色或跟随系统",
             "语言": "选择软件界面显示语言",
             "记账类别": "管理记账 Agent 可使用的收入和支出类别",
+            "账期设置": "调整每月账期起始日及当前期间统计范围",
             "账本与备份": "查看数据位置并创建备份",
         }
 
@@ -5963,61 +6152,47 @@ class BookkeepingWindow:
             if name == "记账类别":
                 refresh_category_table()
 
-        for name, description in page_descriptions.items():
-            if name == "外观":
-                tk.Label(
-                    sidebar,
-                    text="显示设置",
-                    bg=color("#ffffff"),
-                    fg=color("#98a2b3"),
-                    font=(self.ui_font_family, 9, "bold"),
-                    anchor="w",
-                ).pack(fill="x", padx=17, pady=(10, 5))
-            if name == "账本与备份":
-                tk.Label(
-                    sidebar,
-                    text="数据管理",
-                    bg=color("#ffffff"),
-                    fg=color("#98a2b3"),
-                    font=(self.ui_font_family, 9, "bold"),
-                    anchor="w",
-                ).pack(fill="x", padx=17, pady=(10, 5))
-            if name == "记账类别":
-                tk.Label(
-                    sidebar,
-                    text="记账设置",
-                    bg=color("#ffffff"),
-                    fg=color("#98a2b3"),
-                    font=(self.ui_font_family, 9, "bold"),
-                    anchor="w",
-                ).pack(fill="x", padx=17, pady=(10, 5))
-            nav = tk.Frame(sidebar, bg=color("#ffffff"), cursor="hand2")
-            nav.pack(fill="x", padx=10, pady=2)
-            nav_title = tk.Label(
-                nav,
-                text=f"{name}   ›",
-                bg=color("#ffffff"),
-                fg=color("#344054"),
-                font=(self.ui_font_family, 10, "bold"),
-                anchor="w",
-                cursor="hand2",
-            )
-            nav_title.pack(fill="x", padx=12, pady=(6, 0))
-            nav_description = tk.Label(
-                nav,
-                text=description,
-                wraplength=176,
-                justify="left",
+        for group_name, names in group_pages.items():
+            group_title = tk.Label(
+                sidebar_items,
+                text=group_name,
                 bg=color("#ffffff"),
                 fg=color("#667085"),
-                font=(self.ui_font_family, 9),
+                font=(self.ui_font_family, 9, "bold"),
                 anchor="w",
-                cursor="hand2",
             )
-            nav_description.pack(fill="x", padx=12, pady=(1, 6))
-            for widget in (nav, nav_title, nav_description):
-                widget.bind("<Button-1>", lambda _event, selected=name: show_settings_page(selected))
-            nav_buttons[name] = (nav, nav_title, nav_description)
+            group_title.pack(fill="x", padx=17, pady=(10, 2))
+            for name in names:
+                description = page_descriptions[name]
+                nav = tk.Frame(sidebar_items, bg=color("#ffffff"), cursor="hand2")
+                nav.pack(fill="x", padx=10, pady=2)
+                nav_title = tk.Label(
+                    nav,
+                    text=f"{name}   ›",
+                    bg=color("#ffffff"),
+                    fg=color("#344054"),
+                    font=(self.ui_font_family, 10, "bold"),
+                    anchor="w",
+                    cursor="hand2",
+                )
+                nav_title.pack(fill="x", padx=12, pady=(6, 0))
+                nav_description = tk.Label(
+                    nav,
+                    text=description,
+                    wraplength=176,
+                    justify="left",
+                    bg=color("#ffffff"),
+                    fg=color("#667085"),
+                    font=(self.ui_font_family, 9),
+                    anchor="w",
+                    cursor="hand2",
+                )
+                nav_description.pack(fill="x", padx=12, pady=(1, 6))
+                for widget in (nav, nav_title, nav_description):
+                    widget.bind("<Button-1>", lambda _event, selected=name: show_settings_page(selected))
+                    bind_sidebar_wheel(widget)
+                nav_buttons[name] = (nav, nav_title, nav_description)
+            bind_sidebar_wheel(group_title)
 
         panel = ttk.Frame(api_page, style="SettingsPanel.TFrame", padding=18)
         panel.pack(fill="both", expand=True)
@@ -6642,6 +6817,79 @@ class BookkeepingWindow:
             command=add_ledger_category,
         ).grid(row=2, column=1, sticky="w", pady=(8, 0))
 
+        def read_billing_cycle_start_day() -> int:
+            database = Database(self.database_path)
+            try:
+                database.initialize()
+                return database.get_billing_cycle_start_day()
+            finally:
+                database.close()
+
+        def save_billing_cycle_start_day(day: int) -> None:
+            database = Database(self.database_path)
+            try:
+                database.initialize()
+                database.set_billing_cycle_start_day(day)
+            finally:
+                database.close()
+
+        billing_panel = ttk.Frame(billing_page, style="SettingsPanel.TFrame", padding=18)
+        billing_panel.pack(fill="both", expand=True)
+        billing_panel.columnconfigure(0, weight=1)
+        ttk.Label(
+            billing_panel, text=translate("账期设置", self.language),
+            style="SettingsTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            billing_panel,
+            text=translate(
+                "设置每月账期从哪一天开始。保存后总览、财务报表和预算会按新账期重新统计；历史流水日期不会改变。",
+                self.language,
+            ),
+            style="SettingsHint.TLabel",
+            wraplength=680,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(5, 18))
+        billing_cycle_start_day_var = tk.StringVar(
+            value=str(read_billing_cycle_start_day())
+        )
+        ttk.Label(
+            billing_panel,
+            text=translate("每月起始日", self.language),
+            style="SettingsSection.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        billing_cycle_start_day_combo = ttk.Combobox(
+            billing_panel,
+            textvariable=billing_cycle_start_day_var,
+            values=tuple(str(day) for day in range(1, 32)),
+            state="readonly",
+            width=10,
+        )
+        billing_cycle_start_day_combo.grid(row=3, column=0, sticky="w")
+        ttk.Label(
+            billing_panel,
+            text=translate(
+                "周期持续到下一个账期起始日前一天。所选日期在某月不存在时，按该月最后一天开始。",
+                self.language,
+            ),
+            style="SettingsHint.TLabel",
+            wraplength=680,
+            justify="left",
+        ).grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        billing_cycle_status = ttk.Label(
+            billing_panel, text="", style="SettingsStatus.TLabel"
+        )
+        billing_cycle_status.grid(row=5, column=0, sticky="w", pady=(12, 0))
+
+        def mark_billing_cycle_pending(_event: Any = None) -> None:
+            billing_cycle_status.configure(
+                text=translate("账期起始日尚未保存；点击应用或确认后生效。", self.language)
+            )
+
+        billing_cycle_start_day_combo.bind(
+            "<<ComboboxSelected>>", mark_billing_cycle_pending
+        )
+
         data_panel = ttk.Frame(data_page, style="SettingsPanel.TFrame", padding=18)
         data_panel.pack(fill="both", expand=True)
         data_panel.columnconfigure(0, weight=1)
@@ -7254,7 +7502,7 @@ class BookkeepingWindow:
                                 repository=repository,
                                 last_sync_sha=new_sha,
                             )
-                            self._mark_cloud_checkpoint('github', repository, new_sha, sync_revision)
+                            self._mark_cloud_checkpoint('github', repository, new_sha, sync_revision, bundle)
                         result = translate(
                             "GitHub 已连接，私有仓库已创建并上传本机同步数据。"
                             if created
@@ -7409,7 +7657,7 @@ class BookkeepingWindow:
                                 repository=repository,
                                 last_sync_sha=new_sha,
                             )
-                            self._mark_cloud_checkpoint('github', repository, new_sha, sync_revision)
+                            self._mark_cloud_checkpoint('github', repository, new_sha, sync_revision, bundle)
                         message = translate("本机同步数据已上传到 GitHub。", self.language)
                         result_backup = ""
                     else:
@@ -7432,7 +7680,7 @@ class BookkeepingWindow:
                                 repository=repository,
                                 last_sync_sha=cloud_sha,
                             )
-                            self._mark_cloud_checkpoint('github', repository, cloud_sha, None)
+                            self._mark_cloud_checkpoint('github', repository, cloud_sha, None, bundle)
                             self._pull_state().resume_downloads()
                         message = translate(
                             "云端数据已恢复。本机恢复前备份：{path}。软件即将重启。",
@@ -7761,7 +8009,7 @@ class BookkeepingWindow:
                                     repository=repository,
                                     last_sync_sha=new_sha,
                                 )
-                                self._mark_cloud_checkpoint('gitee', repository, new_sha, sync_revision)
+                                self._mark_cloud_checkpoint('gitee', repository, new_sha, sync_revision, bundle)
                             result = translate(
                                 "Gitee 已连接，私有仓库已创建并上传本机同步数据。"
                                 if created
@@ -7902,7 +8150,7 @@ class BookkeepingWindow:
                                 repository=repository,
                                 last_sync_sha=new_sha,
                             )
-                            self._mark_cloud_checkpoint('gitee', repository, new_sha, sync_revision)
+                            self._mark_cloud_checkpoint('gitee', repository, new_sha, sync_revision, bundle)
                         message = translate("本机同步数据已上传到 Gitee。", self.language)
                         result_backup = ""
                     else:
@@ -7925,7 +8173,7 @@ class BookkeepingWindow:
                                 repository=repository,
                                 last_sync_sha=cloud_sha,
                             )
-                            self._mark_cloud_checkpoint('gitee', repository, cloud_sha, None)
+                            self._mark_cloud_checkpoint('gitee', repository, cloud_sha, None, bundle)
                         message = translate(
                             "云端数据已恢复。本机恢复前备份：{path}。软件即将重启。",
                             self.language,
@@ -8222,6 +8470,7 @@ class BookkeepingWindow:
                 "gitee_auto_sync_settings_error": self.gitee_auto_sync_settings_error,
                 "language": self.language,
                 "appearance": self.appearance_mode,
+                "billing_cycle_start_day": read_billing_cycle_start_day(),
             }
 
         settings_baseline = capture_settings_baseline()
@@ -8338,6 +8587,18 @@ class BookkeepingWindow:
             selected_receipt_images = bool(receipt_image_enabled_var.get())
             selected_github_auto_sync = bool(github_auto_sync_var.get())
             selected_gitee_auto_sync = bool(gitee_auto_sync_var.get())
+            try:
+                selected_billing_cycle_start_day = int(billing_cycle_start_day_var.get())
+            except (TypeError, ValueError):
+                billing_cycle_status.configure(
+                    text=translate("请选择1到31之间的账期起始日。", self.language)
+                )
+                return
+            if not 1 <= selected_billing_cycle_start_day <= 31:
+                billing_cycle_status.configure(
+                    text=translate("请选择1到31之间的账期起始日。", self.language)
+                )
+                return
             if not any(selected_scope.values()):
                 backup_scope_status.configure(
                     text=translate("至少选择一项云备份内容。", self.language)
@@ -8373,6 +8634,8 @@ class BookkeepingWindow:
                         store.clear()
                 save_language(selected_language)
                 save_appearance(selected_appearance)
+                if selected_billing_cycle_start_day != old_state["billing_cycle_start_day"]:
+                    save_billing_cycle_start_day(selected_billing_cycle_start_day)
             except Exception as exc:
                 rollback_errors = rollback_persisted_settings(old_state)
                 detail = f"设置没有全部保存：{exc}"
@@ -8437,10 +8700,16 @@ class BookkeepingWindow:
                 text=translate("Gitee 自动同步已开启。" if selected_gitee_auto_sync else "Gitee 自动同步已关闭。", self.language)
             )
             language_status.configure(text=translate("设置已保存。", self.language))
+            billing_cycle_status.configure(
+                text=translate("账期起始日已保存。", self.language)
+            )
             status_message = translate("设置已保存并应用。", self.language)
             footer_status.configure(text=status_message)
             self.status.configure(text=status_message)
             settings_baseline = capture_settings_baseline()
+            if selected_billing_cycle_start_day != old_state["billing_cycle_start_day"]:
+                self.desktop_shell.refresh()
+                self._queue_github_auto_sync()
             if close_after_apply:
                 dialog.destroy()
 
@@ -9726,6 +9995,7 @@ class BookkeepingWindow:
 
 
 def main() -> None:
+    global DND_FILES, TkinterDnD, _DRAG_DROP_INIT_ERROR
     multiprocessing.freeze_support()
     # Must run before creating Tk's first native window. Windows then renders
     # GDI text sharply at monitor DPI while keeping Tk's current layout scale.
@@ -9735,7 +10005,21 @@ def main() -> None:
     if not single_instance.acquire(wait_for_existing=restart_instance):
         return
     try:
-        root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
+        # Create the ordinary Tk root first, then load the optional native
+        # drag/drop extension. Windows security products can block tkdnd's
+        # unsigned DLL; that must not prevent the bookkeeping app opening.
+        root = tk.Tk()
+        if os.environ.get("HOUSEHOLD_BOOKKEEPING_DISABLE_NATIVE_DND") == "1":
+            _DRAG_DROP_INIT_ERROR = "已停用可能被 Windows 安全策略拦截的拖放 DLL"
+            DND_FILES = None
+            TkinterDnD = None
+        elif TkinterDnD is not None:
+            try:
+                TkinterDnD.require(root)
+            except Exception as exc:
+                _DRAG_DROP_INIT_ERROR = str(exc)[:160] or "拖放组件无法加载"
+                DND_FILES = None
+                TkinterDnD = None
         BookkeepingWindow(root)
         root.mainloop()
     finally:

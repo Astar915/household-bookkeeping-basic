@@ -3335,7 +3335,10 @@ class NaturalLanguageSession:
                 saved_ids = [transaction_id]
         except LedgerError as exc:
             return f"还没有记入账本：{exc}"
-        cycle_start, cycle_end = (d.isoformat() for d in billing_cycle(date_text))
+        cycle_start, cycle_end = (
+            d.isoformat()
+            for d in billing_cycle(date_text, self.database.get_billing_cycle_start_day())
+        )
         action = "消费" if kind == "expense" else "收入"
         if payment_allocations and not memo_only:
             currency_digits = self.database.currency(str(currency))["minor_digits"]

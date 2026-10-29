@@ -6,6 +6,10 @@ open financial forms are never rebuilt or interrupted.
 from __future__ import annotations
 
 import os
+import base64
+import math
+import struct
+import zlib
 from .appearance import load_appearance
 import tkinter as tk
 from tkinter import ttk
@@ -50,6 +54,36 @@ def make_palette(dark: bool) -> dict[str, str]:
 
 PALETTE = make_palette(DARK)
 
+_PIL_TK_MODE: str | None = None
+
+
+def pillow_photo_image(image, master=None):
+    """Create a Tk photo, bypassing Pillow's blocked _imagingtk bridge when needed."""
+    global _PIL_TK_MODE
+    if _PIL_TK_MODE != "native-png":
+        try:
+            from PIL import ImageTk
+            photo = ImageTk.PhotoImage(image, master=master)
+            _PIL_TK_MODE = "pillow"
+            return photo
+        except Exception:
+            # Windows may block Pillow's optional _imagingtk DLL even though
+            # Pillow can still render and Tk can still load PNG files itself.
+            _PIL_TK_MODE = "native-png"
+    try:
+        from io import BytesIO
+        stream = BytesIO()
+        image.save(stream, format="PNG")
+        encoded = base64.b64encode(stream.getvalue()).decode("ascii")
+        return tk.PhotoImage(master=master, data=encoded, format="png")
+    except Exception:
+        _PIL_TK_MODE = "unavailable"
+        return None
+
+
+def pillow_photo_available() -> bool:
+    return _PIL_TK_MODE != "unavailable"
+
 
 def color(value: str) -> str:
     """Translate legacy presentation colors without changing financial values."""
@@ -74,6 +108,129 @@ def color(value: str) -> str:
             "#b54708": "#f5ba71",
         }.get(value, value)
     return value
+
+
+def _round_check_indicator_png(accent: str, outline: str, *, selected: bool) -> str:
+    """Build a small antialiased PNG indicator without adding an image dependency."""
+    width = height = 20
+    supersample = 4
+    center = width / 2
+    outer_radius = 8.0
+    inner_radius = 6.35
+    dot_radius = 3.15
+    accent_rgb = tuple(int(accent[index:index + 2], 16) for index in (1, 3, 5))
+    outline_rgb = tuple(int(outline[index:index + 2], 16) for index in (1, 3, 5))
+    rows = bytearray()
+
+    for y in range(height):
+        rows.append(0)  # PNG filter: None
+        for x in range(width):
+            red = green = blue = alpha = 0
+            for sy in range(supersample):
+                sample_y = y + (sy + 0.5) / supersample - center
+                for sx in range(supersample):
+                    sample_x = x + (sx + 0.5) / supersample - center
+                    radius = math.hypot(sample_x, sample_y)
+                    sample_color = None
+                    if selected and radius <= dot_radius:
+                        sample_color = accent_rgb
+                    elif inner_radius <= radius <= outer_radius:
+                        sample_color = accent_rgb if selected else outline_rgb
+                    if sample_color is not None:
+                        red += sample_color[0]
+                        green += sample_color[1]
+                        blue += sample_color[2]
+                        alpha += 255
+            samples = supersample * supersample
+            if alpha:
+                covered = alpha / 255
+                rows.extend((
+                    round(red / covered),
+                    round(green / covered),
+                    round(blue / covered),
+                    round(alpha / samples),
+                ))
+            else:
+                rows.extend((0, 0, 0, 0))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">2I5B", width, height, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes(rows), 9))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode("ascii")
+
+
+def _configure_round_checkbutton(root: tk.Misc, style: ttk.Style) -> None:
+    """Replace every ttk checkbox square with a consistent circular indicator."""
+    palette = PALETTE
+    dark = DARK
+    element_name = f"RoundCheckbutton{int(dark)}.indicator"
+    image_cache = getattr(root, "_bk_round_checkbutton_images", None)
+    if image_cache is None:
+        image_cache = {}
+        root._bk_round_checkbutton_images = image_cache
+
+    if element_name not in image_cache:
+        unchecked = tk.PhotoImage(
+            master=root,
+            data=_round_check_indicator_png(palette["muted"], palette["border"], selected=False),
+            format="png",
+        )
+        checked = tk.PhotoImage(
+            master=root,
+            data=_round_check_indicator_png(palette["accent"], palette["border"], selected=True),
+            format="png",
+        )
+        disabled_outline = palette["border"]
+        disabled_accent = palette["muted"]
+        disabled_unchecked = tk.PhotoImage(
+            master=root,
+            data=_round_check_indicator_png(disabled_outline, disabled_outline, selected=False),
+            format="png",
+        )
+        disabled_checked = tk.PhotoImage(
+            master=root,
+            data=_round_check_indicator_png(disabled_accent, disabled_outline, selected=True),
+            format="png",
+        )
+        image_cache[element_name] = (unchecked, checked, disabled_unchecked, disabled_checked)
+
+    unchecked, checked, disabled_unchecked, disabled_checked = image_cache[element_name]
+    try:
+        style.element_create(
+            element_name,
+            "image",
+            unchecked,
+            ("disabled", "selected", disabled_checked),
+            ("disabled", disabled_unchecked),
+            ("selected", checked),
+            sticky="",
+        )
+    except tk.TclError:
+        # The themed element already exists when appearance settings are reapplied.
+        pass
+
+    def replace_indicator(layout: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+        updated = []
+        for element, options in layout:
+            options = dict(options)
+            if "children" in options:
+                options["children"] = replace_indicator(options["children"])
+            if element == "Checkbutton.indicator" or (
+                element.startswith("RoundCheckbutton") and element.endswith(".indicator")
+            ):
+                element = element_name
+            updated.append((element, options))
+        return updated
+
+    layout = replace_indicator(style.layout("TCheckbutton"))
+    if layout != style.layout("TCheckbutton"):
+        style.layout("TCheckbutton", layout)
 
 
 def configure_styles(root: tk.Misc, family: str) -> None:
@@ -111,6 +268,7 @@ def configure_styles(root: tk.Misc, family: str) -> None:
         s.map(name, background=[("active", p["hover"])],
               foreground=[("disabled", p["muted"])],
               indicatorbackground=[("selected", p["accent"])])
+    _configure_round_checkbutton(root, s)
     s.configure("TNotebook", background=p["background"], borderwidth=0, tabmargins=(0, 6, 0, 12))
     s.configure("TNotebook.Tab", padding=(14, 7), background=p["background"], borderwidth=0)
     s.map("TNotebook.Tab", background=[("selected", p["surface"]), ("active", p["hover"])],
@@ -269,7 +427,7 @@ class RoundedPanel(tk.Frame):
         self._size = size
         self.canvas.delete("all")
         try:
-            from PIL import Image, ImageDraw, ImageTk
+            from PIL import Image, ImageDraw
             scale = 2
             bitmap = Image.new("RGB", (size[0]*scale, size[1]*scale), PALETTE["background"])
             draw = ImageDraw.Draw(bitmap)
@@ -277,23 +435,26 @@ class RoundedPanel(tk.Frame):
                                    radius=self.radius*scale, fill=self.surface,
                                    outline=PALETTE["border"], width=scale)
             bitmap = bitmap.resize(size, Image.Resampling.LANCZOS)
-            self._image = ImageTk.PhotoImage(bitmap, master=self)
-            self.canvas.create_image(0, 0, anchor="nw", image=self._image)
-        except ImportError:
-            r = min(self.radius*2, size[0]//2, size[1]//2)
-            w, h = size
-            self.canvas.create_polygon(r, 0, w-r, 0, w, 0, w, r, w, h-r,
-                                       w, h, w-r, h, r, h, 0, h, 0, h-r,
-                                       0, r, 0, 0, smooth=True,
-                                       fill=self.surface, outline=PALETTE["border"])
+            self._image = pillow_photo_image(bitmap, master=self)
+            if self._image is not None:
+                self.canvas.create_image(0, 0, anchor="nw", image=self._image)
+                return
+        except Exception:
+            pass
+        r = min(self.radius*2, size[0]//2, size[1]//2)
+        w, h = size
+        self.canvas.create_polygon(r, 0, w-r, 0, w, 0, w, r, w, h-r,
+                                   w, h, w-r, h, r, h, 0, h, 0, h-r,
+                                   0, r, 0, 0, smooth=True,
+                                   fill=self.surface, outline=PALETTE["border"])
 
 
 def _rounded_button_styles(root, style):
     """Nine-slice images retain native ttk keyboard/focus/disabled semantics."""
     try:
-        from PIL import Image, ImageDraw, ImageTk
+        from PIL import Image, ImageDraw
     except ImportError:
-        Image = ImageDraw = ImageTk = None
+        Image = ImageDraw = None
     cache = getattr(root, "_rounded_button_images", {})
     for kind, normal, hover, pressed, foreground in (
         ("base", PALETTE["surface"], PALETTE["hover"], PALETTE["selected"], PALETTE["text"]),
@@ -313,13 +474,18 @@ def _rounded_button_styles(root, style):
             for fill, border in ((normal, normal), (PALETTE["background"], PALETTE["background"]),
                                  (pressed, pressed), (hover, hover), (normal, PALETTE["accent"])):
                 corner = "#213c60" if kind.startswith("hero") else PALETTE["surface"] if kind in {"primary", "dock", "dockselected"} else PALETTE["background"]
-                if Image is not None:
-                    bitmap = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
-                    ImageDraw.Draw(bitmap).rounded_rectangle((2, 2, 93, 93), radius=34,
-                                                            fill=fill, outline=border, width=3)
-                    images.append(ImageTk.PhotoImage(bitmap.resize((32, 32), Image.Resampling.LANCZOS), master=root))
-                else:
-                    images.append(_native_round_image(root, fill, border, corner))
+                photo = None
+                if Image is not None and ImageDraw is not None and pillow_photo_available():
+                    try:
+                        bitmap = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
+                        ImageDraw.Draw(bitmap).rounded_rectangle((2, 2, 93, 93), radius=34,
+                                                                fill=fill, outline=border, width=3)
+                        photo = pillow_photo_image(
+                            bitmap.resize((32, 32), Image.Resampling.LANCZOS), master=root
+                        )
+                    except Exception:
+                        photo = None
+                images.append(photo if photo is not None else _native_round_image(root, fill, border, corner))
             style.element_create(element, "image", images[0], ("disabled", images[1]),
                                  ("pressed", images[2]), ("active", images[3]), ("focus", images[4]),
                                  border=13, padding=0, sticky="nswe")

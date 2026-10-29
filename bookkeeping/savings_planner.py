@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from .desktop_theme import color, fit_management_text, wrap_management_toolbar
+from .desktop_theme import (
+    color, fit_management_text, wrap_management_toolbar,
+    pillow_photo_available, pillow_photo_image,
+)
 from .desktop_frame import defer_during_interactive_resize
 
 import json
@@ -33,6 +36,8 @@ from .localization import translate
 _PALETTE = (
     color("#3976b8"), color("#e58a3a"), color("#47a477"), color("#d85f62"), color("#8a6cc1"),
     color("#d2aa3c"), color("#4fabb4"), color("#c66c9a"), color("#728096"), color("#9b835f"),
+    color("#315f8f"), color("#c76d20"), color("#267b55"), color("#b73f49"), color("#6746a1"),
+    color("#a88914"), color("#287e88"), color("#a84478"), color("#49576b"), color("#746044"),
 )
 _MONTHLY_PLAN_KEY = "savings_plan:monthly_template"
 
@@ -118,6 +123,7 @@ def _normalize_plan_categories(plan: dict[str, int], ledger_categories: set[str]
 
 
 def _draw_line_chart(canvas: tk.Canvas, values: list[int], labels: list[str], font_family: str) -> None:
+    """Draw compact daily/monthly bars and retain hit points for hover details."""
     canvas.delete("all")
     canvas._chart_points = []
     width = max(120, canvas.winfo_width())
@@ -136,7 +142,7 @@ def _draw_line_chart(canvas: tk.Canvas, values: list[int], labels: list[str], fo
     scale = 3
     image = None
     drawing = None
-    if Image is not None and ImageDraw is not None and ImageTk is not None:
+    if Image is not None and ImageDraw is not None and ImageTk is not None and pillow_photo_available():
         image = Image.new("RGB", (width * scale, height * scale), color("#ffffff"))
         drawing = ImageDraw.Draw(image)
 
@@ -158,36 +164,39 @@ def _draw_line_chart(canvas: tk.Canvas, values: list[int], labels: list[str], fo
     if values:
         count = len(values)
         x_span = right - left
+        slot_width = x_span / max(1, count)
+        bar_width = max(3.0, min(22.0, slot_width * 0.78))
         points: list[tuple[float, float]] = []
         for index, value in enumerate(values):
-            x = left + (x_span * index / max(1, count - 1))
+            x = left + slot_width * (index + 0.5)
             y = bottom - ((bottom - top) * value / top_value)
             points.append((x, y))
         canvas._chart_points = [
             (x, y, int(values[index]), labels[index] if index < len(labels) else str(index + 1))
             for index, (x, y) in enumerate(points)
         ]
-        if len(points) > 1:
-            for start, end in zip(points, points[1:]):
-                coords = tuple(round(value * scale) for value in (*start, *end))
-                if drawing is not None:
-                    drawing.line(coords, fill=color("#3976b8"), width=3 * scale, joint="curve")
-                else:
-                    canvas.create_line(*start, *end, fill=color("#3976b8"), width=3, smooth=True)
         for x, y in points:
+            bounds = (
+                round((x - bar_width / 2) * scale),
+                round(y * scale),
+                round((x + bar_width / 2) * scale),
+                round(bottom * scale),
+            )
             if drawing is not None:
-                drawing.ellipse(
-                    (round((x - 4) * scale), round((y - 4) * scale),
-                     round((x + 4) * scale), round((y + 4) * scale)),
-                    fill=color("#3976b8"), outline=color("#ffffff"), width=2 * scale,
-                )
+                drawing.rounded_rectangle(bounds, radius=2 * scale, fill=color("#3976b8"))
             else:
-                canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=color("#3976b8"), outline=color("#ffffff"), width=2)
+                canvas.create_rectangle(
+                    x - bar_width / 2, y, x + bar_width / 2, bottom,
+                    fill=color("#3976b8"), outline="",
+                )
 
     if image is not None and ImageTk is not None:
         resampling = getattr(Image, "Resampling", Image).LANCZOS
         image = image.resize((width, height), resampling)
-        photo = ImageTk.PhotoImage(image, master=canvas)
+        photo = pillow_photo_image(image, master=canvas)
+        if photo is None:
+            _draw_line_chart(canvas, values, labels, font_family)
+            return
         canvas._chart_photo = photo
         canvas.create_image(0, 0, anchor="nw", image=photo)
 
@@ -225,6 +234,8 @@ def _draw_pie_chart(
     category_colors: dict[str, str] | None = None,
 ) -> None:
     canvas.delete("all")
+    canvas._pie_hover_index = None
+    canvas._pie_hit_data = None
     width = max(160, canvas.winfo_width())
     height = max(120, canvas.winfo_height())
     visible = _display_entries(entries)
@@ -233,18 +244,13 @@ def _draw_pie_chart(
         return
 
     legend_left = min(width * 0.58, 410)
-    radius = max(35, min((height - 24) / 2, legend_left * 0.43))
+    radius = max(45, min((height - 24) / 2, legend_left * 0.47))
     center_x = radius + 16
     center_y = height / 2
     box = (center_x - radius, center_y - radius, center_x + radius, center_y + radius)
     start = 90.0
-    scale = 3
-    image = None
-    drawing = None
-    if Image is not None and ImageDraw is not None and ImageTk is not None:
-        image = Image.new("RGB", (width * scale, height * scale), color("#ffffff"))
-        drawing = ImageDraw.Draw(image)
     colors = category_colors or {}
+    hit_segments: list[tuple[str, int, float, float]] = []
 
     def color_for(name: str) -> str:
         if name in colors:
@@ -253,26 +259,20 @@ def _draw_pie_chart(
 
     for name, amount in visible:
         extent = amount / total * 360
+        hit_segments.append((name, int(amount), start, start + extent))
         slice_color = color_for(name)
-        if drawing is not None:
-            drawing.pieslice(
-                tuple(round(value * scale) for value in box),
-                start=start, end=start + extent, fill=slice_color,
-                outline=color("#ffffff"), width=2 * scale,
-            )
-        else:
-            canvas.create_arc(
-                *box, start=start, extent=extent, style="pieslice",
-                fill=slice_color, outline=color("#ffffff"), width=2,
-            )
+        canvas.create_arc(
+            *box, start=start, extent=extent, style="pieslice",
+            fill=slice_color, outline=color("#ffffff"), width=2,
+        )
         start += extent
-
-    if image is not None and ImageTk is not None:
-        resampling = getattr(Image, "Resampling", Image).LANCZOS
-        image = image.resize((width, height), resampling)
-        photo = ImageTk.PhotoImage(image, master=canvas)
-        canvas._chart_photo = photo
-        canvas.create_image(0, 0, anchor="nw", image=photo)
+    canvas._pie_hit_data = {
+        "center_x": center_x,
+        "center_y": center_y,
+        "radius": radius,
+        "segments": hit_segments,
+        "total": total,
+    }
 
     legend_x = center_x + radius + 16
     available_width = max(40, width - legend_x - 12)
@@ -328,12 +328,14 @@ def open_savings_plan(
         error = None
         try:
             today = date.fromisoformat(_today_japan())
-            cycle_start, cycle_end = billing_cycle(today)
-            end_day = min(cycle_end, today)
             month_starts = _month_starts(today)
-            setting_key = f"savings_plan:{cycle_start.isoformat()}"
             with (database_lock if database_lock is not None else nullcontext()):
                 database = Database(database_path)
+                cycle_start, cycle_end = billing_cycle(
+                    today, database.get_billing_cycle_start_day()
+                )
+                end_day = min(cycle_end, today)
+                setting_key = f"savings_plan:{cycle_start.isoformat()}"
                 categories = [
                     str(row["name"]) for row in database.connection.execute(
                         "SELECT name FROM categories WHERE kind='expense' AND is_active=1 ORDER BY name COLLATE NOCASE"
@@ -526,7 +528,7 @@ def _build_savings_plan_loaded(
 
     range_text = f"{cycle_start.isoformat()} {translate('至')} {cycle_end.isoformat()}"
     ttk.Label(left, text=translate("本期花费"), style="BudgetSection.TLabel").grid(row=0, column=0, sticky="w")
-    hint = translate("按15日至次月14日账期；人民币使用交易日汇率折算，缺少汇率的流水不计入图表。")
+    hint = translate("按设置的账期统计；人民币使用交易日汇率折算，缺少汇率的流水不计入图表。")
     total_spent = sum(actual_by_category.values())
     spent_label = translate("已入账支出：") + minor_to_text(total_spent, 0, "JPY")
     ttk.Label(left, text=f"{range_text}　{spent_label}\n{hint}", style="Hint.TLabel", wraplength=560).grid(
@@ -552,14 +554,14 @@ def _build_savings_plan_loaded(
     ).pack(side="left", padx=(3, 0))
     plot_area = ttk.Frame(trend_frame)
     plot_area.grid(row=1, column=0, sticky="nsew")
-    trend_canvas = tk.Canvas(plot_area, bg=color("#ffffff"), highlightthickness=0, height=180)
+    trend_canvas = tk.Canvas(plot_area, bg=color("#ffffff"), highlightthickness=0, height=260)
     trend_canvas.pack(fill="both", expand=True)
     trend_empty = ttk.Label(plot_area, text="所选期间暂无已入账消费", style="Hint.TLabel")
     category_frame = ttk.LabelFrame(left, text="消费类别", padding=8)
     category_frame.grid(row=4, column=0, sticky="nsew")
     category_frame.columnconfigure(0, weight=1)
     category_frame.rowconfigure(0, weight=1)
-    actual_pie_canvas = tk.Canvas(category_frame, bg=color("#ffffff"), highlightthickness=0, height=190)
+    actual_pie_canvas = tk.Canvas(category_frame, bg=color("#ffffff"), highlightthickness=0, height=230)
     actual_pie_canvas.grid(row=0, column=0, sticky="nsew")
     actual_pie_empty = ttk.Label(category_frame, text="本期暂无分类支出", style="Hint.TLabel")
 
@@ -670,9 +672,90 @@ def _build_savings_plan_loaded(
     plan_frame.grid(row=2, column=0, sticky="nsew")
     plan_frame.columnconfigure(0, weight=1)
     plan_frame.rowconfigure(0, weight=1)
-    plan_pie_canvas = tk.Canvas(plan_frame, bg=color("#ffffff"), highlightthickness=0, height=280)
+    plan_pie_canvas = tk.Canvas(plan_frame, bg=color("#ffffff"), highlightthickness=0, height=300)
     plan_pie_canvas.grid(row=0, column=0, sticky="nsew")
     plan_pie_empty = ttk.Label(plan_frame, text=translate("添加类别预算后显示预算分配"), style="Hint.TLabel")
+
+    def hide_pie_tooltip(canvas: tk.Canvas) -> None:
+        canvas.delete("pie-hover-tooltip")
+        canvas._pie_hover_index = None
+
+    def show_pie_tooltip(canvas: tk.Canvas, event: tk.Event) -> None:
+        data = getattr(canvas, "_pie_hit_data", None)
+        if not data:
+            hide_pie_tooltip(canvas)
+            return
+        center_x = float(data["center_x"])
+        center_y = float(data["center_y"])
+        delta_x = event.x - center_x
+        delta_y = center_y - event.y
+        radius = float(data["radius"])
+        if delta_x * delta_x + delta_y * delta_y > radius * radius:
+            hide_pie_tooltip(canvas)
+            return
+        angle = math.degrees(math.atan2(delta_y, delta_x)) % 360
+        selected = None
+        for index, (name, amount, start_angle, end_angle) in enumerate(data["segments"]):
+            if (angle - start_angle) % 360 < end_angle - start_angle:
+                selected = (index, name, amount)
+                break
+        if selected is None:
+            hide_pie_tooltip(canvas)
+            return
+        index, name, amount = selected
+        if (
+            getattr(canvas, "_pie_hover_index", None) == index
+            and canvas.find_withtag("pie-hover-tooltip")
+        ):
+            return
+        canvas.delete("pie-hover-tooltip")
+        canvas._pie_hover_index = index
+        percentage = int(amount) / max(1, int(data["total"]))
+        label = (
+            f"{name}\n{minor_to_text(int(amount), 0, 'JPY')} ({percentage:.1%})"
+        )
+        text_id = canvas.create_text(
+            event.x + 12,
+            event.y + 12,
+            text=label,
+            anchor="nw",
+            justify="left",
+            width=min(240, max(120, canvas.winfo_width() - 24)),
+            fill=color("#ffffff"),
+            font=(font_family, 10, "bold"),
+            tags=("pie-hover-tooltip",),
+        )
+        bounds = canvas.bbox(text_id)
+        if bounds is None:
+            return
+        shift_x = min(0, canvas.winfo_width() - 8 - bounds[2])
+        shift_y = min(0, canvas.winfo_height() - 8 - bounds[3])
+        shift_x = max(8 - bounds[0], shift_x)
+        shift_y = max(8 - bounds[1], shift_y)
+        if shift_x or shift_y:
+            canvas.move(text_id, shift_x, shift_y)
+            bounds = canvas.bbox(text_id)
+        if bounds is not None:
+            background = canvas.create_rectangle(
+                bounds[0] - 7,
+                bounds[1] - 5,
+                bounds[2] + 7,
+                bounds[3] + 5,
+                fill=color("#1d2939"),
+                outline=color("#1d2939"),
+                tags=("pie-hover-tooltip",),
+            )
+            canvas.tag_lower(background, text_id)
+
+    for pie_canvas in (actual_pie_canvas, plan_pie_canvas):
+        pie_canvas.bind(
+            "<Motion>",
+            lambda event, target=pie_canvas: show_pie_tooltip(target, event),
+        )
+        pie_canvas.bind(
+            "<Leave>",
+            lambda _event, target=pie_canvas: hide_pie_tooltip(target),
+        )
 
     save_results: queue.Queue[tuple[dict[str, int], str | None]] = queue.Queue()
     save_state = {"running": False, "poll_after": None, "previous_plan": None}

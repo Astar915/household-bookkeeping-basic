@@ -28,6 +28,10 @@ Else
   command = "pythonw.exe -m bookkeeping.gui"
 End If
 
+' tkdnd is an optional unsigned native extension. On this PC Windows blocks
+' its DLL, so let Tk launch without native drag/drop; the Add Image button remains.
+shell.Environment("PROCESS")("HOUSEHOLD_BOOKKEEPING_DISABLE_NATIVE_DND") = "1"
+
 On Error Resume Next
 shell.Run command, 0, False
 If Err.Number <> 0 Then

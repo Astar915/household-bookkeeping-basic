@@ -27,6 +27,27 @@ class BookkeepingTests(unittest.TestCase):
         self.assertEqual(tuple(d.isoformat() for d in billing_cycle("2026-10-15")), ("2026-10-15", "2026-11-14"))
         self.assertEqual(tuple(d.isoformat() for d in billing_cycle("2027-01-14")), ("2026-12-15", "2027-01-14"))
 
+    def test_custom_billing_cycle_start_day_and_short_months(self) -> None:
+        self.assertEqual(
+            tuple(d.isoformat() for d in billing_cycle("2026-10-09", start_day=10)),
+            ("2026-09-10", "2026-10-09"),
+        )
+        self.assertEqual(
+            tuple(d.isoformat() for d in billing_cycle("2026-02-27", start_day=31)),
+            ("2026-01-31", "2026-02-27"),
+        )
+        self.assertEqual(
+            tuple(d.isoformat() for d in billing_cycle("2026-02-28", start_day=31)),
+            ("2026-02-28", "2026-03-30"),
+        )
+
+    def test_billing_cycle_setting_defaults_and_validates(self) -> None:
+        self.assertEqual(self.db.get_billing_cycle_start_day(), 15)
+        self.db.set_billing_cycle_start_day(10)
+        self.assertEqual(self.db.get_billing_cycle_start_day(), 10)
+        with self.assertRaises(LedgerError):
+            self.db.set_billing_cycle_start_day(32)
+
     def test_seed_reproduces_known_asset_snapshots_without_double_counting(self) -> None:
         expected = {
             "瑞穗银行": 200000,
