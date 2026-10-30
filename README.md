@@ -15,6 +15,7 @@
     <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge" alt="MIT License" />
   </p>
   <p><strong>当前版本：0.2.1 · 账期与云端恢复改进</strong></p>
+  <p>简体中文 · <a href="README.en.md">English</a> · <a href="README.ja.md">日本語</a></p>
 </div>
 
 > 💬 **记账可以很简单：**“昨晚晚餐 850 日元，现金支付。”检查候选记录，确认后保存。自然语言记账需要你自行配置本机 Ollama 或兼容模型；不用 AI，也能打开并管理本地账本。

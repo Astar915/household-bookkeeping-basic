@@ -15,6 +15,7 @@
     <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge" alt="MIT License" />
   </p>
   <p><strong>Current version: 0.2.1 · Billing cycle and cloud restore improvements</strong></p>
+  <p><a href="README.md">简体中文</a> · English · <a href="README.ja.md">日本語</a></p>
 </div>
 
 > 💬 **Bookkeeping can be this simple:** “Dinner yesterday, 850 JPY, paid in cash.” Review the suggested entry and confirm to save. Natural-language entry needs a model service you configure; you can still open and manage your local ledger without AI.
