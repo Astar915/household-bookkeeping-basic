@@ -102,4 +102,6 @@ python -m bookkeeping.cli validate
 python -m unittest discover -s tests -v
 ```
 
+Cloudflareへのデプロイを検討している場合は、Worker、D1、Workflow、永続化、Secrets、公開手順、費用の境界を説明した[クラウド移行の注意点ガイド（中国語）](docs/CLOUD_MIGRATION_PITFALLS.md)をご覧ください。
+
 変更履歴は [CHANGELOG.md](CHANGELOG.md) をご覧ください。[MIT License](LICENSE) で公開しています。

@@ -102,4 +102,6 @@ python -m bookkeeping.cli validate
 python -m unittest discover -s tests -v
 ```
 
+准备把本地软件部署到 Cloudflare？请先看[云端迁移避坑指南](docs/CLOUD_MIGRATION_PITFALLS.md)，确认 Worker、D1、Workflow、持久化、密钥和费用边界。
+
 版本历史见 [CHANGELOG.md](CHANGELOG.md)。本项目以 [MIT License](LICENSE) 发布。

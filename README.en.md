@@ -102,4 +102,6 @@ python -m bookkeeping.cli validate
 python -m unittest discover -s tests -v
 ```
 
+Planning a Cloudflare deployment? See the [Chinese cloud migration pitfalls guide](docs/CLOUD_MIGRATION_PITFALLS.md) for this repository's Worker, D1, Workflow, persistence, secrets, deployment, and cost boundaries.
+
 See [CHANGELOG.md](CHANGELOG.md) for release history. Licensed under the [MIT License](LICENSE).

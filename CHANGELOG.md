@@ -5,6 +5,9 @@
 - **English:** Add configurable monthly billing cycles and refresh the overview, financial statements, and budget reports to match. Improve budget charts with taller trends, clearer category pies, and hover details. Startup cloud checks now show live progress and an explicit result; cloud restore keeps a recovery backup and falls back to SQLite's online backup when Windows temporarily locks the ledger file.
 - **日本語：** 月次請求期間を設定可能にし、概要・財務レポート・予算を新しい期間で再集計します。予算グラフの傾向表示を高くし、カテゴリ円グラフとホバー詳細を改善しました。起動時のクラウド確認に進捗と結果を表示し、復元前バックアップを保持します。Windowsで台帳ファイルが一時的にロックされている場合はSQLiteバックアップで復元します。
 - **简体中文：** 新增可配置的月度账期，并同步刷新总览、财务报表和预算统计；加高预算趋势图，改善分类饼图和悬停详情。启动云端检查显示实时进度和明确结果；云端恢复保留恢复前备份，并在 Windows 暂时锁定账本文件时改用 SQLite 在线备份回写。
+- **Documentation update, 2026-10-30:** Add a Chinese-language guide to the pitfalls of migrating a local application to Cloudflare Workers + D1, including data persistence, migrations, durable jobs, CPU limits, authentication, deployment order, cost controls, and safe validation.
+- **ドキュメント更新（2026-10-30）：** ローカルアプリをCloudflare Workers + D1へ移行する際の注意点をまとめた中国語ガイドを追加しました。永続化、DB移行、Durable Jobs、CPU制限、認証、公開順序、費用管理、安全な検証方法を説明します。
+- **文档更新（2026-10-30）：** 新增《从本地版迁移到云端：部署避坑指南》，梳理数据持久化、数据库迁移、持久任务、CPU限制、登录与密钥、发布顺序、费用控制和安全验证。
 
 ## 0.2.0 — 2026-10-27 — Initial public release / 初回公開 / 首次公开版本
 
