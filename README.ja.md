@@ -15,6 +15,7 @@
     <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge" alt="MIT License" />
   </p>
   <p><strong>現在のバージョン：0.2.1 · 請求期間とクラウド復元の改善</strong></p>
+  <p><strong>LANGUAGE</strong></p>
   <p><a href="README.md">简体中文</a> · <a href="README.en.md">English</a> · 日本語</p>
 </div>
 
