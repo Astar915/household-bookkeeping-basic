@@ -1,6 +1,7 @@
+// Paid Container legacy configuration. Use python-d1/wrangler.web.jsonc for the official web app.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "household-bookkeeping-cloud-test",
+  "name": "household-bookkeeping-container-legacy",
   "main": "src/worker.js",
   "compatibility_date": "2026-10-27",
   "assets": {
@@ -12,7 +13,7 @@
     "binding": "CF_VERSION_METADATA"
   },
   "vars": {
-    "PUBLIC_ORIGIN": "https://household-bookkeeping-cloud-test.household-bookkeeping-cloud-test.workers.dev"
+    "PUBLIC_ORIGIN": "https://household-bookkeeping-container-legacy.household-bookkeeping-cloud-test.workers.dev"
   },
   "durable_objects": {
     "bindings": [

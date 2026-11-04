@@ -74,6 +74,8 @@ from .backup_scope import (
     BackupScopeStore,
 )
 from .cash_management import managed_balances, reconcile_account_balances, sort_managed_balances
+from .balance_reconciliation import record_credit_snapshot
+from .model_usage import estimate_deepseek_cost_cny, fetch_deepseek_balance
 from .credit_management import (
     credit_card_overview,
     next_month_due_date,
@@ -147,6 +149,7 @@ from .desktop_theme import fit_management_text, wrap_management_toolbar
 from .desktop_shell import DesktopShell
 from .desktop_frame import center_window, defer_during_interactive_resize
 from .user_data import app_data_directory
+from .desktop_tutorial import DesktopTutorialStore
 from .ui_confirm import confirm_delete_once
 from .single_instance import SingleInstance, repair_window_position
 from .localization import (
@@ -203,6 +206,8 @@ class BookkeepingWindow:
         install_tk_localization(root, self.language)
         self.ui_font_family = configure_global_fonts(root)
         self.database_path = database_path
+        self.desktop_tutorial_store = DesktopTutorialStore()
+        self._desktop_tutorial_window: tk.Toplevel | None = None
         self.root.report_callback_exception = self._report_ui_exception
         self.github_auto_sync_settings_store = GitHubAutoSyncSettingsStore()
         self.github_auto_sync_enabled = True
@@ -227,6 +232,8 @@ class BookkeepingWindow:
         self._gitee_auto_sync_running = False
         self._gitee_auto_sync_pending = False
         self._github_upload_lock = threading.Lock()
+        self._cloud_sync_state_lock = threading.Lock()
+        self._cloud_sync_states = {"github": "idle", "gitee": "idle"}
         self.receipt_image_settings_store = ReceiptImageSettingsStore()
         self.receipt_image_settings_error = ""
         try:
@@ -268,6 +275,12 @@ class BookkeepingWindow:
         self._request_history_snapshot: list[dict[str, Any]] = []
         self._request_pending_snapshot: dict[str, Any] | None = None
         self._request_profile_id: str | None = None
+        self._request_usage_profile: dict[str, str] | None = None
+        self._request_balance_api_key = ""
+        self._model_balance_by_profile: dict[str, dict[str, str]] = {}
+        self._model_usage_lines: dict[str, str] = {}
+        self._model_balance_lines: dict[str, str] = {}
+        self._model_usage_profile_by_agent: dict[str, str] = {}
         self._pending_image_attachments: list[ImageAttachment] = []
         self._request_agent_mode = "bookkeeping"
         self.image_attachments: list[ImageAttachment] = []
@@ -405,6 +418,7 @@ class BookkeepingWindow:
         self.input_box.focus_set()
         self.root.after(100, self._poll_results)
         self.root.after(0, self._start_startup_cloud_pull)
+        self.root.after(1200, self._maybe_start_desktop_tutorial)
         self.root.after(150, self._poll_recurring_transaction_results)
         self.root.after(150, self._poll_credit_repayment_results)
         self.root.after(1000, self._check_due_scheduled_entries)
@@ -1549,90 +1563,27 @@ class BookkeepingWindow:
             return
         if self._github_restore_in_progress:
             return
-        cloud_backup_configured = False
-        for settings_store in (GitHubSyncSettingsStore(), GiteeSyncSettingsStore()):
+        connected = False
+        for provider, settings_store, token_store in (
+            ("github", GitHubSyncSettingsStore(), GitHubTokenStore()),
+            ("gitee", GiteeSyncSettingsStore(), GiteeTokenStore()),
+        ):
             try:
-                if settings_store.load().get("repository"):
-                    cloud_backup_configured = True
+                has_repository = bool(settings_store.load().get("repository"))
+                has_token = bool(
+                    token_store.load_credentials().get("access_token")
+                    if provider == "github" else token_store.load()
+                )
+                if has_repository and has_token:
+                    connected = True
                     break
             except Exception:
-                # Let the normal pull path report a damaged connection setting.
-                cloud_backup_configured = True
-                break
-        if cloud_backup_configured and not messagebox.askyesno(
-            translate("检查云端备份", self.language),
-            translate(
-                "检测到已连接云端备份，是否检查并下载最新账本？确认后会检查 GitHub/Gitee；如有更新，会先完整备份本机账本再恢复。取消则跳过本次检查，继续使用本机账本。",
-                self.language,
-            ),
-            parent=self.root,
-        ):
-            self.status.configure(
-                text=translate("已跳过本次云端检查；本机账本保持不变。", self.language)
-            )
-            return
-        self._github_restore_in_progress = True
-        self.send_button.configure(state='disabled')
-        self.input_box.configure(state='disabled')
-        self._show_startup_cloud_progress()
-        self._update_startup_cloud_progress('正在检查云端账本版本…')
-
-        def report_progress(message: str) -> None:
-            self.post_to_ui(
-                lambda message=message: self._update_startup_cloud_progress(message)
-            )
-
-        def work():
-            try:
-                candidates = []
-                for provider, settings_store, token_store in (
-                    ('github', GitHubSyncSettingsStore(), GitHubTokenStore()),
-                    ('gitee', GiteeSyncSettingsStore(), GiteeTokenStore()),
-                ):
-                    settings = settings_store.load()
-                    repository = settings.get('repository', '')
-                    if provider == 'github':
-                        credentials = token_store.load_credentials()
-                        token = credentials.get('access_token', '')
-                        if not token or not repository:
-                            continue
-                        client = GitHubClient(token, refresh_token=credentials.get('refresh_token', ''),
-                                              client_id=GITHUB_APP_CLIENT_ID, token_store=token_store)
-                    else:
-                        token = token_store.load()
-                        if not token or not repository:
-                            continue
-                        client = GiteeClient(token)
-                    if not token or not repository:
-                        continue
-                    def save(sha, store=settings_store, cfg=settings):
-                        store.save(repository_name=cfg['repository_name'], repository=cfg['repository'], last_sync_sha=sha)
-                    candidates.append((provider, repository, client, save))
-                if candidates:
-                    def restore(body, provider):
-                        self._startup_applying = True
-                        if self._startup_cancelled.is_set():
-                            raise LedgerError('自动下载已取消，本机账本保持原样。')
-                        with self._scheduled_db_work_lock:
-                            return restore_sync_bundle(body, self.database_path,
-                                **self._cloud_stores(), backup_provider=provider)
-                    with self._github_upload_lock, github_sync_process_lock():
-                        result = automatic_pull(self.database_path, candidates, self._pull_state(),
-                            restore,
-                            stores=self._cloud_stores(), cancelled=self._startup_cancelled.is_set,
-                            progress=report_progress)
-                else:
-                    result = {'status': 'unconnected', 'restored': False}
-                self._startup_results.put((result, ''))
-            except Exception as exc:
-                self._startup_results.put(({}, str(exc)))
-            finally:
-                self._startup_applying = False
-        self.root.after(100, self._poll_startup_cloud_pull)
-        try:
-            threading.Thread(target=work, name='startup-cloud-download', daemon=True).start()
-        except RuntimeError as exc:
-            self._startup_results.put(({}, str(exc)))
+                continue
+        if connected:
+            self._queue_github_auto_sync()
+        else:
+            self._set_cloud_sync_indicator("github", "idle")
+            self._set_cloud_sync_indicator("gitee", "idle")
 
     def _poll_startup_cloud_pull(self):
         try:
@@ -1752,10 +1703,15 @@ class BookkeepingWindow:
                     token = GiteeTokenStore().load()
                     repository = settings.get("repository", "")
                     if not token or not repository:
+                        self._set_cloud_sync_indicator("gitee", "idle")
                         with self._gitee_auto_sync_state_lock:
                             self._gitee_auto_sync_pending = False
                             self._gitee_auto_sync_running = False
                         return
+                    self._publish_github_auto_sync_status(
+                        translate("本机更改已保存，正在自动同步到 Gitee…", self.language)
+                    )
+                    self._set_cloud_sync_indicator("gitee", "uploading")
                     client = GiteeClient(token)
                     with tempfile.TemporaryDirectory(prefix="household-gitee-auto-upload-") as temp_name:
                         bundle_path = Path(temp_name) / "sync-bundle.zip"
@@ -1781,14 +1737,16 @@ class BookkeepingWindow:
                     )
                     self._mark_cloud_checkpoint('gitee', repository, new_sha, sync_revision, bundle)
                 self._publish_github_auto_sync_status(
-                    translate("账本已记录并同步到 Gitee。", self.language)
+                    translate("本机更改已同步到 Gitee。", self.language)
                 )
+                self._set_cloud_sync_indicator("gitee", "success")
             except Exception as exc:
                 self._publish_github_auto_sync_status(
-                    translate("账本已记录在本地，但 Gitee 自动同步失败：{error}", self.language).format(
+                    translate("本机更改已保留，但 Gitee 自动同步失败：{error}", self.language).format(
                         error=translate(str(exc), self.language)
                     )
                 )
+                self._set_cloud_sync_indicator("gitee", "error")
                 with self._gitee_auto_sync_state_lock:
                     self._gitee_auto_sync_pending = False
                     self._gitee_auto_sync_running = False
@@ -1809,7 +1767,7 @@ class BookkeepingWindow:
                 return
 
             self._publish_github_auto_sync_status(
-                translate("账本已记录，正在自动同步到 GitHub…", self.language)
+                translate("本机更改已保存，正在自动同步到 GitHub…", self.language)
             )
             try:
                 with self._github_upload_lock, github_sync_process_lock():
@@ -1818,9 +1776,10 @@ class BookkeepingWindow:
                     credentials = GitHubTokenStore().load_credentials()
                     repository = settings.get("repository", "")
                     if not credentials["access_token"] or not repository:
+                        self._set_cloud_sync_indicator("github", "idle")
                         self._publish_github_auto_sync_status(
                             translate(
-                                "账本已记录在本地；请先连接 GitHub，连接后会上传当前同步数据。",
+                                "本机更改已保留；请先连接 GitHub，连接后会上传当前同步数据。",
                                 self.language,
                             )
                         )
@@ -1828,6 +1787,7 @@ class BookkeepingWindow:
                             self._github_auto_sync_pending = False
                             self._github_auto_sync_running = False
                         return
+                    self._set_cloud_sync_indicator("github", "uploading")
                     if not is_github_app_user_token(credentials["access_token"]):
                         raise GitHubSyncError("旧版 GitHub 授权需要更新；请重新连接 GitHub。")
                     client = GitHubClient(
@@ -1856,14 +1816,16 @@ class BookkeepingWindow:
                     )
                     self._mark_cloud_checkpoint('github', repository, new_sha, sync_revision, bundle)
                 self._publish_github_auto_sync_status(
-                    translate("账本已记录并同步到 GitHub。", self.language)
+                    translate("本机更改已同步到 GitHub。", self.language)
                 )
+                self._set_cloud_sync_indicator("github", "success")
             except Exception as exc:
                 self._publish_github_auto_sync_status(
-                    translate("账本已记录在本地，但自动同步失败：{error}", self.language).format(
+                    translate("本机更改已保留，但自动同步失败：{error}", self.language).format(
                         error=translate(str(exc), self.language)
                     )
                 )
+                self._set_cloud_sync_indicator("github", "error")
                 with self._github_auto_sync_state_lock:
                     self._github_auto_sync_pending = False
                     self._github_auto_sync_running = False
@@ -1880,6 +1842,31 @@ class BookkeepingWindow:
                 pass
 
         self.post_to_ui(update_status)
+
+    def _set_cloud_sync_indicator(self, provider: str, state: str) -> None:
+        if provider not in self._cloud_sync_states or state not in {"idle", "uploading", "success", "error"}:
+            return
+        with self._cloud_sync_state_lock:
+            self._cloud_sync_states[provider] = state
+            states = tuple(self._cloud_sync_states.values())
+        if "uploading" in states:
+            message, foreground = "● 云端上传中…", color("#b54708")
+        elif "error" in states:
+            message, foreground = "● 云端同步失败", color("#d92d20")
+        elif "success" in states:
+            message, foreground = "● 已上传到云端", color("#039855")
+        else:
+            message, foreground = "● 云端未连接", color("#667085")
+
+        def update() -> None:
+            try:
+                self.desktop_shell.set_cloud_status(
+                    translate(message[2:], self.language), foreground
+                )
+            except (AttributeError, tk.TclError):
+                pass
+
+        self.post_to_ui(update)
 
     def _build_widgets(self) -> None:
         configure_styles(self.root, self.ui_font_family)
@@ -2012,8 +1999,8 @@ class BookkeepingWindow:
         self.input_box.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
         self.input_box.edit_modified(False)
         self.input_box.bind("<<Modified>>", self._refresh_input_after_change, add="+")
-        self.input_box.bind("<Shift-Return>", self._send_shortcut)
-        self.input_box.bind("<Shift-KP_Enter>", self._send_shortcut)
+        self.input_box.bind("<Control-Return>", self._send_shortcut)
+        self.input_box.bind("<Control-KP_Enter>", self._send_shortcut)
         self.drag_drop_enabled = False
         self.drag_drop_error: str | None = _DRAG_DROP_INIT_ERROR
         if DND_FILES is None:
@@ -2023,7 +2010,10 @@ class BookkeepingWindow:
             # Register both the text widget and its surrounding attachment
             # area. TkDND selects the most specific target, so drops over the
             # input remain reliable while the toolbar is also a drop zone.
-            for target in (self.input_box, attachment_toolbar, self.attachments_frame, compose):
+            for target in (
+                self.transcript, history_frame, self.input_box,
+                attachment_toolbar, self.attachments_frame, compose,
+            ):
                 try:
                     target.drop_target_register(DND_FILES)
                     target.dnd_bind("<<Drop>>", self._handle_image_drop)
@@ -2051,10 +2041,23 @@ class BookkeepingWindow:
         )
         self.reset_conversation_button.pack(side="top", fill="x", pady=(6, 0))
         self._refresh_image_attachments()
+        self.model_usage_panel = RoundedPanel(content, padding=(12, 9), radius=10)
+        self.model_usage_panel.grid(row=4, column=0, sticky="ew", pady=(7, 0))
+        self.model_usage_label = ttk.Label(
+            self.model_usage_panel.body,
+            text=translate(
+                "模型费用 · 人民币估算：发送记账内容后显示本轮命中、未命中和输出费用。",
+                self.language,
+            ),
+            style="SurfaceHint.TLabel",
+            wraplength=800,
+            justify="left",
+        )
+        self.model_usage_label.pack(fill="x")
         self.payment_hint_summary = ttk.Label(content, text="", style="Hint.TLabel")
-        self.payment_hint_summary.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.payment_hint_summary.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         self.skill_summary = ttk.Label(content, text="", style="Hint.TLabel")
-        self.skill_summary.grid(row=5, column=0, sticky="ew", pady=(3, 0))
+        self.skill_summary.grid(row=6, column=0, sticky="ew", pady=(3, 0))
         self.hint = ttk.Label(
             content,
             style="Hint.TLabel",
@@ -2092,6 +2095,7 @@ class BookkeepingWindow:
         self.history = selected["history"]
         self.pending_state = selected["pending_state"]
         self._update_skill_summary()
+        self._refresh_model_usage_display()
         self._refresh_agent_view()
 
     def _refresh_agent_view(self) -> None:
@@ -2115,15 +2119,15 @@ class BookkeepingWindow:
             text=(
                 "可拖入食物图片；记录与饮食 Skill 会发给饮食 Agent 的模型"
                 if is_food
-                else "可拖入 JPG/PNG/WebP 图片到输入框或附件栏"
+                else "可拖入 JPG/PNG/WebP 图片到聊天记录、输入框或附件栏"
             )
         )
         if is_food:
             self.payment_hint_summary.grid_remove()
             self.skill_summary.grid()
-            self.hint.grid(row=6, column=0, sticky="ew", pady=(4, 0))
+            self.hint.grid(row=7, column=0, sticky="ew", pady=(4, 0))
             self.hint.configure(
-                text="饮食健康 Agent 会检索本地饮食回顾，并将记录摘要、此 Agent 单独选择的 Skill 正文和本轮问题发送给当前消息对应的服务；附图消息使用含图片服务，纯文字消息使用纯文字服务。本机 Ollama 留在本机，远程服务会收到这些内容。此模式只提供饮食建议，不会写入记录。Enter 换行，Shift+Enter 发送。"
+                text="饮食健康 Agent 会检索本地饮食回顾，并将记录摘要、此 Agent 单独选择的 Skill 正文和本轮问题发送给当前消息对应的服务；附图消息使用含图片服务，纯文字消息使用纯文字服务。本机 Ollama 留在本机，远程服务会收到这些内容。此模式只提供饮食建议，不会写入记录。Enter 换行，Ctrl+Enter 发送。"
             )
         else:
             self.payment_hint_summary.grid()
@@ -2418,7 +2422,9 @@ class BookkeepingWindow:
         if self.busy:
             messagebox.showinfo("正在记账", "当前记账请求完成后再查看食材与饮食记录。", parent=self.root)
             return
-        show_food_tracking(self.root, self.database_path)
+        show_food_tracking(
+            self.root, self.database_path, on_changed=self._queue_github_auto_sync
+        )
 
     def open_transaction_history(self) -> None:
         if self.busy:
@@ -3631,7 +3637,7 @@ class BookkeepingWindow:
                 if key == "kind":
                     widget = ttk.Combobox(form_panel, textvariable=values[key], values=("支出", "收入"), state="readonly")
                 elif key == "currency":
-                    widget = ttk.Combobox(form_panel, textvariable=values[key], values=("JPY", "CNY"), state="readonly")
+                    widget = ttk.Combobox(form_panel, textvariable=values[key], values=("JPY", "CNY", "USD"), state="readonly")
                 elif key == "account":
                     widget = ttk.Combobox(form_panel, textvariable=values[key], state="readonly")
                 elif key == "category":
@@ -3755,6 +3761,7 @@ class BookkeepingWindow:
                     else:
                         tree.selection_set(str(schedule_id))
                         status_var.set("定期收支规则已更新；只影响后续到期项目，已生成的流水不会改变。")
+                    self._queue_github_auto_sync()
                 except (LedgerError, sqlite3.Error, OSError, KeyError) as exc:
                     messagebox.showerror("无法保存", str(exc), parent=form)
 
@@ -3795,6 +3802,7 @@ class BookkeepingWindow:
                 database.close()
             refresh()
             status_var.set("定期收支已启用。" if enabled else "定期收支已暂停。")
+            self._queue_github_auto_sync()
 
         def remove_selected() -> None:
             schedule_id = selected_schedule_id()
@@ -3818,6 +3826,7 @@ class BookkeepingWindow:
                 database.close()
             refresh()
             status_var.set("规则已删除，历史账本流水已保留。")
+            self._queue_github_auto_sync()
 
         ttk.Button(toolbar, text="＋ 新增定期收支", command=open_schedule_form).pack(side="left")
         ttk.Button(toolbar, text="编辑规则", command=edit_selected_schedule).pack(side="left", padx=(8, 0))
@@ -3881,6 +3890,7 @@ class BookkeepingWindow:
             self.ui_font_family,
             container=container,
             database_lock=self._scheduled_db_work_lock,
+            on_changed=self._queue_github_auto_sync,
         )
 
     def open_financial_statements(self, container: tk.Misc | None = None) -> None:
@@ -4070,6 +4080,7 @@ class BookkeepingWindow:
                         report_status.configure(text="固定资产计入状态更新失败。")
                     else:
                         report_state["refresh_pending"] = True
+                        self._queue_github_auto_sync()
             if report_state["refresh_pending"] and not report_state["loading"] and not report_state["asset_toggle_running"]:
                 report_state["refresh_pending"] = False
                 refresh()
@@ -4144,7 +4155,7 @@ class BookkeepingWindow:
                 return f"  {row['name']}（{detail}）" if detail else f"  {row['name']}"
 
             def code_order(code: str) -> tuple[int, str]:
-                return ({"JPY": 0, "CNY": 1}.get(code, 2), code)
+                return ({"JPY": 0, "CNY": 1, "USD": 2}.get(code, 3), code)
 
             def add_currency_block(code: str) -> None:
                 digits = currency_digits.get(code, 0)
@@ -4284,18 +4295,18 @@ class BookkeepingWindow:
             jpy_total = profit["jpy_equivalent"]
             jpy_money = lambda value: minor_to_text(int(value), currency_digits["JPY"], "JPY")
             add_profit_row(
-                ("JPY合并口径", "收入合计", jpy_money(jpy_total["income_minor"]), "JPY原币收入 + CNY按交易日汇率折算"),
+                ("JPY合并口径", "收入合计", jpy_money(jpy_total["income_minor"]), "JPY原币收入 + 外币按交易日汇率折算"),
                 ("income",),
             )
             add_profit_row(
-                ("JPY合并口径", "消费合计", jpy_money(-int(jpy_total["expense_minor"])), "JPY原币消费 + CNY按交易日汇率折算"),
+                ("JPY合并口径", "消费合计", jpy_money(-int(jpy_total["expense_minor"])), "JPY原币消费 + 外币按交易日汇率折算"),
                 ("expense",),
             )
             for category, amount in sorted(
                 jpy_total["categories"].items(), key=lambda item: (-item[1], item[0])
             ):
                 add_profit_row(
-                    ("JPY合并口径", f"支出分类：{category}", jpy_money(-int(amount)), "含人民币交易日汇率折算"),
+                    ("JPY合并口径", f"支出分类：{category}", jpy_money(-int(amount)), "含外币交易日汇率折算"),
                     ("expense",),
                 )
             net_minor = int(jpy_total["net_minor"])
@@ -4310,6 +4321,37 @@ class BookkeepingWindow:
                     ("待补汇率", "未折算流水", f"{count} 笔", "不计入JPY合并口径；需补充历史汇率"),
                     ("warning",),
                 )
+            base_total = profit.get("base_equivalent", {})
+            base_currency = str(base_total.get("currency") or "JPY")
+            if base_currency != "JPY":
+                base_digits = int(base_total.get("minor_digits", currency_digits[base_currency]))
+                base_money = lambda value: minor_to_text(int(value), base_digits, base_currency)
+                for row_name, amount, note, tag in (
+                    ("收入合计", base_total["income_minor"], "按交易日汇率折算外币收入", "income"),
+                    ("消费合计", -int(base_total["expense_minor"]), "按交易日汇率折算外币消费", "expense"),
+                ):
+                    add_profit_row(
+                        ("主要记账货币合并口径", row_name, base_money(amount), note), (tag,)
+                    )
+                for category, amount in sorted(
+                    base_total["categories"].items(), key=lambda item: (-item[1], item[0])
+                ):
+                    add_profit_row(
+                        ("主要记账货币合并口径", f"支出分类：{category}", base_money(-int(amount)),
+                         "含外币交易日参考汇率折算"), ("expense",)
+                    )
+                base_net = int(base_total["net_minor"])
+                base_tag = "net_positive" if base_net > 0 else "net_negative" if base_net < 0 else ""
+                add_profit_row(
+                    ("主要记账货币合并口径", "本期合计", base_money(base_net), "收入减消费；含外币汇率折算"),
+                    (base_tag,) if base_tag else (),
+                )
+                if base_total.get("missing_conversion_count"):
+                    count = int(base_total["missing_conversion_count"])
+                    add_profit_row(
+                        ("待补汇率", "未折算流水", f"{count} 笔", f"不计入{base_currency}合并口径；需补充历史汇率"),
+                        ("warning",),
+                    )
             report_status.configure(text="报表已按账本最新记录刷新。")
 
         def toggle_fixed_asset(event: Any) -> str | None:
@@ -4363,7 +4405,95 @@ class BookkeepingWindow:
         if self.busy:
             messagebox.showinfo("正在记账", "当前记账请求完成后再管理固定资产。", parent=self.root)
             return
-        open_fixed_asset_management(self.root, self.database_path)
+        open_fixed_asset_management(
+            self.root, self.database_path, on_changed=self._queue_github_auto_sync
+        )
+
+    def _rename_account_dialog(
+        self,
+        account_id: int,
+        expected_name: str,
+        *,
+        parent: tk.Misc,
+        on_saved: Any = None,
+    ) -> None:
+        if self.busy:
+            messagebox.showinfo(
+                translate("正在记账", self.language),
+                translate("当前记账请求完成后再更改账户称呼。", self.language),
+                parent=parent,
+            )
+            return
+        dialog = tk.Toplevel(parent)
+        dialog.title(translate("更改账户称呼", self.language))
+        dialog.geometry("460x210")
+        dialog.resizable(False, False)
+        dialog.transient(parent)
+        dialog.grab_set()
+        panel = ttk.Frame(dialog, style="App.TFrame", padding=18)
+        panel.pack(fill="both", expand=True)
+        panel.columnconfigure(0, weight=1)
+        ttk.Label(
+            panel,
+            text=translate("更改账户称呼", self.language),
+            style="ManagementTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            panel,
+            text=translate(
+                "只会改显示名称，余额、流水和账单关联都会保留。旧称呼也能继续被记账助手识别。",
+                self.language,
+            ),
+            style="Hint.TLabel",
+            wraplength=410,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(6, 12))
+        name_var = tk.StringVar(value=expected_name)
+        name_entry = ttk.Entry(panel, textvariable=name_var)
+        name_entry.grid(row=2, column=0, sticky="ew")
+        status = ttk.Label(panel, text="", style="Status.TLabel", wraplength=410)
+        status.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        actions = ttk.Frame(panel, style="App.TFrame")
+        actions.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+
+        def save() -> None:
+            database = Database(self.database_path)
+            try:
+                database.initialize()
+                old_name, new_name = database.rename_account(
+                    account_id,
+                    name_var.get(),
+                    expected_name=expected_name,
+                )
+            except (LedgerError, sqlite3.Error, OSError) as exc:
+                status.configure(text=translate(str(exc), self.language))
+                return
+            finally:
+                database.close()
+            if callable(on_saved):
+                on_saved()
+            self.status.configure(
+                text=translate("账户称呼已更改：{old} → {new}。", self.language).format(
+                    old=old_name, new=new_name
+                )
+            )
+            self._queue_github_auto_sync()
+            dialog.destroy()
+
+        ttk.Button(
+            actions, text=translate("取消", self.language), command=dialog.destroy
+        ).pack(side="right", padx=(8, 0))
+        ttk.Button(
+            actions,
+            text=translate("保存", self.language),
+            style="Send.TButton",
+            command=save,
+        ).pack(side="right")
+        name_entry.focus_set()
+        name_entry.selection_range(0, "end")
+        dialog.bind("<Return>", lambda _event: save())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        center_window(dialog, parent)
 
     def open_cash_management(self, container: tk.Misc | None = None) -> None:
         if self.busy and container is None:
@@ -4511,13 +4641,25 @@ class BookkeepingWindow:
                 state_label = ttk.Label(table, text="", style="Hint.TLabel")
                 state_label.grid(row=row_index, column=3, sticky="w", padx=(4, 10), pady=3)
                 delete_button: ttk.Button | None = None
+                rename_button: ttk.Button | None = None
                 if row["initialized"]:
+                    action_frame = ttk.Frame(table, style="App.TFrame")
+                    action_frame.grid(row=row_index, column=4, sticky="e", padx=(4, 0), pady=2)
+                    rename_button = ttk.Button(
+                        action_frame,
+                        text=translate("更改称呼", self.language),
+                        command=lambda account_id=int(row["account_id"]), old_name=account_name:
+                            self._rename_account_dialog(
+                                account_id, old_name, parent=dialog, on_saved=refresh_table
+                            ),
+                    )
+                    rename_button.pack(side="left", padx=(0, 6))
                     delete_button = ttk.Button(
-                        table,
+                        action_frame,
                         text="删除账户",
                         command=lambda name=account_name: delete_managed_account(name),
                     )
-                    delete_button.grid(row=row_index, column=4, sticky="ew", padx=(4, 0), pady=2)
+                    delete_button.pack(side="left")
                 else:
                     ttk.Label(table, text="—", style="Hint.TLabel").grid(
                         row=row_index, column=4, sticky="w", padx=(4, 10), pady=3
@@ -4527,6 +4669,7 @@ class BookkeepingWindow:
                     "entry": amount_entry,
                     "status": state_label,
                     "delete": delete_button,
+                    "rename": rename_button,
                 }
 
                 if row["initialized"]:
@@ -4598,6 +4741,7 @@ class BookkeepingWindow:
             if account_name in {"现金（日元）", "现金（人民币）"}:
                 status_text += " 默认首次盘点行已一并移除；需要时可用同名钱包账户重新添加。"
             set_status(status_text)
+            self._queue_github_auto_sync()
 
         def set_editing_controls(is_editing: bool) -> None:
             nonlocal editing
@@ -4611,6 +4755,9 @@ class BookkeepingWindow:
                 delete_button = row_widgets_for_account.get("delete")
                 if delete_button is not None:
                     delete_button.configure(state="disabled" if is_editing else "normal")
+                rename_button = row_widgets_for_account.get("rename")
+                if rename_button is not None:
+                    rename_button.configure(state="disabled" if is_editing else "normal")
 
         def update_adjustment_button_label(*_args: Any) -> None:
             if editing:
@@ -4658,7 +4805,7 @@ class BookkeepingWindow:
             note_var = tk.StringVar()
 
             currency_box = ttk.Combobox(
-                form, textvariable=currency_var, values=("JPY", "CNY"), state="readonly"
+                form, textvariable=currency_var, values=("JPY", "CNY", "USD"), state="readonly"
             )
             fields = (
                 ("账户名称", ttk.Entry(form, textvariable=name_var)),
@@ -4716,6 +4863,7 @@ class BookkeepingWindow:
                 add_dialog.destroy()
                 refresh_table()
                 set_status(f"账户“{name}”已添加，并按当前排序规则排列。没有创建额外收支分录。")
+                self._queue_github_auto_sync()
 
             actions = ttk.Frame(form, style="App.TFrame")
             actions.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(16, 0))
@@ -4813,8 +4961,7 @@ class BookkeepingWindow:
             edit_button.configure(text="调整差额", command=start_edit)
             cancel_button.configure(state="disabled")
             messagebox.showinfo("余额调整完成", "\n".join(messages), parent=dialog)
-            if any(result["transaction_id"] is not None for result in results):
-                self._queue_github_auto_sync()
+            self._queue_github_auto_sync()
 
         add_account_button = ttk.Button(toolbar, text="＋ 添加账户", command=open_add_account)
         add_account_button.pack(side="left")
@@ -5269,7 +5416,7 @@ class BookkeepingWindow:
             note_var = tk.StringVar(value="真实历史卡债未核实；期初值仅为本账本记录起点")
             fields = (
                 ("信用卡名称", ttk.Entry(form, textvariable=name_var)),
-                ("币种", ttk.Combobox(form, textvariable=currency_var, values=("JPY", "CNY"), state="readonly")),
+                ("币种", ttk.Combobox(form, textvariable=currency_var, values=("JPY", "CNY", "USD"), state="readonly")),
                 ("期初账面卡债", ttk.Entry(form, textvariable=balance_var)),
                 ("期初日期", ttk.Entry(form, textvariable=date_var)),
                 ("债务记录状态", ttk.Combobox(form, textvariable=completeness_var, values=("已确认", "记录不完整"), state="readonly")),
@@ -5306,6 +5453,7 @@ class BookkeepingWindow:
                 add_dialog.destroy()
                 refresh_cards()
                 set_status(f"信用卡“{name}”已登记；额度仍需单独录入快照。")
+                self._queue_github_auto_sync()
 
             actions = ttk.Frame(form, style="App.TFrame")
             actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(16, 0))
@@ -5316,8 +5464,8 @@ class BookkeepingWindow:
         def open_limit_snapshot() -> None:
             add_dialog = tk.Toplevel(dialog)
             add_dialog.title("录入信用卡额度")
-            add_dialog.geometry("560x440")
-            add_dialog.minsize(520, 420)
+            add_dialog.geometry("600x540")
+            add_dialog.minsize(560, 500)
             add_dialog.transient(dialog)
             add_dialog.grab_set()
             form = ttk.Frame(add_dialog, style="App.TFrame", padding=12)
@@ -5364,6 +5512,22 @@ class BookkeepingWindow:
             ttk.Label(form, textvariable=unit_var, style="Hint.TLabel").grid(
                 row=7, column=1, sticky="w", pady=(0, 4)
             )
+            include_difference_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                form,
+                text=translate("将额度差额计入账本（余额盘盈/盘亏）", self.language),
+                variable=include_difference_var,
+            ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 2))
+            ttk.Label(
+                form,
+                text=translate(
+                    "默认只保存额度快照。勾选后，会比较估算欠款和账面卡债，并将差额记入收支报表；仅在快照日期之后没有相关流水时可用。",
+                    self.language,
+                ),
+                style="Hint.TLabel",
+                wraplength=520,
+                justify="left",
+            ).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(0, 4))
             card_box = widgets["信用卡"]
 
             def update_snapshot_unit(*_args: Any) -> None:
@@ -5380,12 +5544,14 @@ class BookkeepingWindow:
                 database = Database(self.database_path)
                 try:
                     database.initialize()
-                    database.add_credit_limit_snapshot(
+                    snapshot_result = record_credit_snapshot(
+                        database,
                         account_name=name,
-                        snapshot_date=date_var.get().strip(),
-                        limit=limit_var.get().strip(),
-                        available=available_var.get().strip(),
+                        occurred_on=date_var.get().strip(),
+                        limit_amount=limit_var.get().strip(),
+                        available_amount=available_var.get().strip(),
                         note=note_var.get().strip(),
+                        include_difference=bool(include_difference_var.get()),
                     )
                 except LedgerError as exc:
                     messagebox.showerror("无法保存额度", str(exc), parent=add_dialog)
@@ -5394,11 +5560,18 @@ class BookkeepingWindow:
                     database.close()
                 add_dialog.destroy()
                 refresh_cards()
-                set_status(f"“{name}”的额度快照已保存；消费、退款和还款会调整可用额度，并更新当前欠款估算。")
+                if snapshot_result["transaction_id"]:
+                    set_status(
+                        f"“{name}”的额度快照已保存，并已将差额记入{snapshot_result['category_name']}。"
+                    )
+                elif include_difference_var.get():
+                    set_status(f"“{name}”的额度快照已保存；账面与估算欠款一致，未新增调整流水。")
+                else:
+                    set_status(f"“{name}”的额度快照已保存，未计入账本。")
                 self._queue_github_auto_sync()
 
             actions = ttk.Frame(form, style="App.TFrame")
-            actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+            actions.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(16, 0))
             ttk.Button(actions, text="取消", command=add_dialog.destroy).pack(side="right", padx=(8, 0))
             ttk.Button(actions, text="保存快照", style="Send.TButton", command=save_snapshot).pack(side="right")
             if names:
@@ -5481,7 +5654,7 @@ class BookkeepingWindow:
                 if schedule:
                     source_var.set(schedule["source_name"] if schedule["source_name"] in compatible else "")
                     if schedule["amount_minor"] is not None:
-                        amount_text = minor_to_text(schedule["amount_minor"], 2 if code == "CNY" else 0, code)
+                        amount_text = minor_to_text(schedule["amount_minor"], 2 if code in {"CNY", "USD"} else 0, code)
                         amount_var.set(amount_text.removesuffix(f" {code}").replace(",", ""))
                     else:
                         amount_var.set("")
@@ -5544,6 +5717,7 @@ class BookkeepingWindow:
                 set_status(
                     f"已保存“{card_var.get()}”的扣款账户和还款日；本期金额按本月填写，未填写就不会自动记账。"
                 )
+                self._queue_github_auto_sync()
 
             def toggle_schedule() -> None:
                 card_name = card_var.get()
@@ -5564,6 +5738,7 @@ class BookkeepingWindow:
                 add_dialog.destroy()
                 refresh_cards()
                 set_status(f"“{card_name}”每月应还计划已{'恢复' if enabled else '暂停'}。")
+                self._queue_github_auto_sync()
 
             actions = ttk.Frame(form, style="App.TFrame")
             actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(18, 0))
@@ -5691,6 +5866,13 @@ class BookkeepingWindow:
                 set_status("没有信用卡账户；请先点击“新增信用卡”。")
 
         ttk.Button(controls, text="＋ 新增信用卡", command=open_add_card).pack(side="left")
+        rename_card_button = ttk.Button(
+            controls,
+            text=translate("更改称呼", self.language),
+            command=lambda: rename_selected_credit_card(),
+            state="disabled",
+        )
+        rename_card_button.pack(side="left", padx=(8, 0))
         ttk.Button(controls, text="录入额度快照", command=open_limit_snapshot).pack(side="left", padx=(8, 0))
         ttk.Button(controls, text="恢复额度快照", command=open_credit_recovery_dialog).pack(side="left", padx=(8, 0))
         ttk.Button(controls, text="记录还款", command=open_repayment_dialog).pack(side="left", padx=(8, 0))
@@ -5707,6 +5889,32 @@ class BookkeepingWindow:
             )
             set_status(status_message)
             refresh_cards()
+
+        def update_credit_rename_state(_event: Any = None) -> None:
+            rename_card_button.configure(
+                state="normal" if card_tree.selection() else "disabled"
+            )
+
+        def rename_selected_credit_card() -> None:
+            selection = card_tree.selection()
+            if not selection:
+                return
+            try:
+                account_id = int(selection[0])
+            except (TypeError, ValueError):
+                return
+            account_name = card_names_by_id.get(account_id)
+            if not account_name:
+                refresh_cards()
+                return
+            self._rename_account_dialog(
+                account_id,
+                account_name,
+                parent=dialog,
+                on_saved=refresh_cards,
+            )
+
+        card_tree.bind("<<TreeviewSelect>>", update_credit_rename_state, add="+")
 
         if container is None:
             ttk.Button(buttons, text="关闭", command=dialog.destroy).pack(side="right")
@@ -5962,7 +6170,192 @@ class BookkeepingWindow:
             if cache_key[0] == mode:
                 del self.clients[cache_key]
 
-    def open_settings(self, initial_page: str = "API 服务") -> None:
+    def _maybe_start_desktop_tutorial(self) -> None:
+        if self.desktop_tutorial_store.is_complete(self.database_path):
+            return
+        database = Database(self.database_path)
+        try:
+            database.initialize()
+            has_accounts = database.connection.execute(
+                "SELECT 1 FROM accounts LIMIT 1"
+            ).fetchone() is not None
+            has_transactions = database.connection.execute(
+                "SELECT 1 FROM transactions LIMIT 1"
+            ).fetchone() is not None
+        except (LedgerError, sqlite3.Error, OSError):
+            return
+        finally:
+            database.close()
+        if not has_accounts and not has_transactions:
+            self.open_desktop_tutorial()
+
+    def open_desktop_tutorial(self) -> None:
+        existing = self._desktop_tutorial_window
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return
+        except tk.TclError:
+            pass
+
+        steps = (
+            {
+                "title": translate("选好主要记账货币", self.language),
+                "description": translate("选择你平时最常用的货币。其他币种会单独显示，不会被改写。", self.language),
+                "detail": translate("点“打开本项”进入通用设置。设置会在你点“应用”或“确认”时保存。", self.language),
+                "target": "general",
+            },
+            {
+                "title": translate("添加自己的 API 服务", self.language),
+                "description": translate("填入你自己的接口地址、模型名称和 API 密钥。密钥只保存在本机，不会复制给其他账号。", self.language),
+                "detail": translate("已有网页版默认记账 Skill；本机没有 API 密钥，需要你自行配置。", self.language),
+                "target": "api",
+            },
+            {
+                "title": translate("确认 Agent 和 Skill", self.language),
+                "description": translate("为记账和饮食助手选择文字/图片服务，并查看已加载的 Skill。", self.language),
+                "detail": translate("可使用同一个 API 服务；自带的记账 Skill 已经可以直接使用。", self.language),
+                "target": "agent",
+            },
+            {
+                "title": translate("设置类别和每月统计日期", self.language),
+                "description": translate("调整收入、支出类别，并选择每月从哪一天开始统计。", self.language),
+                "detail": translate("总览、报表和预算会按新的统计日期更新，原有流水日期不变。", self.language),
+                "target": "categories",
+            },
+            {
+                "title": translate("添加或核对余额", self.language),
+                "description": translate("添加银行、钱包、信用卡等账户，填写现在的余额。", self.language),
+                "detail": translate("这一步只建立账本余额，不会操作真实银行账户。", self.language),
+                "target": "balances",
+            },
+            {
+                "title": translate("总览", self.language),
+                "description": translate("查看当前统计期间的收入、支出、余额和最近记录。", self.language),
+                "detail": translate("主卡片可切换显示余额或当期收支。", self.language),
+                "target": "home",
+            },
+            {
+                "title": translate("记录一笔", self.language),
+                "description": translate("在“记录”里用文字或小票图片告诉助手发生了什么。", self.language),
+                "detail": translate("助手确认后才会写入本机账本；云端同步在后台进行。", self.language),
+                "target": "entry",
+            },
+            {
+                "title": translate("查看账单", self.language),
+                "description": translate("按日期查找、修改、核对或删除流水。", self.language),
+                "detail": translate("修改和删除会先保存在本机，再排队后台同步。", self.language),
+                "target": "ledger",
+            },
+            {
+                "title": translate("查看余额", self.language),
+                "description": translate("按账户查看余额、信用卡和固定资产。", self.language),
+                "detail": translate("核对余额时可以选择是否把差额记入流水。", self.language),
+                "target": "assets",
+            },
+            {
+                "title": translate("更多功能", self.language),
+                "description": translate("报表、预算、定期收支、备份和设置都能从这里打开。", self.language),
+                "detail": translate("以后可以从左侧“新手教程”再次查看这份指南。", self.language),
+                "target": "more",
+            },
+        )
+
+        dialog = tk.Toplevel(self.root)
+        self._desktop_tutorial_window = dialog
+        dialog.title(translate("新手教程", self.language))
+        dialog.geometry("500x340")
+        dialog.minsize(440, 310)
+        dialog.transient(self.root)
+        dialog.configure(bg=color("#f2f4f7"))
+        panel = ttk.Frame(dialog, style="App.TFrame", padding=24)
+        panel.pack(fill="both", expand=True, padx=12, pady=12)
+        panel.columnconfigure(0, weight=1)
+        progress = ttk.Label(panel, text="", style="Hint.TLabel")
+        progress.grid(row=0, column=0, sticky="w")
+        title = ttk.Label(panel, text="", style="ManagementTitle.TLabel", wraplength=420)
+        title.grid(row=1, column=0, sticky="w", pady=(14, 8))
+        description = ttk.Label(
+            panel, text="", style="Hint.TLabel", wraplength=420, justify="left"
+        )
+        description.grid(row=2, column=0, sticky="ew")
+        detail = ttk.Label(
+            panel, text="", style="Hint.TLabel", wraplength=420, justify="left"
+        )
+        detail.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        actions = ttk.Frame(panel, style="App.TFrame")
+        actions.grid(row=4, column=0, sticky="ew", pady=(24, 0))
+        actions.columnconfigure(0, weight=1)
+        state = {"index": 0, "closing": False}
+
+        def close_tutorial(*, completed: bool) -> None:
+            if state["closing"]:
+                return
+            state["closing"] = True
+            if completed:
+                self.desktop_tutorial_store.mark_complete(self.database_path)
+            self._desktop_tutorial_window = None
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+        def show_step() -> None:
+            index = state["index"]
+            step = steps[index]
+            progress.configure(text=translate("教程进度：第 {current} 步 / 共 {total} 步", self.language).format(
+                current=index + 1, total=len(steps)
+            ))
+            title.configure(text=step["title"])
+            description.configure(text=step["description"])
+            detail.configure(text=step["detail"])
+            previous_button.configure(state="normal" if index else "disabled")
+            next_button.configure(text=translate("完成" if index == len(steps) - 1 else "下一步", self.language))
+
+        def open_step() -> None:
+            target = steps[state["index"]]["target"]
+            if target == "general":
+                self.open_settings("通用设置")
+            elif target == "api":
+                self.open_settings("API 服务")
+            elif target == "agent":
+                self.open_settings("Agent 配置与 Skill")
+            elif target == "categories":
+                self.open_settings("记账类别")
+            elif target == "balances":
+                self.open_accounts_workspace()
+            elif target in {"home", "entry", "ledger", "assets", "more"}:
+                self.desktop_shell.navigate(target)
+            dialog.lower()
+
+        def previous_step() -> None:
+            if state["index"] > 0:
+                state["index"] -= 1
+                show_step()
+
+        def next_step() -> None:
+            if state["index"] >= len(steps) - 1:
+                close_tutorial(completed=True)
+                return
+            state["index"] += 1
+            show_step()
+
+        previous_button = ttk.Button(actions, text=translate("上一步", self.language), command=previous_step)
+        previous_button.pack(side="left")
+        ttk.Button(actions, text=translate("跳过教程", self.language), command=lambda: close_tutorial(completed=True)).pack(
+            side="left", padx=(8, 0)
+        )
+        open_button = ttk.Button(actions, text=translate("打开本项", self.language), style="Settings.TButton", command=open_step)
+        open_button.pack(side="right", padx=(8, 0))
+        next_button = ttk.Button(actions, text=translate("下一步", self.language), style="Send.TButton", command=next_step)
+        next_button.pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_tutorial(completed=True))
+        dialog.bind("<Escape>", lambda _event: close_tutorial(completed=True))
+        show_step()
+
+    def open_settings(self, initial_page: str = "通用设置") -> None:
         if self.busy:
             messagebox.showinfo("正在等待 API", "当前请求完成后再切换 API 服务。", parent=self.root)
             return
@@ -6047,7 +6440,7 @@ class BookkeepingWindow:
         sidebar_header = tk.Frame(sidebar, bg=color("#ffffff"))
         sidebar_header.pack(fill="x")
         tk.Label(sidebar_header, text="⚙  设置", bg=color("#ffffff"), fg=color("#101828"), font=(self.ui_font_family, 16, "bold"), anchor="w").pack(fill="x", padx=21, pady=(14, 2))
-        tk.Label(sidebar_header, text="管理服务、解析和数据", bg=color("#ffffff"), fg=color("#667085"), font=(self.ui_font_family, 10), anchor="w").pack(fill="x", padx=22, pady=(0, 12))
+        tk.Label(sidebar_header, text=translate("账户、类别和备份设置", self.language), bg=color("#ffffff"), fg=color("#667085"), font=(self.ui_font_family, 10), anchor="w").pack(fill="x", padx=22, pady=(0, 12))
 
         sidebar_nav = tk.Frame(sidebar, bg=color("#ffffff"))
         sidebar_nav.pack(fill="both", expand=True)
@@ -6116,23 +6509,23 @@ class BookkeepingWindow:
             "外观": appearance_page,
             "语言": language_page,
             "记账类别": category_page,
-            "账期设置": billing_page,
+            "通用设置": billing_page,
             "账本与备份": data_page,
         }
         nav_buttons: dict[str, tuple[tk.Frame, tk.Label, tk.Label]] = {}
         group_pages = {
-            "服务与解析": ("API 服务", "Agent 配置与 Skill"),
-            "显示设置": ("外观", "语言"),
-            "记账设置": ("记账类别", "账期设置"),
-            "数据管理": ("账本与备份",),
+            "通用设置": ("通用设置", "外观", "语言"),
+            "Agent 相关": ("API 服务", "Agent 配置与 Skill"),
+            "记账类别": ("记账类别",),
+            "备份": ("账本与备份",),
         }
         page_descriptions = {
-            "API 服务": "管理可供两个 Agent 选择的模型连接",
-            "Agent 配置与 Skill": "统一管理 Agent 模型与 Skill",
+            "API 服务": "填写你自己的模型服务和密钥",
+            "Agent 配置与 Skill": "选择服务并查看已加载的 Skill",
             "外观": "浅色、深色或跟随系统",
             "语言": "选择软件界面显示语言",
-            "记账类别": "管理记账 Agent 可使用的收入和支出类别",
-            "账期设置": "调整每月账期起始日及当前期间统计范围",
+            "记账类别": "修改收入、支出类别和每月统计日期",
+            "通用设置": "选择主要记账货币",
             "账本与备份": "查看数据位置并创建备份",
         }
 
@@ -6163,7 +6556,7 @@ class BookkeepingWindow:
             )
             group_title.pack(fill="x", padx=17, pady=(10, 2))
             for name in names:
-                description = page_descriptions[name]
+                description = translate(page_descriptions[name], self.language)
                 nav = tk.Frame(sidebar_items, bg=color("#ffffff"), cursor="hand2")
                 nav.pack(fill="x", padx=10, pady=2)
                 nav_title = tk.Label(
@@ -6767,6 +7160,7 @@ class BookkeepingWindow:
             category_status_var.set(translate("类别名称已保存。", self.language))
             finish_category_name_edit()
             refresh_category_table()
+            self._queue_github_auto_sync()
 
         category_edit_button.configure(command=start_category_name_edit)
         category_name_save_button.configure(command=save_category_name_edit)
@@ -6809,6 +7203,7 @@ class BookkeepingWindow:
             category_name_var.set("")
             category_status_var.set("类别已添加；记账 Agent 下次请求会读取新类别。")
             refresh_category_table()
+            self._queue_github_auto_sync()
 
         ttk.Button(
             category_form,
@@ -6825,6 +7220,22 @@ class BookkeepingWindow:
             finally:
                 database.close()
 
+        def read_base_currency() -> str:
+            database = Database(self.database_path)
+            try:
+                database.initialize()
+                return database.get_base_currency()
+            finally:
+                database.close()
+
+        def save_base_currency(code: str) -> None:
+            database = Database(self.database_path)
+            try:
+                database.initialize()
+                database.set_base_currency(code)
+            finally:
+                database.close()
+
         def save_billing_cycle_start_day(day: int) -> None:
             database = Database(self.database_path)
             try:
@@ -6833,17 +7244,60 @@ class BookkeepingWindow:
             finally:
                 database.close()
 
-        billing_panel = ttk.Frame(billing_page, style="SettingsPanel.TFrame", padding=18)
-        billing_panel.pack(fill="both", expand=True)
+        base_currency_panel = ttk.Frame(billing_page, style="SettingsPanel.TFrame", padding=18)
+        base_currency_panel.pack(fill="x", pady=(0, 12))
+        base_currency_panel.columnconfigure(0, weight=1)
+        ttk.Label(
+            base_currency_panel,
+            text=translate("主要记账货币", self.language),
+            style="SettingsTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            base_currency_panel,
+            text=translate(
+                "选择你平时主要用来记账的货币。总览和报表会用它合并统计，其他币种仍分开显示。",
+                self.language,
+            ),
+            style="SettingsHint.TLabel",
+            wraplength=680,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(5, 12))
+        base_currency_var = tk.StringVar(value=read_base_currency())
+        base_currency_combo = ttk.Combobox(
+            base_currency_panel,
+            textvariable=base_currency_var,
+            values=("JPY", "CNY", "USD"),
+            state="readonly",
+            width=14,
+        )
+        base_currency_combo.grid(row=2, column=0, sticky="w")
+        base_currency_status = ttk.Label(
+            base_currency_panel,
+            text=translate("更改会在点击应用或确认后保存。", self.language),
+            style="SettingsHint.TLabel",
+        )
+        base_currency_status.grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        def mark_base_currency_pending(_event: Any = None) -> None:
+            base_currency_status.configure(
+                text=translate("主要记账货币尚未保存；点击应用或确认后生效。", self.language)
+            )
+
+        base_currency_combo.bind("<<ComboboxSelected>>", mark_base_currency_pending)
+
+        category_panel.pack_forget()
+        billing_panel = ttk.Frame(category_page, style="SettingsPanel.TFrame", padding=18)
+        billing_panel.pack(fill="x", pady=(0, 12))
+        category_panel.pack(fill="both", expand=True)
         billing_panel.columnconfigure(0, weight=1)
         ttk.Label(
-            billing_panel, text=translate("账期设置", self.language),
+            billing_panel, text=translate("每月统计日期", self.language),
             style="SettingsTitle.TLabel",
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             billing_panel,
             text=translate(
-                "设置每月账期从哪一天开始。保存后总览、财务报表和预算会按新账期重新统计；历史流水日期不会改变。",
+                "选择每月从哪一天开始算本月。总览、报表和预算会跟着更新；旧流水日期不变。",
                 self.language,
             ),
             style="SettingsHint.TLabel",
@@ -6855,7 +7309,7 @@ class BookkeepingWindow:
         )
         ttk.Label(
             billing_panel,
-            text=translate("每月起始日", self.language),
+            text=translate("每月从几号开始", self.language),
             style="SettingsSection.TLabel",
         ).grid(row=2, column=0, sticky="w", pady=(0, 6))
         billing_cycle_start_day_combo = ttk.Combobox(
@@ -6869,7 +7323,7 @@ class BookkeepingWindow:
         ttk.Label(
             billing_panel,
             text=translate(
-                "周期持续到下一个账期起始日前一天。所选日期在某月不存在时，按该月最后一天开始。",
+                "统计到下次开始日前一天。某个月没有这一天时，就从当月最后一天开始。",
                 self.language,
             ),
             style="SettingsHint.TLabel",
@@ -6883,7 +7337,7 @@ class BookkeepingWindow:
 
         def mark_billing_cycle_pending(_event: Any = None) -> None:
             billing_cycle_status.configure(
-                text=translate("账期起始日尚未保存；点击应用或确认后生效。", self.language)
+                text=translate("每月统计日期尚未保存；点击应用或确认后生效。", self.language)
             )
 
         billing_cycle_start_day_combo.bind(
@@ -8471,6 +8925,7 @@ class BookkeepingWindow:
                 "language": self.language,
                 "appearance": self.appearance_mode,
                 "billing_cycle_start_day": read_billing_cycle_start_day(),
+                "base_currency": read_base_currency(),
             }
 
         settings_baseline = capture_settings_baseline()
@@ -8502,6 +8957,7 @@ class BookkeepingWindow:
                 ("Gitee 自动同步", lambda: self.gitee_auto_sync_settings_store.save_enabled(value["gitee_auto_sync"])),
                 ("语言", lambda: save_language(value["language"])),
                 ("外观", lambda: save_appearance(value["appearance"])),
+                ("主要记账货币", lambda: save_base_currency(value["base_currency"])),
             )
             for label, operation in operations:
                 try:
@@ -8582,6 +9038,12 @@ class BookkeepingWindow:
                     return
 
             selected_appearance = APPEARANCE_CHOICES[max(0, appearance_combo.current())][0]
+            selected_base_currency = base_currency_var.get().strip().upper()
+            if selected_base_currency not in {"JPY", "CNY", "USD"}:
+                base_currency_status.configure(
+                    text=translate("请选择有效的主要记账货币。", self.language)
+                )
+                return
             old_state = settings_baseline
             selected_scope = backup_scope_selection()
             selected_receipt_images = bool(receipt_image_enabled_var.get())
@@ -8591,12 +9053,12 @@ class BookkeepingWindow:
                 selected_billing_cycle_start_day = int(billing_cycle_start_day_var.get())
             except (TypeError, ValueError):
                 billing_cycle_status.configure(
-                    text=translate("请选择1到31之间的账期起始日。", self.language)
+                    text=translate("每月统计日期请选择1到31号。", self.language)
                 )
                 return
             if not 1 <= selected_billing_cycle_start_day <= 31:
                 billing_cycle_status.configure(
-                    text=translate("请选择1到31之间的账期起始日。", self.language)
+                    text=translate("每月统计日期请选择1到31号。", self.language)
                 )
                 return
             if not any(selected_scope.values()):
@@ -8634,6 +9096,8 @@ class BookkeepingWindow:
                         store.clear()
                 save_language(selected_language)
                 save_appearance(selected_appearance)
+                if selected_base_currency != old_state["base_currency"]:
+                    save_base_currency(selected_base_currency)
                 if selected_billing_cycle_start_day != old_state["billing_cycle_start_day"]:
                     save_billing_cycle_start_day(selected_billing_cycle_start_day)
             except Exception as exc:
@@ -8701,14 +9165,35 @@ class BookkeepingWindow:
             )
             language_status.configure(text=translate("设置已保存。", self.language))
             billing_cycle_status.configure(
-                text=translate("账期起始日已保存。", self.language)
+                text=translate("每月统计日期已保存。", self.language)
+            )
+            base_currency_status.configure(
+                text=translate("主要记账货币已保存。", self.language)
             )
             status_message = translate("设置已保存并应用。", self.language)
             footer_status.configure(text=status_message)
             self.status.configure(text=status_message)
             settings_baseline = capture_settings_baseline()
-            if selected_billing_cycle_start_day != old_state["billing_cycle_start_day"]:
-                self.desktop_shell.refresh()
+            if (
+                selected_billing_cycle_start_day != old_state["billing_cycle_start_day"]
+                or selected_base_currency != old_state["base_currency"]
+                or any(
+                    agent_skill_drafts[mode]
+                    != old_state[
+                        "loaded_skill" if mode == "bookkeeping" else "loaded_food_health_skill"
+                    ]
+                    for mode in ("bookkeeping", "food_health")
+                )
+                or selected_scope != old_state["backup_scope"]
+                or selected_receipt_images != old_state["receipt_images"]
+                or (selected_github_auto_sync and not old_state["github_auto_sync"])
+                or (selected_gitee_auto_sync and not old_state["gitee_auto_sync"])
+            ):
+                if (
+                    selected_billing_cycle_start_day != old_state["billing_cycle_start_day"]
+                    or selected_base_currency != old_state["base_currency"]
+                ):
+                    self.desktop_shell.refresh()
                 self._queue_github_auto_sync()
             if close_after_apply:
                 dialog.destroy()
@@ -8749,7 +9234,8 @@ class BookkeepingWindow:
         thinking_enabled_var.trace_add("write", refresh_thinking_controls)
         dialog.bind("<Escape>", lambda _event: discard_settings())
         dialog.protocol("WM_DELETE_WINDOW", discard_settings)
-        show_settings_page(initial_page if initial_page in pages else "API 服务")
+        initial_page = {"账期设置": "记账类别"}.get(initial_page, initial_page)
+        show_settings_page(initial_page if initial_page in pages else "通用设置")
         load_active_profile()
         center_window(dialog, self.root)
         # This dialog is built after the main window, and several pages stay
@@ -9077,7 +9563,7 @@ class BookkeepingWindow:
             row_frame.columnconfigure(1, weight=1)
             row_frame.columnconfigure(2, weight=4)
             method_var = tk.StringVar(value=payment_method)
-            currency_var = tk.StringVar(value=currency if currency in {"JPY", "CNY"} else "不限")
+            currency_var = tk.StringVar(value=currency if currency in {"JPY", "CNY", "USD"} else "不限")
             purpose_var = tk.StringVar(value=purpose)
             order_var: list[str] = []
             method_box = ttk.Combobox(
@@ -9090,7 +9576,7 @@ class BookkeepingWindow:
             ttk.Combobox(
                 row_frame,
                 textvariable=currency_var,
-                values=("不限", "JPY", "CNY"),
+                values=("不限", "JPY", "CNY", "USD"),
                 width=8,
                 state="readonly",
             ).grid(row=0, column=1, sticky="ew", padx=(0, 8))
@@ -9288,7 +9774,7 @@ class BookkeepingWindow:
                         return
                     scope = currency_var.get().strip().upper()
                     route_currency = next(iter(currencies))
-                    if scope in {"JPY", "CNY"} and route_currency != scope:
+                    if scope in {"JPY", "CNY", "USD"} and route_currency != scope:
                         messagebox.showwarning(
                             translate("币种不匹配", self.language),
                             translate("扣款账户币种应与规则适用的交易币种一致；普通消费不会自动换汇。", self.language),
@@ -9375,7 +9861,7 @@ class BookkeepingWindow:
                     )
                     return
                 scope = "" if row["currency"].get() == "不限" else row["currency"].get().strip().upper()
-                if scope in {"JPY", "CNY"} and next(iter(route_currencies)) != scope:
+                if scope in {"JPY", "CNY", "USD"} and next(iter(route_currencies)) != scope:
                     messagebox.showwarning(
                         translate("币种不匹配", self.language),
                         translate("扣款账户币种应与规则适用的交易币种一致；普通消费不会自动换汇。", self.language),
@@ -9407,6 +9893,7 @@ class BookkeepingWindow:
             self.payment_settings_load_error = ""
             self._update_payment_hint_summary()
             self.status.configure(text="支付场景规则已保存；下次发送记账内容时生效。")
+            self._queue_github_auto_sync()
             if container is None:
                 dialog.destroy()
             else:
@@ -9595,6 +10082,13 @@ class BookkeepingWindow:
         self._request_history_snapshot = history_snapshot
         self._request_pending_snapshot = pending_snapshot
         self._request_profile_id = str(profile.get("id") or "") or None
+        self._request_usage_profile = {
+            "profile_id": str(profile.get("id") or ""),
+            "agent": agent_mode,
+            "api_url": str(profile.get("api_url") or ""),
+            "model": str(profile.get("model") or ""),
+        }
+        self._request_balance_api_key = str(profile.get("api_key") or "")
         self._pending_image_attachments = images_snapshot
         self._request_agent_mode = agent_mode
         threading.Thread(target=receive_request_result, args=(
@@ -9693,18 +10187,7 @@ class BookkeepingWindow:
         self._pending_image_attachments = []
         self.progress.stop()
         self.progress.grid_remove()
-        if usage:
-            self.status.configure(
-                text=(
-                    f"本轮模型用量：输入 {usage.get('prompt_tokens', 0):,} tokens "
-                    f"（缓存命中 {usage.get('cache_hit_tokens', 0):,}），输出 "
-                    f"{usage.get('completion_tokens', 0):,} tokens "
-                    f"（思考 {usage.get('reasoning_tokens', 0):,}）；"
-                    f"API 请求 {usage.get('requests', 0)} 次"
-                )
-            )
-        else:
-            self.status.configure(text="")
+        self._update_request_usage(usage, status)
         self.busy = False
         self._refresh_agent_view()
         self.send_button.configure(state="normal")
@@ -9716,6 +10199,125 @@ class BookkeepingWindow:
         if status == "ok" and inserted_transaction_ids:
             self._queue_github_auto_sync()
         self.root.after(100, self._poll_results)
+
+    @staticmethod
+    def _estimated_yuan(value: float) -> str:
+        amount = Decimal(str(value))
+        if amount == 0:
+            return "¥0.00"
+        rounded = amount.quantize(Decimal("0.000001"))
+        if rounded == 0:
+            return "<¥0.000001"
+        return "≈¥" + format(rounded, ",.6f").rstrip("0").rstrip(".")
+
+    def _refresh_model_usage_display(self) -> None:
+        if not hasattr(self, "model_usage_label"):
+            return
+        profile_id = self._model_usage_profile_by_agent.get(self.agent_mode)
+        profile_id = profile_id or self.agent_profile_ids.get(self.agent_mode) or ""
+        key = self.agent_mode + ":" + profile_id
+        usage_line = self._model_usage_lines.get(key)
+        balance_line = self._model_balance_lines.get(key)
+        if not usage_line:
+            usage_line = translate(
+                "发送记账内容后显示本轮命中、未命中和输出费用。",
+                self.language,
+            )
+        text = translate("模型费用 · 人民币估算", self.language) + "\n" + usage_line
+        if balance_line:
+            text += "\n" + balance_line
+        self.model_usage_label.configure(text=text)
+
+    def _update_request_usage(self, usage: dict[str, Any] | None, status: str) -> None:
+        profile = self._request_usage_profile
+        api_key = self._request_balance_api_key
+        self._request_usage_profile = None
+        self._request_balance_api_key = ""
+        if not profile:
+            self.status.configure(text="")
+            return
+        key = str(profile.get("agent", self.agent_mode)) + ":" + str(profile.get("profile_id", ""))
+        self._model_usage_profile_by_agent[str(profile.get("agent", self.agent_mode))] = str(
+            profile.get("profile_id", "")
+        )
+        cost = estimate_deepseek_cost_cny(
+            usage,
+            profile.get("api_url", ""),
+            profile.get("model", ""),
+        )
+        if cost is None:
+            usage_line = translate(
+                "当前服务暂不支持人民币费用估算。",
+                self.language,
+            )
+        else:
+            usage_line = " · ".join((
+                translate("命中", self.language) + " " + self._estimated_yuan(cost["hit_cny"]),
+                translate("未命中", self.language) + " " + self._estimated_yuan(cost["miss_cny"]),
+                translate("输出", self.language) + " " + self._estimated_yuan(cost["output_cny"]),
+            ))
+        self._model_usage_lines[key] = usage_line
+        self.status.configure(
+            text=translate("本轮模型费用（人民币估算）：{cost}", self.language).format(
+                cost=usage_line
+            )
+        )
+
+        if status == "ok" and is_deepseek_api(profile.get("api_url", "")) and api_key:
+            self._model_balance_lines[key] = translate("当前余额：正在读取…", self.language)
+            self._refresh_model_usage_display()
+            agent = str(profile.get("agent", self.agent_mode))
+
+            def fetch_balance() -> None:
+                balances = fetch_deepseek_balance(api_key)
+
+                def update() -> None:
+                    if balances is None:
+                        self._model_balance_lines[key] = translate("当前余额：暂时无法读取", self.language)
+                    elif not balances:
+                        self._model_balance_lines[key] = translate("服务商暂未返回可用余额。", self.language)
+                    else:
+                        previous = self._model_balance_by_profile.get(key, {})
+                        current = {item["currency"]: item["total"] for item in balances}
+                        self._model_balance_by_profile[key] = current
+                        rendered = " · ".join(
+                            f"{item['currency']} {item['total']}" for item in balances
+                        )
+                        if previous:
+                            changes = []
+                            for code, value in current.items():
+                                if code in previous:
+                                    try:
+                                        delta = Decimal(value) - Decimal(previous[code])
+                                    except InvalidOperation:
+                                        continue
+                                    if delta:
+                                        changes.append(f"{code} {delta:+f}")
+                            delta_text = "、".join(changes) if changes else translate("暂未体现", self.language)
+                            self._model_balance_lines[key] = translate(
+                                "当前余额：{balance}；本轮余额变化：{change}", self.language
+                            ).format(balance=rendered, change=delta_text)
+                        else:
+                            self._model_balance_lines[key] = translate(
+                                "当前余额：{balance}；余额变化会从下一轮开始比较。", self.language
+                            ).format(balance=rendered)
+                    self._refresh_model_usage_display()
+
+                self.post_to_ui(update)
+
+            threading.Thread(
+                target=fetch_balance,
+                name="deepseek-balance-read",
+                daemon=True,
+            ).start()
+        elif not is_deepseek_api(profile.get("api_url", "")):
+            self._model_balance_lines[key] = translate(
+                "当前服务暂不支持余额查询。",
+                self.language,
+            )
+            self._refresh_model_usage_display()
+        else:
+            self._refresh_model_usage_display()
 
     def _restore_pending_request(self) -> None:
         if self._pending_draft_text:
@@ -9808,6 +10410,8 @@ class BookkeepingWindow:
         self._request_pipe = None
         self._request_workspace = None
         self._request_profile_id = None
+        self._request_usage_profile = None
+        self._request_balance_api_key = ""
         self._request_baseline_path = None
         self._request_candidate_path = None
         self._request_worker_message = None

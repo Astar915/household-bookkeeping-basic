@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/badge/AI-可选配置-EC4899?style=for-the-badge" alt="AI 可选配置" />
     <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge" alt="MIT License" />
   </p>
-  <p><strong>当前版本：0.2.1 · 账期与云端恢复改进</strong></p>
+  <p><strong>当前版本：0.2.2 · 桌面功能补齐与后台同步改进</strong></p>
   <p><strong>LANGUAGE</strong><br />
   简体中文 · <a href="README.en.md">English</a> · <a href="README.ja.md">日本語</a></p>
 </div>

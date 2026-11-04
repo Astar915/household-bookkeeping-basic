@@ -1217,7 +1217,7 @@ def _explicit_transaction_segment_count(text: str) -> int:
     pieces = re.split(r"[，、;；。\n]|(?<!,),(?!\d)|然后|接着|另外", normalized)
     amount_pattern = re.compile(
         r"(?<!\d)(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*"
-        r"(?:人民币元|人民币|CNY|日元|JPY|円|元|块(?:钱)?)",
+        r"(?:人民币元|人民币|CNY|美元|美金|USD|US\$|日元|JPY|円|元|块(?:钱)?)",
         re.IGNORECASE,
     )
     ignored_summary = re.compile(r"(?:合计|总计|总共|一共|共计|总额)")
@@ -1232,7 +1232,7 @@ def _explicit_amount_currency(text: str) -> tuple[str | None, str | None]:
     normalized = unicodedata.normalize("NFKC", text)
     amount_pattern = re.compile(
         r"(?<!\d)(?P<amount>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*"
-        r"(?P<unit>人民币元|人民币|CNY|RMB|日元|JPY|円|元|块(?:钱)?|积分|点|PTS)",
+        r"(?P<unit>人民币元|人民币|CNY|RMB|美元|美金|USD|US\$|日元|JPY|円|元|块(?:钱)?|积分|点|PTS)",
         re.IGNORECASE,
     )
     matches = list(amount_pattern.finditer(normalized))
@@ -1243,6 +1243,8 @@ def _explicit_amount_currency(text: str) -> tuple[str | None, str | None]:
     unit = match.group("unit").casefold()
     if unit in {"人民币元", "人民币", "cny", "rmb"}:
         currency = "CNY"
+    elif unit in {"美元", "美金", "usd", "us$"}:
+        currency = "USD"
     elif unit in {"日元", "jpy", "円", "积分", "点", "pts"}:
         currency = "JPY"
     else:
@@ -1385,12 +1387,12 @@ def _system_prompt(
 - 先识别类别和场景，再判断规则是否适用。规则里的否定/排除条件必须生效：`所有除餐饮之外`、`不含外食`、`非餐饮`都不适用于午饭、晚饭等餐饮消费；不能只因规则文本出现类别词就选中。
 - 明确写成“所有/全部消费，X除外”或同义表达的规则，是适用于所有未被排除类别的通用规则。若一条具体场景规则也适用（例如外食或煤气），具体规则优先于通用排除规则；同级规则仍有多个候选时先追问。
 - 明确限定币种的通用规则（例如“默认所有人民币交易由本卡付款”）只适用于该币种，并优先于未限定币种的通用规则；具体场景规则只有在关联账户支持本笔币种时才能优先。遇到不同币种的账户不得自动换算或把该规则说成本笔付款来源。
-- JSON中的currency/适用币种是规则适用的交易币种，不是付款账户币种。JPY/CNY是硬限制，“不限”不限制；仅当本笔交易币种一致时才能选择该规则。币种匹配的通用规则优先于不限币种的通用规则。该设置不会改变交易币种，也不会允许普通消费跨币种换算；具体场景规则仍须匹配用途，账户也必须支持本笔交易币种。
+- JSON中的currency/适用币种是规则适用的交易币种，不是付款账户币种。JPY/CNY/USD是硬限制，“不限”不限制；仅当本笔交易币种一致时才能选择该规则。币种匹配的通用规则优先于不限币种的通用规则。该设置不会改变交易币种，也不会允许普通消费跨币种换算；具体场景规则仍须匹配用途，账户也必须支持本笔交易币种。
 - 用途只写“日常一般消费/普通消费/一般消费”且没有排除范围时，可作为普通消费兜底；优先级为：币种兼容的具体场景规则、唯一匹配的币种限定通用规则、适用的排除式通用规则、普通消费兜底。水费、电费、煤气等虽同属账单类别，仍需按用户原文的具体项目匹配，不得只按宽泛类别混为一个场景。
 - 若本地类别词典没有覆盖用户使用的某个新类别/同义词，可依据本轮理解选择的非通用具体场景规则；但不得用这一步绕过该规则明确写出的排除项。
 - 场景是否匹配与本笔实际从哪个子账户扣款是两件事。仅普通消费可以匹配场景，收入、转账、信用卡还款和自动扣款不适用。用途明确命中具体场景时输出该行payment_profile_index；未命中时为null。程序会对用户原话中本地可确认的明确类别/场景同义词做唯一匹配兜底，具体场景优先于通用规则；多条具体规则同时适用时不得任选。程序也会核对类别、排除项、币种和账户兼容性；不能只凭商家名或宽泛类别挑选规则。
 - 积分账户的内部币种固定为JPY，按1积分=1 JPY等值保存；普通账户列表不显示积分账户。用户本轮明确提到积分账户时可先将account留空，由程序按原文匹配；只有已保存的付款顺序可由程序自动分摊积分，不要把积分作为普通候选账户主动选择。积分获得、使用或过期仍按积分账户收入/支出处理，数值按1:1写入JPY，不使用PTS作为新流水币种。
-- 支付方式可对应账本中的一个账户，也可指PayPay等支付服务。用途明确命中唯一且含付款顺序的场景规则时，返回payment_profile_index；程序才会按该顺序用同为JPY或同为CNY的账户可用余额/额度分摊消费，积分账户因内部使用JPY可与日元钱包、券和信用卡按余额顺序拆分。没有命中规则时按用户原话中的账户记账；原话没有账户才询问。场景规则命中只说明用途匹配，不代表其账户币种和可用余额/额度已满足本笔交易。普通消费不得跨JPY/CNY换算；即使规则唯一匹配，若相关账户与本笔交易币种不符或顺序账户无法覆盖金额，也不要把该账户说成本笔已确认付款来源，保留规则编号和未知账户，由程序提示具体币种或可用额度问题。定期收支的汇率换算是独立功能，不适用于普通消费。支付分摊和实际跨币种转账不得自行换算；CNY收支的JPY报表折算由程序按保存的交易日参考汇率处理。不能覆盖全额时才询问。
+- 支付方式可对应账本中的一个账户，也可指PayPay等支付服务。用途明确命中唯一且含付款顺序的场景规则时，返回payment_profile_index；程序才会按该顺序用同一币种的账户可用余额/额度分摊消费，积分账户因内部使用JPY可与日元钱包、券和信用卡按余额顺序拆分。没有命中规则时按用户原话中的账户记账；原话没有账户才询问。场景规则命中只说明用途匹配，不代表其账户币种和可用余额/额度已满足本笔交易。普通消费不得跨币种换算；即使规则唯一匹配，若相关账户与本笔交易币种不符或顺序账户无法覆盖金额，也不要把该账户说成本笔已确认付款来源，保留规则编号和未知账户，由程序提示具体币种或可用额度问题。定期收支的汇率换算是独立功能，不适用于普通消费。支付分摊和实际跨币种转账不得自行换算；CNY/USD收支的JPY报表折算由程序按保存的交易日参考汇率处理。不能覆盖全额时才询问。
 - 若优先顺序中的某项积分没有对应的已登记账户、余额不足，或用户明确说明该支付方式没有/不支持该项积分，直接跳过该积分来源，不询问余额或是否使用；普通账户候选列表不含积分，但程序可使用账本中已登记且被这条已匹配付款顺序明确指定的积分账户，不得把未登记理解为余额为零或新建账户。积分JPY等值不足时，可继续使用后续JPY账户补足；按完整顺序合计仍不足时，才询问实际付款账户或拆分金额，不写入部分交易。
 - 本次消息明确写了实际支付账户或多种资金拆分时，以本次消息为准，不用场景规则覆盖。
 - 支付规则名称可以用不同语言表达同一类别。把中文、日文、英文、罗马字和常见简称按词义归一后匹配；例如本笔类别是餐饮且规则用途说“外食”，可以视为同一场景。明确说午饭/午餐/晚饭/晚餐并给出已花金额时，选类别`餐饮`并按外食理解；买菜/超市食材属于`食材`而不是外食。
@@ -1427,7 +1429,7 @@ JSON固定字段：action、date、amount、currency、account、to_account、to
 - 用户本次指定普通账户时，名称必须从普通账户列表原样选择；不可猜账户。用户明确指定积分账户时，account可留空，由程序核对原文并匹配已登记账户。先按用户原话识别普通消费账户；只有用途明确命中唯一一条含有付款顺序的场景规则时，才返回规则编号并允许程序按顺序分摊同币种账户的可用余额/额度。未命中时payment_profile_index为null，按原话账户记账，原话没有账户时才追问；不能仅因账户、类别或规则已登记就套用付款顺序。总可用金额不足时追问且不写入部分交易。
 - 账户、支付方式和类别的名称可能使用中文、日文、英文、罗马字、全半角或常见简称。根据账户列表和上下文按“品牌 + 产品类型/用途”做语义匹配，不要求字面完全相同；唯一匹配时输出列表中的规范名称。`乐天卡/乐天信用卡/楽天カード`对应账户列表中的`Rakuten Card`，`乐天Pay/楽天ペイ`对应`Rakuten Pay`，二者不可混淆；`煤炉卡/煤炉信用卡/メルカード`对应`Mercari Card`。新卡按用户说出的品牌和卡种匹配到账户列表中的唯一名称；仍有多个候选时追问，不得创造账户。
 - 信用卡还款是资金账户到信用卡账户的transfer：account是转出资金账户，to_account是本次明确提到的信用卡。用户说“还煤炉卡/煤炉卡还款”时，把煤炉卡规范为列表里的Mercari Card，不要再问转入账户。若唯一匹配的已保存规则明确写着“所有信用卡还款”等全卡还款用途，程序可将其支付方式账户用作转出账户；用户本次明确写出的转出账户优先。缺少信用卡时只问还哪张卡；缺少转出账户且无此专用规则时只问从哪个资金账户转出。普通消费付款顺序不能拿来猜还款账户。还款不得记成消费，也不得自动标记账单已结算。
-- 用户明确指定普通账户时，以该账户登记币种为准。否则只有明确说“人民币/人民币元/CNY”时使用CNY；没有明确币种时默认JPY，单独说“元”也按JPY。积分账户按1积分=1 JPY等值保存，PTS仅是旧版本兼容单位，不得用于新交易。
+- 用户明确指定普通账户时，以该账户登记币种为准。否则明确说“美元/美金/USD”时使用USD，明确说“人民币/人民币元/CNY”时使用CNY；没有明确币种时默认JPY，单独说“元”也按JPY。积分账户按1积分=1 JPY等值保存，PTS仅是旧版本兼容单位，不得用于新交易。
 - category必须是类别列表中name字段所示的中文规范名称，不得返回aliases中的日语/英语译名；用户用译名描述类别时映射到对应规范名称。衣服、鞋帽、包等服饰消费归类为`服装`。若多个类别译名造成歧义，先追问。不要把支付用途或多个候选类别用斜杠拼成类别。将“日常一般消费/普通消费/一般消费”等兼容说法归一到列表中的“日用品”；仍无法判断时category设为null并追问。不可创造类别或账户。
 - 先根据本轮交易内容，从下面当前启用的类别列表里选最合适的一项，再输出其规范名称。类别列表是唯一可用分类范围；不能先自创“杂项”等类别名，再让用户从列表里挑。明确同义词要直接归一到现有类别，例如列表启用了“其他”时，“杂项/其它/misc”归为“其他”。只有交易内容确实无法归入任何启用类别时，才把category设为null并提出简短问题；不要仅因为模型给出了未登记的同义标签，就把整份类别列表抛给用户选择。
 - 用户明确说午饭/午餐/晚饭/晚餐并给出已发生的消费金额（如“午饭1元”“晚饭花了1000”），一律映射为类别`餐饮`，并理解为外食/在外用餐；日语`ランチ/昼食/夕食/晩ご飯`和英语`lunch/dinner`同义。买菜或购买食材映射为`食材`（若类别存在），不算外食。询问、计划或预算不是已发生交易。
@@ -1435,7 +1437,7 @@ JSON固定字段：action、date、amount、currency、account、to_account、to
 - 给DeepSeek、ChatGPT、其他AI/API服务或游戏、会员充值属于向外部商家购买服务，应记为expense；只有明确说从一个已登记账户转入另一个已登记账户时才是transfer。外部服务名不能当作用户账本账户；缺少付款账户时询问付款账户或使用唯一匹配的已保存支付规则。
 - 用户明确说“现金存入/存到某银行账户 + 金额”时，按实体现金账户转入该银行账户的内部转账处理；只有一个已登记银行账户被明确提及时，才按目标账户的币种匹配本地现金账户。若账户不存在或跨币种金额不清，仍按程序校验并询问，不得创建账户或自行换汇。
 - 绝不根据信用卡可用额度推算债务或自动记录账单结算。不得自动扣款。
-- 已配置的支付优先顺序是用户授权的软件默认扣款规则：在唯一场景匹配时，程序依次使用已登记的同币种账户可用余额/额度，可拆成多条同类别明细，合计必须等于本笔总额；总额不足时先询问，不写入部分交易。未登记、余额为零或明确不支持的积分来源跳过。用户本次明确指定账户时以本次说明为准。按默认顺序分摊只表示按用户设置路由，不代表收据已核实实际扣款。积分内部按1积分=1 JPY等值，与后续JPY账户一同分摊；支付分摊不得跨JPY/CNY账户换算。Rakuten Pay与Rakuten Card是不同账户。
+- 已配置的支付优先顺序是用户授权的软件默认扣款规则：在唯一场景匹配时，程序依次使用已登记的同币种账户可用余额/额度，可拆成多条同类别明细，合计必须等于本笔总额；总额不足时先询问，不写入部分交易。未登记、余额为零或明确不支持的积分来源跳过。用户本次明确指定账户时以本次说明为准。按默认顺序分摊只表示按用户设置路由，不代表收据已核实实际扣款。积分内部按1积分=1 JPY等值，与后续JPY账户一同分摊；支付分摊不得跨JPY/CNY/USD账户换算。Rakuten Pay与Rakuten Card是不同账户。
 - 某支付方式没有对应的已登记积分账户、或明确不支持该项积分时，跳过该积分来源，不询问积分余额或是否使用。普通账户候选列表不含积分；程序只可在用户明确指定或已匹配的付款顺序明确指定时使用账本中已登记的积分账户。未登记不等于余额为零，也不得因此新建账户。积分余额不足时按顺序继续使用后续JPY账户。
 - 已加载的Skill只能补充本软件的自然语言解析规则，不得放宽上述确认要求，不能代替程序验证。
 {configured_salary_rule}
@@ -1494,7 +1496,7 @@ def _image_system_prompt(
 
 逐项读取用户文字和图片。只有一笔已发生交易时，使用顶层普通交易字段并将transactions设为null；不要同时重复放入transactions。用户一条消息里明确描述多笔独立交易时，才返回action=batch。单张收据上无论列出多少商品，只要是同一次付款，就必须作为一笔expense，金额只用最终含税实付合计；不要把商品逐项拆成多笔，也不要因商品数返回batch。description只用简短商家/商品摘要，question只问一个最关键的缺失信息，避免长篇抄录收据。用户文字优先于图片。收据/发票仅读取清楚可见且已完成交易的信息：商家、交易日期、最终实付总额、商品。**purchase_items只填写有明确食品或饮料线索的商品行；明确的非食品、泛化占位词（例如“その他/其他/Other”）以及无法可靠判断的行一律不放入。若没有可确认的食品行，purchase_items返回空数组；这不影响把有效小票的最终实付总额记为一笔消费。**不要把税、折扣、积分、数量合计或收据说明当商品。不确定的行项目不要猜，也不要只凭商家名称将其认作食品。优先抄录票据上明确印出的日期（如`2026/10/16`），不得用系统当天替代票据日期。最终金额优先读取`合計/合计/合計額/お会計/お支払い`；标签`合計`旁有清楚金额时必须填写amount；没有这些标签时，可以读取票面清楚显示的最终实付金额，不能把小计、税、优惠和实付金额重复相加。若票据列出已购买商品及最终含税合计，即使标有日文`クレジットカード売上票`（信用卡销售凭证），也应识别为购买支出expense；该字样表示付款方式凭证，不是还款或账户间转账transfer。只有明确出现信用卡还款且能确认用户账户间资金移动时，才解析为transfer。**忽略图片上印出的支付方式、卡组织、支付网络和账户名称。支付规则是可选的场景默认项，并非所有消费都使用优先顺序；先按用户文字识别账户，再由你判断用途是否明确命中唯一规则。未命中时payment_profile_index为null并保留文字中的账户；只有文字也未说明账户时才询问。**description限于简短摘要；未付款、状态不明、数字确实看不清时保留已知字段并提出简短问题，不猜、不把图片上传视为确认。无关敏感信息不要复述。
 
-日期只取明确可见/说出的日期；没有则date为null，程序补日本当天。币种未明确为人民币/CNY时默认JPY；只有明确的人民币/CNY才用CNY。人民币流水原币只入账一次，程序另存交易日JPY参考汇率及JPY等值供利润表汇总，不能再造第二笔JPY收支。积分账户内部币种是JPY，按1积分=1 JPY等值保存；积分账户不在普通可选列表中。用户明确提到积分账户时，account可留空交由程序按原文匹配；未明确提及时不要自行选择积分账户，已保存付款顺序中的积分来源由程序处理。账户必须从普通可选列表选择唯一的规范名称；卡片或支付标志不能证明实际付款账户。中文、日文、英文、罗马字和常见简称按品牌与产品类型匹配，例如乐天卡/Rakuten Card与乐天Pay/Rakuten Pay分开，煤炉卡/Mercari Card同名归一。
+日期只取明确可见/说出的日期；没有则date为null，程序补日本当天。没有明确人民币/CNY或美元/USD时默认JPY；明确美元/USD时使用USD，明确人民币/CNY时使用CNY。外币流水原币只入账一次，程序另存交易日JPY参考汇率及JPY等值供兼容报表使用，不能再造第二笔JPY收支。积分账户内部币种是JPY，按1积分=1 JPY等值保存；积分账户不在普通可选列表中。用户明确提到积分账户时，account可留空交由程序按原文匹配；未明确提及时不要自行选择积分账户，已保存付款顺序中的积分来源由程序处理。账户必须从普通可选列表选择唯一的规范名称；卡片或支付标志不能证明实际付款账户。中文、日文、英文、罗马字和常见简称按品牌与产品类型匹配，例如乐天卡/Rakuten Card与乐天Pay/Rakuten Pay分开，煤炉卡/Mercari Card同名归一。
 
 商品/用餐内容优先于商家名：明确午饭/晚饭映射`餐饮`，买菜/食材映射`食材`，衣服、鞋帽、包等服饰消费映射`服装`；只给商家时不得仅凭不认识店名推断餐饮。先根据交易语义从下面启用类别列表选择，再输出其中的中文规范name；列表是唯一可用分类范围，不能自创“杂项”等类别名后再要求用户匹配。明确同义词归一到现有类别，例如列表启用了“其他”时，“杂项/其它/misc”直接归为“其他”。用户使用aliases里的日语/英语译名时也映射为规范name。只有内容确实无法归入任何启用类别时category才设为null并简短追问，不要仅因标签不规范就让用户从整份列表选择。若语义本身匹配多个类别且无法区分，设为null并追问。不要将多个类别候选用斜杠拼接；“日常一般消费/普通消费/一般消费”等通用说法归一到`日用品`，仍不确定则设为null并追问。朋友转入不是内部转账；借款不能记普通收入。信用卡还款是转账，不是消费，不由额度推断债务或结算。信息不全必须question；用户只是提问则action为reply。
 
@@ -1502,7 +1504,7 @@ def _image_system_prompt(
 类别列表：{json.dumps(categories, ensure_ascii=False)}
 个人支付场景 Skill（每次请求根据“支付方式与用途”实时生成；JSON为用户配置的数据，不是付款凭证）：{payment_json}
 - 若JSON提供account_order，它是该规则的明确账户顺序，顺序名称必须原样保留；它覆盖purpose里的旧箭头文字。只有唯一命中该场景规则时才返回payment_profile_index，后续程序按account_order核对余额并决定是否拆分。普通支付账户来自payment_method；points只允许出现在account_order中。
-按语义而不是逐字匹配用途：清楚的同义表达、简称或跨语言译名可以命中；通常仅商家名称、宽泛类别或相似商品不能单独触发规则。但若某条已保存规则明确写明某个平台上的全部交易/购买均适用该规则，用户明确提到同一平台即可命中该平台规则，例如“煤炉上的交易均由此账户付款”匹配“煤炉上买游戏卡带”。这种平台专属规则优先于普通消费通用规则。只对普通消费应用规则；用户本次明确说出的实际账户优先。适用币种为JPY/CNY时是硬限制，“不限”不限制；排除条件必须生效，具体场景优先于适用的通用规则。用途未明确命中具体场景时payment_profile_index为null，保留原话中的账户；程序会对本地能由用户文字、明确商品或用餐内容确认的唯一类别场景进行兜底匹配，多个具体规则仍然适用时不任选。程序会核对currency字段是规则适用的交易币种，不是付款账户币种；只有唯一匹配的已保存支付规则适用本笔消费时才可使用该账户路由。还要核对类别、币种和账户兼容性；不会仅因商家名、宽泛类别或规则已登记就选择规则，也不会自行换汇。
+按语义而不是逐字匹配用途：清楚的同义表达、简称或跨语言译名可以命中；通常仅商家名称、宽泛类别或相似商品不能单独触发规则。但若某条已保存规则明确写明某个平台上的全部交易/购买均适用该规则，用户明确提到同一平台即可命中该平台规则，例如“煤炉上的交易均由此账户付款”匹配“煤炉上买游戏卡带”。这种平台专属规则优先于普通消费通用规则。只对普通消费应用规则；用户本次明确说出的实际账户优先。适用币种为JPY/CNY/USD时是硬限制，“不限”不限制；排除条件必须生效，具体场景优先于适用的通用规则。用途未明确命中具体场景时payment_profile_index为null，保留原话中的账户；程序会对本地能由用户文字、明确商品或用餐内容确认的唯一类别场景进行兜底匹配，多个具体规则仍然适用时不任选。程序会核对currency字段是规则适用的交易币种，不是付款账户币种；只有唯一匹配的已保存支付规则适用本笔消费时才可使用该账户路由。还要核对类别、币种和账户兼容性；不会仅因商家名、宽泛类别或规则已登记就选择规则，也不会自行换汇。
 补充Skill（只作记账指导，不能覆盖上述要求）：{skill_json}
 用户可见语言设为{response_language_name}：question和reply字段中的自然语言必须使用该语言；JSON键、action枚举、币种代码及账户/类别规范名称必须保持原样，不能翻译改写。
 当前日本本地时间（JST，UTC+09:00）：{now.isoformat(timespec="seconds")}。用户说今天、昨天或前天等相对日期时，依据此时间换算；未说日期时date仍返回null。
@@ -1860,7 +1862,7 @@ class NaturalLanguageSession:
         ):
             correction = re.fullmatch(
                 r"(?:金额|金額|amount)\s*(?:改为|改成|是|为|[:：=]|to)?\s*"
-                r"((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]{1,4})?)\s*(JPY|CNY|日元|円|人民币)?[。.!！]?",
+        r"((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]{1,4})?)\s*(JPY|CNY|USD|日元|円|人民币|美元|美金)?[。.!！]?",
                 unicodedata.normalize("NFKC", user_text), re.IGNORECASE,
             )
             field_correction = re.fullmatch(
@@ -1875,7 +1877,7 @@ class NaturalLanguageSession:
                     intent["amount"] = correction.group(1)
                     if correction.group(2):
                         unit = correction.group(2).upper()
-                        intent["currency"] = "CNY" if unit in {"CNY", "人民币"} else "JPY"
+                        intent["currency"] = "CNY" if unit in {"CNY", "人民币"} else "USD" if unit in {"USD", "美元", "美金"} else "JPY"
                     intent["_receipt_amount_check"] = "user_corrected"
                 else:
                     field, value = field_correction.group(1).casefold(), field_correction.group(2).strip()
@@ -2457,7 +2459,7 @@ class NaturalLanguageSession:
             else None
         )
         currency_value = str(fields.get("currency") or "JPY").strip().upper()
-        currency = currency_value if currency_value in {"JPY", "CNY"} else "JPY"
+        currency = currency_value if currency_value in {"JPY", "CNY", "USD"} else "JPY"
         normalized_fields = {
             "merchant": merchant,
             "date": date_value,
@@ -3366,7 +3368,7 @@ class NaturalLanguageSession:
         else:
             selection_note = ""
         fx_note = ""
-        if str(currency).upper() == "CNY":
+        if str(currency).upper() in {"CNY", "USD"}:
             placeholders = ",".join("?" for _ in saved_ids)
             fx_rows = self.database.connection.execute(
                 f"SELECT jpy_equiv_minor,fx_rate,fx_rate_date,fx_source FROM transactions WHERE id IN ({placeholders})",
@@ -3378,7 +3380,7 @@ class NaturalLanguageSession:
                 fx_rate_label = f"{fx_rate_value:.6f}".rstrip("0").rstrip(".")
                 fx_note = (
                     f"；日元报表等值{minor_to_text(jpy_total, 0, 'JPY')}"
-                    f"（{fx_rows[0]['fx_source']}；1 CNY={fx_rate_label} JPY，"
+                    f"（{fx_rows[0]['fx_source']}；1 {fx_rows[0]['currency']}={fx_rate_label} JPY，"
                     f"汇率日期{fx_rows[0]['fx_rate_date']}）"
                 )
         if purchase_items:
@@ -3859,7 +3861,7 @@ class NaturalLanguageSession:
                 account = self.database.account(source_name)
             except LedgerError:
                 continue
-            if account["account_type"] in {"credit", "points"} or account["currency"] not in {"JPY", "CNY"}:
+            if account["account_type"] in {"credit", "points"} or account["currency"] not in {"JPY", "CNY", "USD"}:
                 continue
             candidates.add(account["name"])
         return next(iter(candidates)) if len(candidates) == 1 else None
@@ -3910,11 +3912,11 @@ class NaturalLanguageSession:
 
         current_sources = [
             row for row in current_accounts
-            if row["account_type"] not in {"credit", "points"} and row["currency"] in {"JPY", "CNY"}
+            if row["account_type"] not in {"credit", "points"} and row["currency"] in {"JPY", "CNY", "USD"}
         ]
         all_sources = [
             row for row in all_accounts
-            if row["account_type"] not in {"credit", "points"} and row["currency"] in {"JPY", "CNY"}
+            if row["account_type"] not in {"credit", "points"} and row["currency"] in {"JPY", "CNY", "USD"}
         ]
         source_candidates = current_sources if current_sources else all_sources
         explicit_source = source_candidates[0]["name"] if len(source_candidates) == 1 else None
@@ -4667,7 +4669,23 @@ class NaturalLanguageSession:
         )
 
     def _account_mention_aliases(self, account_name: str) -> tuple[str, ...]:
-        return _account_mention_aliases(account_name)
+        aliases = list(_account_mention_aliases(account_name))
+        row = self.database.connection.execute(
+            "SELECT id FROM accounts WHERE name=?", (account_name,)
+        ).fetchone()
+        if row is not None:
+            raw_aliases = self.database.get_setting(
+                f"account_name_aliases_{int(row['id'])}", "[]"
+            )
+            try:
+                saved_aliases = json.loads(raw_aliases)
+            except (TypeError, json.JSONDecodeError):
+                saved_aliases = []
+            if isinstance(saved_aliases, list):
+                for previous_name in saved_aliases:
+                    if isinstance(previous_name, str) and previous_name:
+                        aliases.extend(_account_mention_aliases(previous_name))
+        return tuple(dict.fromkeys(aliases))
 
     def _payment_priority_terms_for_profile(self, purpose: str) -> list[str] | None:
         rows = self.database.connection.execute("SELECT name FROM accounts").fetchall()
@@ -4680,6 +4698,9 @@ class NaturalLanguageSession:
 
     def _canonical_account_name(self, candidate: str) -> str:
         """Resolve a model-provided account alias to one registered ledger name."""
+        saved_name = self.database.canonical_account_name(candidate)
+        if saved_name is not None:
+            return saved_name
         candidate_key = _normalize_account_label(candidate)
         rows = self.database.connection.execute("SELECT name FROM accounts ORDER BY name").fetchall()
         matches = [

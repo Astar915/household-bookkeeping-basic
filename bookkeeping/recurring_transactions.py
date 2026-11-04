@@ -73,9 +73,9 @@ def save_recurring_schedule(
         raise LedgerError(f"首次日期早于账户期初日期：{account['opening_date']}")
     account_currency = str(account["currency"])
     currency = database.currency(currency_code or account_currency)
-    if currency["code"] not in {"JPY", "CNY"} or account_currency not in {"JPY", "CNY"}:
+    if currency["code"] not in {"JPY", "CNY", "USD"} or account_currency not in {"JPY", "CNY", "USD"}:
         raise LedgerError(
-            "定期收支目前支持JPY和CNY账户与账单币种；其他币种暂不能自动换算。"
+            "定期收支目前支持JPY、CNY和USD账户与账单币种；其他币种暂不能自动换算。"
         )
     amount_minor = to_minor(amount, str(currency["code"]), int(currency["minor_digits"]))
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")

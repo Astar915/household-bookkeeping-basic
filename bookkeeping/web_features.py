@@ -37,6 +37,7 @@ from .food_review import build_food_review_answer
 from .github_sync import (
     GITHUB_APP_CLIENT_ID, GitHubClient, GitHubSyncError,
     create_sync_bundle, restore_sync_bundle, request_device_code, poll_device_token,
+    sync_bundle_created_at,
 )
 from .github_app_config import GITHUB_APP_INSTALL_URL
 from .gitee_sync import GiteeClient, GiteeSyncError, MAX_GITEE_SYNC_BUNDLE_BYTES
@@ -711,7 +712,8 @@ class MobileWorkspace:
                 cfg["cloud"][provider].update(lastSha=sha, token=client.token,
                                                refresh_token=getattr(client, "refresh_token", ""))
                 self.save_config(uid, cfg)
-                PullState(self.folder(uid) / 'cloud_pull_state.json').synced(provider, repository, sha, sync_revision)
+                PullState(self.folder(uid) / 'cloud_pull_state.json').synced(
+                    provider, repository, sha, sync_revision, sync_bundle_created_at(body))
         return result
 
     def _startup_pull(self, uid, cancelled=None):

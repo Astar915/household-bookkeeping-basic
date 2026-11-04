@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import json
 import re
 import sqlite3
 import unicodedata
@@ -239,6 +240,7 @@ CREATE INDEX IF NOT EXISTS idx_food_consumption_date ON food_consumption_records
 DEFAULT_CURRENCIES = (
     ("JPY", "Japanese yen", 0, 1),
     ("CNY", "Chinese yuan", 2, 1),
+    ("USD", "United States dollar", 2, 1),
     ("PTS", "Legacy points unit (stored as JPY equivalent)", 0, 0),
 )
 
@@ -711,6 +713,22 @@ class Database:
         ).fetchone()
         return str(row["value"]) if row is not None else default
 
+    def get_base_currency(self) -> str:
+        """Return the selected report currency, safely defaulting to JPY."""
+        code = self.get_setting("base_currency", "JPY").strip().upper()
+        try:
+            currency = self.currency(code)
+        except LedgerError:
+            return "JPY"
+        return code if bool(currency["is_monetary"]) else "JPY"
+
+    def set_base_currency(self, code: str) -> None:
+        normalized = str(code).strip().upper()
+        currency = self.currency(normalized)
+        if not bool(currency["is_monetary"]):
+            raise LedgerError("主要记账货币必须是货币，不能选择积分单位。")
+        self.set_setting("base_currency", normalized, "Currency used for combined report totals.")
+
     def get_billing_cycle_start_day(self) -> int:
         """Read the ledger's configurable cycle day, defaulting safely to 15."""
         value = self.get_setting("billing_cycle_start_day", "15").strip()
@@ -977,8 +995,102 @@ class Database:
             raise LedgerError(f"不支持的币种/单位：{code}")
         return row
 
+    def canonical_account_name(self, name: str) -> str | None:
+        row = self.connection.execute("SELECT name FROM accounts WHERE name = ?", (name,)).fetchone()
+        if row is not None:
+            return str(row["name"])
+        prefix = "account_name_aliases_"
+        for saved in self.connection.execute(
+            "SELECT key,value FROM settings WHERE key LIKE ? ORDER BY key",
+            (prefix + "%",),
+        ).fetchall():
+            try:
+                aliases = json.loads(str(saved["value"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(aliases, list) or name not in aliases:
+                continue
+            try:
+                account_id = int(str(saved["key"])[len(prefix):])
+            except ValueError:
+                continue
+            current = self.connection.execute(
+                "SELECT name FROM accounts WHERE id=?", (account_id,)
+            ).fetchone()
+            if current is not None:
+                return str(current["name"])
+        return None
+
+    def rename_account(
+        self,
+        account_id: int,
+        new_name: str,
+        *,
+        expected_name: str | None = None,
+        preserve_alias: bool = True,
+        commit: bool = True,
+    ) -> tuple[str, str]:
+        """Change an account label without changing its ledger links or history."""
+        name = new_name.strip()
+        if not name:
+            raise LedgerError("账户称呼不能为空。")
+        if len(name) > 80:
+            raise LedgerError("账户称呼不能超过80个字符。")
+        if any(ord(character) < 32 or ord(character) == 127 for character in name):
+            raise LedgerError("账户称呼不能包含换行或控制字符。")
+        row = self.connection.execute(
+            "SELECT id,name FROM accounts WHERE id=?", (int(account_id),)
+        ).fetchone()
+        if row is None:
+            raise LedgerError("找不到要修改的账户。请刷新后重试。")
+        old_name = str(row["name"])
+        if expected_name is not None and old_name != expected_name:
+            raise LedgerError("这个账户已在其他操作中改名，请刷新后重试。")
+        if old_name == name:
+            return old_name, name
+        duplicate = self.connection.execute(
+            "SELECT id FROM accounts WHERE name=? COLLATE NOCASE AND id<>?",
+            (name, int(account_id)),
+        ).fetchone()
+        if duplicate is not None:
+            raise LedgerError("这个称呼已经被其他账户使用，请换一个。")
+
+        from .cash_management import cash_currency_for_name
+
+        cash_currency = cash_currency_for_name(self, old_name)
+        aliases_key = f"account_name_aliases_{int(account_id)}"
+        aliases: list[str] = []
+        if preserve_alias:
+            try:
+                saved_aliases = json.loads(self.get_setting(aliases_key, "[]"))
+                if isinstance(saved_aliases, list):
+                    aliases = [item for item in saved_aliases if isinstance(item, str) and item]
+            except (TypeError, json.JSONDecodeError):
+                aliases = []
+            if old_name not in aliases:
+                aliases.append(old_name)
+
+        self.connection.execute("UPDATE accounts SET name=? WHERE id=?", (name, int(account_id)))
+        if cash_currency:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO settings(key,value,note) VALUES (?,?,?)",
+                (f"cash_management_default_cash_name_{cash_currency}", name,
+                 "用户为默认现金账户设置的显示称呼。"),
+            )
+        if preserve_alias:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO settings(key,value,note) VALUES (?,?,?)",
+                (aliases_key, json.dumps(aliases, ensure_ascii=False), "账户曾用称呼，供记账识别。"),
+            )
+        if commit:
+            self.connection.commit()
+        return old_name, name
+
     def account(self, name: str) -> sqlite3.Row:
-        row = self.connection.execute("SELECT * FROM accounts WHERE name = ?", (name,)).fetchone()
+        canonical_name = self.canonical_account_name(name)
+        row = self.connection.execute(
+            "SELECT * FROM accounts WHERE name = ?", (canonical_name,)
+        ).fetchone() if canonical_name is not None else None
         if row is None:
             raise LedgerError(f"找不到账户：{name}")
         return row
@@ -1323,11 +1435,11 @@ class Database:
             to_amount_minor = None
             category_id = category_row["id"]
             effect = "memo" if memo_only else "posted"
-            if currency_row["code"] == "CNY":
+            if currency_row["is_monetary"] and currency_row["code"] != "JPY":
                 from .fx_rates import convert_minor_to_jpy_minor, resolve_jpy_rate
 
                 try:
-                    applied_rate = resolve_jpy_rate(self, "CNY", date_text)
+                    applied_rate = resolve_jpy_rate(self, currency_row["code"], date_text)
                 except (ValueError, RuntimeError) as exc:
                     raise LedgerError(str(exc)) from exc
                 jpy_equiv_minor = convert_minor_to_jpy_minor(
@@ -1413,11 +1525,11 @@ class Database:
         fx_rate: str | None = None
         fx_rate_date: str | None = None
         fx_source: str | None = None
-        if currency_row["code"] == "CNY":
+        if currency_row["is_monetary"] and currency_row["code"] != "JPY":
             from .fx_rates import convert_minor_to_jpy_minor, resolve_jpy_rate
 
             try:
-                applied_rate = resolve_jpy_rate(self, "CNY", date_text)
+                applied_rate = resolve_jpy_rate(self, currency_row["code"], date_text)
             except (ValueError, RuntimeError) as exc:
                 raise LedgerError(str(exc)) from exc
             jpy_total_minor = convert_minor_to_jpy_minor(
@@ -1441,7 +1553,7 @@ class Database:
                 raise LedgerError("分摊金额必须是正的最小货币单位整数")
             account = self.account(account_name)
             if account["currency"] != currency_row["code"]:
-                raise LedgerError("自动分摊只支持同一内部币种；JPY与CNY不可自动换算")
+                raise LedgerError("自动分摊只支持同一内部币种；不同币种不可自动换算")
             if date_text < account["opening_date"]:
                 raise LedgerError(f"交易日期早于账户期初日期：{account['opening_date']}")
             validated.append((int(account["id"]), amount_minor, description.strip()))
@@ -2320,7 +2432,7 @@ class Database:
                 account = None
                 account_amount_minor = None
 
-            if currency_code == "CNY":
+            if currency_row["is_monetary"] and currency_code != "JPY":
                 if (
                     old["kind"] in {"income", "expense"}
                     and old["currency"] == currency_code
@@ -2336,7 +2448,7 @@ class Database:
                     from .fx_rates import convert_minor_to_jpy_minor, resolve_jpy_rate
 
                     try:
-                        applied_rate = resolve_jpy_rate(self, "CNY", date_text)
+                        applied_rate = resolve_jpy_rate(self, currency_code, date_text)
                     except (ValueError, RuntimeError) as exc:
                         raise LedgerError(str(exc)) from exc
                     jpy_equiv_minor = convert_minor_to_jpy_minor(
@@ -2670,16 +2782,16 @@ class Database:
                     errors.append(f"转账#{row['id']}缺少一端账户或金额")
             if row["needs_review"]:
                 warnings.append(f"交易#{row['id']}待核对：{row['description']}")
-            if row["currency"] == "CNY" and row["kind"] in {"income", "expense"}:
+            if row["currency"] in {"CNY", "USD"} and row["kind"] in {"income", "expense"}:
                 if row["jpy_equiv_minor"] is None or not row["fx_rate"] or not row["fx_rate_date"]:
-                    warnings.append(f"人民币交易#{row['id']}尚无交易日JPY折算；利润表日元合计不含该笔")
+                    warnings.append(f"{row['currency']}交易#{row['id']}尚无交易日JPY折算；利润表日元合计不含该笔")
                 else:
                     try:
                         parse_date(row["fx_rate_date"])
                         if Decimal(str(row["fx_rate"])) <= 0 or int(row["jpy_equiv_minor"]) < 0:
-                            errors.append(f"人民币交易#{row['id']}的交易日汇率或JPY折算金额无效")
+                            errors.append(f"{row['currency']}交易#{row['id']}的交易日汇率或JPY折算金额无效")
                     except (LedgerError, InvalidOperation, TypeError, ValueError):
-                        errors.append(f"人民币交易#{row['id']}的交易日汇率格式无效")
+                        errors.append(f"{row['currency']}交易#{row['id']}的交易日汇率格式无效")
         for row in self.connection.execute(
             "SELECT s.*,a.name FROM credit_limit_snapshots s JOIN accounts a ON a.id=s.account_id"
         ):

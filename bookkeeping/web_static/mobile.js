@@ -47,7 +47,7 @@ function mountMobile() {
   const accounts=$(".accounts-panel"), entry=$(".entry-panel"), queue=$(".queue-panel"), history=$(".history-panel");
   $(".table-scroll",history).classList.add("legacy-table");
   const legacyNote=$(".privacy-note",app); legacyNote?.remove();
-  app.replaceChildren(heading,$("#githubLinkBanner"),banner);
+  app.replaceChildren(...[heading,$("#githubLinkBanner"),banner].filter(Boolean));
   heading.classList.add("mobile-heading");
   heading.querySelector("h1").removeAttribute("data-i18n");
   const tools=document.createElement("div"); tools.className="heading-tools";
@@ -324,28 +324,71 @@ async function openForm(title, fields, submit, options={}) {
 }
 async function guarded(callback){try{return await callback();}catch(error){showToast(error.message,true);}}
 async function confirmOnce(target,impact) {
-  return confirm(target+"\n\n"+impact);
+  const dialog=$("#actionConfirmDialog");
+  if(!dialog||dialog.open)return false;
+  const title=$("#actionConfirmTitle"),copy=$("#actionConfirmImpact"),cancel=$("#actionConfirmCancel"),accept=$("#actionConfirmAccept");
+  title.textContent=target;copy.textContent=impact;
+  cancel.textContent=m("取消","キャンセル","Cancel");
+  accept.textContent=m("确认","確認","Confirm");
+  return new Promise(resolve=>{
+    let settled=false;
+    const finish=value=>{
+      if(settled)return;settled=true;
+      cancel.onclick=null;accept.onclick=null;dialog.onclick=null;
+      dialog.removeEventListener("cancel",onCancel);dialog.removeEventListener("close",onClose);
+      if(dialog.open)dialog.close();
+      resolve(value);
+    };
+    const onCancel=event=>{event.preventDefault();finish(false);};
+    const onClose=()=>finish(false);
+    cancel.onclick=()=>finish(false);accept.onclick=()=>finish(true);
+    dialog.onclick=event=>{if(event.target===dialog)finish(false);};
+    dialog.addEventListener("cancel",onCancel);dialog.addEventListener("close",onClose);
+    try{if(typeof dialog.showModal==="function")dialog.showModal();else dialog.setAttribute("open","");}
+    catch{dialog.setAttribute("open","");}
+    cancel.focus();
+  });
+}
+function showActionProgress(action,state="running",error="") {
+  const copies={
+    settings:[m("正在保存设置到服务器…","設定をサーバーに保存中…","Saving settings to the server…"),m("正在更新 API 与账本设置，请勿重复点击。","APIと台帳の設定を更新しています。重複して操作しないでください。","Updating API and ledger settings. Please do not click again.")],
+    cloud_connect:[m("正在保存云端连接…","クラウド接続を保存中…","Saving cloud connection…"),m("正在安全保存授权信息，请稍候。","認証情報を安全に保存しています。","Saving authorization securely. Please wait.")],
+    payment_rules:[m("正在保存支付规则…","支払ルールを保存中…","Saving payment rules…"),m("正在提交更改并刷新账本。请勿重复点击。","変更を送信して台帳を更新しています。重複して操作しないでください。","Submitting changes and refreshing the ledger. Please do not click again.")],
+    agent:[m("正在处理你的请求…","リクエストを処理中…","Processing your request…"),m("记账可能需要一点时间；你可以继续查看其他页面，也可以在这里中断。","処理に時間がかかる場合があります。ほかの画面を確認するか、ここで中断できます。","This may take a little while. You can view other pages or stop the task here.")],
+  };
+  let [title,detail]=copies[action]||[m("正在保存到账本服务器…","台帳サーバーに保存中…","Saving to the ledger server…"),m("正在提交更改并刷新账本。请勿重复点击或关闭页面。","変更を送信して台帳を更新しています。重複操作やページを閉じる操作はお控えください。","Submitting changes and refreshing the ledger. Please do not click again or close the page.")];
+  if(state==="done"){title=m("操作已完成","処理が完了しました","Operation complete");detail=m("账本已更新。","台帳を更新しました。","Your ledger is up to date.");}
+  if(state==="failed"){title=m("操作未完成","処理を完了できませんでした","Operation did not complete");detail=error||m("未能完成此次操作，请根据页面提示处理后重试。","処理を完了できませんでした。画面の案内を確認して再試行してください。","The operation could not be completed. Follow the page message and try again.");}
+  showCloudProgress(title,detail,{modal:action!=="agent"});
+  const spinner=$("#cloudProgressDialog .cloud-progress-spinner");if(spinner)spinner.dataset.state=state;
+  const cancel=$("#cloudProgressCancel");if(cancel){cancel.classList.toggle("hidden",action!=="agent"||state!=="running");cancel.disabled=action==="agent"&&!activeJob;cancel.textContent=m("取消任务","タスクを中断","Stop task");cancel.onclick=action==="agent"&&state==="running"?async()=>{if(!activeJob||cancel.disabled)return;const jobId=activeJob;cancel.disabled=true;$("#cloudProgressTitle").textContent=m("正在请求中断…","中断を要求中…","Requesting cancellation…");$("#cloudProgressDetail").textContent=m("请稍候，服务器正在安全停止任务。","安全に処理を停止しています。","The server is stopping the task safely.");try{await api("/api/cancel-job",{method:"POST",body:JSON.stringify({id:jobId})});}catch(error){cancel.disabled=false;$("#cloudProgressDetail").textContent=error.message;}}:null;}
 }
 async function runAction(action,data={},progress=null,refresh=true) {
   if(!navigator.onLine||!serverReachable)throw new Error(m("此操作需要连接服务；内容还在当前编辑页。","この操作にはサービスへの接続が必要です。入力は編集画面に残っています。","This action needs a connection. Your input remains in the editor."));
+  if(activeJob&&action!=="agent")throw new Error(m("记账仍在处理中，你可以查看其他页面；完成后再修改账本。","記帳を処理中です。ほかの画面は確認できますが、台帳の変更は完了後に行ってください。","Bookkeeping is still processing. You can view other pages; wait until it finishes before changing the ledger."));
   const owner=currentUser?.id;if(!owner)throw new Error(t("login"));
   const opId=crypto.randomUUID();
-  let job=await api("/api/action",{method:"POST",body:JSON.stringify({action,data,opId})});
-  if(currentUser?.id!==owner)throw new Error(t("logout"));
-  localStorage.setItem("hh-active-job:"+owner,job.id);activeJob=job.id;
-  if(action==="agent")renderAgent();
-  while(job.state==="running"){
-    if(progress)progress(job);
-    await sleepMobile(1000);
+  const ownsProgress=!progress;if(ownsProgress)showActionProgress(action);
+  try{
+    let job=await api("/api/action",{method:"POST",body:JSON.stringify({action,data,opId})});
     if(currentUser?.id!==owner)throw new Error(t("logout"));
-    try{job=await api("/api/job?id="+encodeURIComponent(job.id));}catch(error){activeJob="";renderAgent();throw error;}
-  }
-  if(currentUser?.id!==owner)throw new Error(t("logout"));
-  localStorage.removeItem("hh-active-job:"+owner);activeJob="";
-  if(job.state!=="done")throw new Error(localizeServerError(job.result?.error||job.message||m("操作未完成","操作未完了","Action did not complete")));
-  if(job.cloudSnapshotSaved===false)showToast(m("操作已完成，但云端快照未能保存。请保持服务运行并稍后重试备份。","操作は完了しましたが、クラウドスナップショットを保存できませんでした。サービスを終了せず、後でバックアップを再試行してください。","The action completed, but its cloud snapshot was not saved. Keep the service running and retry the backup later."),true);
-  if(refresh){await fetchBootstrap();await loadWorkspace(true);if($("#historyStart").value||$("#historyEnd").value)await loadLedgerRange();}
-  return job.result;
+    localStorage.setItem("hh-active-job:"+owner,job.id);activeJob=job.id;
+    if(action==="agent"){renderAgent();if(ownsProgress)showActionProgress(action);}
+    while(job.state==="running"){
+      if(progress)progress(job);
+      await sleepMobile(1000);
+      if(currentUser?.id!==owner)throw new Error(t("logout"));
+      try{job=await api("/api/job?id="+encodeURIComponent(job.id));}catch(error){activeJob="";renderAgent();throw error;}
+    }
+    if(currentUser?.id!==owner)throw new Error(t("logout"));
+    localStorage.removeItem("hh-active-job:"+owner);activeJob="";
+    if(job.state!=="done")throw new Error(localizeServerError(job.result?.error||job.message||m("操作未完成","操作未完了","Action did not complete")));
+    if(job.cloudSnapshotSaved===false)showToast(m("操作已完成，但云端快照未能保存。请保持服务运行并稍后重试备份。","操作は完了しましたが、クラウドスナップショットを保存できませんでした。サービスを終了せず、後でバックアップを再試行してください。","The action completed, but its cloud snapshot was not saved. Keep the service running and retry the backup later."),true);
+    if(refresh){const updates=[fetchBootstrap(),loadWorkspace(true)];if($("#historyStart").value||$("#historyEnd").value)updates.push(loadLedgerRange());await Promise.all(updates);}
+    if(ownsProgress){showActionProgress(action,"done");await sleepMobile(450);}
+    return job.result;
+  }catch(error){if(ownsProgress){showActionProgress(action,"failed",error.message);await sleepMobile(action==="agent"?1800:700);}throw error;}
+  finally{if(ownsProgress)hideCloudProgress();}
 }
 async function resumeJob() {
   const owner=currentUser?.id;if(!owner||jobRecoveryOwner===owner||activeJob)return;
@@ -364,7 +407,8 @@ async function restoreFile(file) {
   if(!file)return;
   if((await outboxAll()).length)throw new Error(m("请先同步待处理记录。","先に未同期の記録を同期してください。","Sync pending entries first."));
   if(!await confirmOnce(m("恢复文件：","ファイルを復元：","Restore file: ")+file.name,m("当前账本会被替换，恢复前会创建完整备份。","現在の台帳を置き換え、復元前の完全コピーを保存します。","The current ledger will be replaced after a full safety backup.")))return;
-  try{await api("/api/restore-bundle",{method:"POST",body:file,headers:{"Content-Type":"application/zip","X-Confirm-Restore":"confirmed-once"}});await fetchBootstrap();await loadWorkspace(true);showToast(m("已恢复","復元しました","Restored"));}catch(error){showToast(error.message,true);}
+  showCloudProgress(m("正在上传并恢复备份…","バックアップを送信して復元中…","Uploading and restoring the backup…"),m("正在发送文件、备份当前账本并应用恢复内容。请勿重复点击或关闭页面。","ファイルを送信し、現在の台帳をバックアップしてから復元します。重複操作やページを閉じる操作はお控えください。","Uploading the file, backing up your current ledger, then restoring. Please do not click again or close the page."));
+  try{await api("/api/restore-bundle",{method:"POST",body:file,headers:{"Content-Type":"application/zip","X-Confirm-Restore":"confirmed-once"}});await fetchBootstrap();await loadWorkspace(true);showToast(m("已恢复","復元しました","Restored"));}catch(error){showToast(error.message,true);}finally{hideCloudProgress();}
 }
 
 function renderAgent() {
@@ -375,6 +419,11 @@ function renderAgent() {
   $("#chatMessages").innerHTML=messages.length?messages.map(item=>'<article class="bubble '+item.role+'"><span class="bubble-label">'+(item.role==="user"?m("你","あなた","You"):m("助手","アシスタント","Assistant"))+'</span><p>'+e(item.text)+'</p></article>').join(""):'<div class="chat-welcome"><span class="assistant-orb">'+icon(chatAgent==="bookkeeping"?"chat":"food")+'</span><h2>'+m("让生活，清楚一点","暮らしを、少しクリアに","A clearer picture of everyday life")+'</h2><p>'+m("告诉我一笔收支，或拍下小票。信息不足时先确认，记录成功后再备份。","収支を伝えるか、レシートを撮影してください。不明点は確認してから記帳します。","Tell me about an entry, or photograph a receipt. Unclear details are checked before recording.")+'</p></div>';
   renderAttachments();
   $("#chatForm").onsubmit=sendAgent;
+  $("#chatInput").onkeydown=event=>{
+    if(event.key==="Enter"&&event.shiftKey&&!event.isComposing&&event.keyCode!==229){
+      event.preventDefault();$("#chatForm").requestSubmit();
+    }
+  };
   $("#chatImageInput").onchange=async event=>{await guarded(()=>attachImages([...event.target.files]));event.target.value="";};
   if(messages.length)$("#chatMessages").scrollTop=$("#chatMessages").scrollHeight;
 }
@@ -406,7 +455,7 @@ async function sendAgent(event) {
     if(currentUser?.id!==owner)return;
     chats[agent].push({role:"assistant",text:result.answer});
     await cacheSet("chat:"+currentUser.id+":"+agent,chats[agent]);
-  }catch(error){if(currentUser?.id===owner){chats[agent].push({role:"assistant",text:error.message});if(images.length)attachments=images;}}
+  }catch(error){if(currentUser?.id===owner){chats[agent].push({role:"assistant",text:error.message});if(images.length)attachments=images;showToast(error.message,true);}}
   finally{if(currentUser?.id===owner)renderAgent();}
 }
 
@@ -426,6 +475,7 @@ async function editSettings() {
   if(!workspace)throw new Error(t("offline"));
   settingsDraft=deepCopy(workspace.preferences);
   const cfg=settingsDraft;
+  const savedKeyMask="••••••••••••";
   const skillWarning=agent=>cfg.skillErrors?.[agent]?'<p role="alert" class="fineprint">'+m("此 Agent 的 Skill 无法读取。请恢复默认文本或粘贴有效内容后保存；账本仍可正常查看。","このAgentのSkillを読み込めません。初期値を復元するか内容を貼り付けて保存してください。台帳は引き続き表示できます。","This agent's skill cannot be read. Restore the default text or paste valid content and save. The ledger remains available.")+'</p>':"";
   const cloudRuntime=typeof runtimeConfig!=="undefined"&&runtimeConfig?.deploymentMode==="cloud";
   let appearanceDraft=window.HouseholdAppearance.mode;
@@ -433,8 +483,8 @@ async function editSettings() {
     $("#editorTitle").textContent=m("设置与 Skill","設定とSkill","Settings & skills");
     $("#editorCancel").textContent=m("‹ 返回更多","‹ その他へ戻る","‹ Back to More");$("#editorSave").textContent=m("确认","確定","Done");
     $("#editorBody").innerHTML='<p class="fineprint">'+m("编辑内容不会自动保存。点应用保留当前页，点确认保存并关闭；取消撤回尚未应用的修改。","変更は自動保存されません。「適用」で保存し画面を維持、「確定」で保存して閉じます。","Changes are not saved automatically. Apply saves and stays here; Done saves and closes. Cancel discards unapplied changes.")+'</p>'+appearanceSettingsHtml(appearanceDraft)+'<div class="section-heading"><h3>'+m("API 服务","APIサービス","API services")+'</h3>'+b("profile-add",icon("plus"))+'</div><div id="profileList">'+cfg.profiles.map((p,index)=>'<section class="profile-editor" data-profile-index="'+index+'"><div class="spread"><strong>'+m("服务","サービス","Service")+' '+(index+1)+'</strong>'+b("profile-remove",m("删除","削除","Remove"),index,"text-button danger-text")+'</div>'+[
-        ["name",m("名称","名前","Name"),"text"],["api_url",m("接口完整地址","エンドポイントURL","Full endpoint URL"),"url"],["model",m("模型标识","モデルID","Model ID"),"text"],["api_key",m("API 密钥（留空保留已保存密钥）","APIキー（空欄で既存を保持）","API key (blank keeps saved key)"),"password"]
-      ].map(([key,label,type])=>'<label class="field"><span>'+label+'</span><input type="'+type+'" data-profile-key="'+key+'" value="'+e(p[key]||"")+'" '+(key==="api_key"?'autocomplete="new-password"':'required')+'></label>').join("")+
+        ["name",m("名称","名前","Name"),"text"],["api_url",m("接口完整地址","エンドポイントURL","Full endpoint URL"),"url"],["model",m("模型标识","モデルID","Model ID"),"text"],["api_key",m("API 密钥（已保存时显示为遮罩；留空保留）","APIキー（保存済みはマスク表示、空欄なら保持）","API key (masked when saved; blank keeps it)"),"password"]
+      ].map(([key,label,type])=>{const masked=key==="api_key"&&p.keyPresent&&!p.api_key;const value=masked?savedKeyMask:(p[key]||"");return '<label class="field"><span>'+label+'</span><input type="'+type+'" data-profile-key="'+key+'" value="'+e(value)+'" '+(masked?'data-masked-saved-key="1" ':'')+(key==="api_key"?'autocomplete="new-password"':'required')+'></label>';}).join("")+
       '<label class="check-row"><input type="checkbox" data-profile-key="thinking_enabled" '+(p.thinking_enabled?"checked":"")+'><span>'+m("思考模式（支持的服务）","思考モード（対応API）","Thinking mode (supported providers)")+'</span></label><label class="field"><span>'+m("思考强度","思考強度","Reasoning effort")+'</span><select data-profile-key="reasoning_effort">'+["low","high","max"].map(value=>'<option '+(p.reasoning_effort===value?"selected":"")+'>'+value+'</option>').join("")+'</select></label></section>').join("")+'</div>'+
       ["bookkeeping","food_health"].map(agent=>'<section class="skill-editor"><h3>'+ (agent==="bookkeeping"?m("记账 Agent","記帳Agent","Ledger agent"):m("饮食健康 Agent","食生活Agent","Food agent"))+'</h3>'+["agents","visionAgents"].map(group=>'<label class="field"><span>'+ (group==="agents"?m("文字服务","テキスト用","Text service"):m("图片服务","画像用","Image service"))+'</span><select data-agent="'+agent+'" data-group="'+group+'"><option value="">'+m("请选择","選択してください","Choose a service")+'</option>'+cfg.profiles.map(p=>'<option value="'+e(p.id)+'" '+(cfg[group][agent]===p.id?"selected":"")+'>'+e(p.name)+'</option>').join("")+'</select></label>').join("")+
       skillWarning(agent)+'<div class="spread"><label for="skill-'+agent+'">'+m("Skill 文本 · 复制粘贴后编辑","Skillテキスト・貼り付けて編集","Skill text · paste and edit")+'</label>'+b("skill-default",m("恢复默认","初期値に戻す","Restore default"),agent,"text-button accent")+'</div><textarea id="skill-'+agent+'" class="skill-text" data-skill="'+agent+'" spellcheck="false" rows="12">'+e(cfg.skills[agent]||"")+'</textarea><p class="fineprint">'+m("此文本会随该 Agent 的请求发送给你选择的模型服务。","このテキストは選択したモデルへのリクエストに含まれます。","This text is included in requests to the model service you select.")+'</p></section>').join("")+
@@ -442,7 +492,7 @@ async function editSettings() {
     $("#editorFooter").innerHTML=b("settings-apply",m("应用","適用","Apply"),"","button primary");
   };
   const capture=()=>{
-    $$(".profile-editor").forEach(node=>{const p=cfg.profiles[Number(node.dataset.profileIndex)];$$("[data-profile-key]",node).forEach(input=>p[input.dataset.profileKey]=input.type==="checkbox"?input.checked:input.value);});
+    $$(".profile-editor").forEach(node=>{const p=cfg.profiles[Number(node.dataset.profileIndex)];$$("[data-profile-key]",node).forEach(input=>{if(input.dataset.profileKey==="api_key"&&input.dataset.maskedSavedKey==="1"&&input.value===savedKeyMask)p.api_key="";else p[input.dataset.profileKey]=input.type==="checkbox"?input.checked:input.value;});});
     $$("[data-agent]").forEach(input=>cfg[input.dataset.group][input.dataset.agent]=input.value);
     $$("[data-skill]").forEach(input=>{
       const agent=input.dataset.skill;
@@ -453,6 +503,7 @@ async function editSettings() {
     appearanceDraft=$("#settings-appearance").value;
   };
   render();$("#editorDialog").showModal();
+  $$('[data-masked-saved-key="1"]').forEach(input=>input.addEventListener("focus",()=>input.select(),{once:true}));
   $("#editorForm").oninput=capture;
   $("#editorForm").onchange=capture;
   $("#editorForm").onsubmit=async event=>{event.preventDefault();capture();await guarded(async()=>{await runAction("settings",cfg);window.HouseholdAppearance.save(appearanceDraft);$("#editorDialog").close();});};

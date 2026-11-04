@@ -18,24 +18,42 @@
   <script defer src="/app.js"></script>
   <script defer src="/mobile.js"></script>
   <script defer src="/github-login.js"></script>
+  <script defer src="/gitee-login.js"></script>
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="/" aria-label="家庭记账"><img src="/icon.svg" alt=""><span data-i18n="appName">家庭记账</span></a>
-    <button id="appearanceButton" class="icon-button appearance-launch" type="button" aria-label="外观"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg></button>
     <div id="toolbar" class="toolbar hidden">
       <span id="connectionState" class="connection"></span>
-      <button id="syncButton" class="button secondary" type="button" data-i18n="syncNow">立即同步</button>
-      <select id="languageSelect" aria-label="Language">
-        <option value="zh-CN">简体中文</option><option value="ja-JP">日本語</option><option value="en-US">English</option>
-      </select>
+      <button id="syncButton" class="button secondary" type="button" data-i18n="syncNow" title="只上传本机待同步记录；不会覆盖整本云端账本。">立即上传</button>
+      <button id="tutorialButton" class="button secondary" type="button">新手教程</button>
+      <button id="linkGiteeButton" class="button secondary hidden" type="button">关联 Gitee</button>
+      <button id="linkGithubButton" class="button secondary hidden" type="button">关联 GitHub</button>
       <span id="usernameLabel" class="username"></span>
       <button id="logoutButton" class="button text-button" type="button" data-i18n="logout">退出</button>
     </div>
   </header>
 
   <main>
-    <section id="authScreen" class="auth-layout">
+    <section id="sessionScreen" class="session-layout" aria-live="polite">
+      <div class="auth-card session-card">
+        <img class="session-icon" src="/icon.svg" alt="">
+        <p id="sessionIdentity" class="eyebrow">正在恢复安全会话</p>
+        <h1 id="sessionWelcome">正在打开家庭记账</h1>
+        <p id="sessionLoadingText" class="fineprint">正在检查此浏览器的登录状态，请稍候。</p>
+        <span id="sessionLoadingIndicator" class="session-spinner" aria-hidden="true"></span>
+        <div id="cloudBootstrapBlocked" class="message error hidden" role="alert">
+          <strong data-gh-text="restoreRequired">网页版账本暂未载入</strong>
+          <p id="cloudBootstrapError" class="fineprint"></p>
+          <div class="session-actions">
+            <button id="reconnectGithubBackup" type="button" class="button primary wide" data-gh-text="reconnectBackup">重新连接 GitHub 备份</button>
+            <button id="restoreCloudAfterConflict" type="button" class="button secondary wide" data-gh-text="restoreAfterConflict">先备份当前账本后下载云端账本</button>
+            <button id="retryCloudBootstrap" type="button" class="button secondary wide" data-gh-text="retryDownload">重试载入账本</button>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section id="authScreen" class="auth-layout hidden">
       <div class="intro">
         <p class="eyebrow" data-i18n="privateLedger">私人账本 · 多设备同步</p>
         <h1 data-i18n="heroTitle">每一笔，都清楚。</h1>
@@ -48,11 +66,12 @@
       </div>
       <div class="auth-card">
         <div class="github-welcome">
-          <span class="github-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .9a11.1 11.1 0 0 0-3.5 21.63c.55.1.75-.24.75-.53v-2.1c-3.1.67-3.75-1.3-3.75-1.3-.5-1.28-1.23-1.62-1.23-1.62-1-.69.08-.67.08-.67 1.12.08 1.71 1.14 1.71 1.14 1 1.7 2.6 1.2 3.24.92.1-.72.39-1.2.7-1.48-2.48-.28-5.1-1.25-5.1-5.56 0-1.23.44-2.24 1.15-3.03-.12-.28-.5-1.43.11-2.98 0 0 .94-.3 3.05 1.16A10.6 10.6 0 0 1 12 6.1c.94 0 1.88.13 2.76.38 2.12-1.45 3.05-1.16 3.05-1.16.61 1.55.23 2.7.11 2.98.72.79 1.15 1.8 1.15 3.03 0 4.32-2.62 5.27-5.12 5.55.4.35.76 1.02.76 2.06V22c0 .3.2.64.76.53A11.1 11.1 0 0 0 12 .9Z"/></svg></span>
-          <h2 data-gh-text="title">一个 GitHub 账号，就能开始</h2>
-          <p class="fineprint" data-gh-text="intro">首次授权自动建立你的私人账本，以后在其他设备使用同一个 GitHub 登录即可。</p>
+          <span class="github-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4.5 6v5.5c0 4.7 3.2 7.7 7.5 9.5 4.3-1.8 7.5-4.8 7.5-9.5V6L12 3Z"/><path d="m8.5 12 2.3 2.3 4.8-4.8"/></svg></span>
+          <h2 id="githubAuthTitle" data-gh-text="title">选择登录方式</h2>
+          <p id="githubAuthIntro" class="fineprint" data-gh-text="intro">GitHub 或 Gitee 均可独立登录。首次使用某个身份会创建独立账本；已关联的身份会进入同一账本。</p>
           <button id="githubSignIn" type="button" class="button primary wide" data-gh-text="signIn">使用 GitHub 登录</button>
-          <p class="fineprint" data-gh-text="privacy">密码只在 GitHub 页面输入；登录不会上传或覆盖云备份。</p>
+          <button id="giteeSignIn" type="button" class="button secondary wide hidden">使用 Gitee 登录</button>
+          <p class="fineprint" data-gh-text="privacy">密码只在 GitHub 页面输入；登录只检查和下载，不会自动上传云备份。</p>
         </div>
         <section id="githubLoginProgress" class="hidden" aria-live="polite">
           <p data-gh-text="instructions">复制临时授权码，在 GitHub 验证页输入并确认，再返回这里。</p>
@@ -61,22 +80,12 @@
           <p id="githubLoginState" class="fineprint"></p>
           <button id="githubCancelLogin" type="button" class="text-button" data-gh-text="cancel">取消登录</button>
         </section>
-        <details id="legacyAccountMigration" class="legacy-migration">
-          <summary data-gh-text="legacyTitle">已有旧账号？迁移原账本</summary>
-          <p class="fineprint" data-gh-text="legacyHelp">先验证原账号，再关联 GitHub，保留原来的账目和设置。新用户直接使用上方 GitHub 登录。</p>
-          <div class="button-row"><button type="button" class="auth-tab" data-auth-tab="login" data-gh-text="legacyPassword">原账号密码</button><button type="button" class="auth-tab" data-auth-tab="recover" data-gh-text="legacyRecovery">原账号恢复码</button></div>
-        <form id="loginForm" class="auth-form">
-          <label><span data-i18n="username">用户名</span><input name="username" required autocomplete="username" minlength="3" maxlength="32"></label>
-          <label><span data-i18n="password">密码</span><input name="password" type="password" required autocomplete="current-password"></label>
-          <button class="button secondary wide" data-gh-text="verifyLegacy">验证原账号并保留账本</button>
-        </form>
-        <form id="recoverForm" class="auth-form hidden">
-          <label><span data-i18n="username">用户名</span><input name="username" required autocomplete="username"></label>
-          <label><span data-i18n="recoveryCode">恢复码</span><input name="recoveryCode" required autocomplete="off"></label>
-          <label><span data-i18n="newPassword">新密码（至少12位）</span><input name="newPassword" type="password" required autocomplete="new-password" minlength="12"></label>
-          <button class="button primary wide" data-i18n="resetPassword">重置密码</button>
-        </form>
-        </details>
+        <div class="auth-language">
+          <label id="authLanguageLabel" for="authLanguageSelect">界面语言</label>
+          <select id="authLanguageSelect" aria-label="显示语言">
+            <option value="zh-CN">简体中文</option><option value="ja-JP">日本語</option><option value="en-US">English</option>
+          </select>
+        </div>
         <div id="authMessage" class="message hidden" role="status"></div>
       </div>
     </section>
@@ -86,7 +95,6 @@
         <div><p class="eyebrow" data-i18n="overview">总览</p><h1 data-i18n="yourLedger">你的家庭账本</h1></div>
         <div id="syncSummary" class="sync-summary"></div>
       </div>
-      <div id="githubLinkBanner" class="panel hidden"><p data-gh-text="linkHelp">关联 GitHub 后，以后直接使用 GitHub 登录，当前账本和设置会保留。</p><button type="button" id="githubLinkLegacy" class="button primary" data-gh-text="linkButton">关联 GitHub，保留当前账本</button></div>
       <div id="offlineBanner" class="offline-banner hidden"></div>
       <section class="panel accounts-panel">
         <div class="section-heading"><div><h2 data-i18n="accounts">账户</h2><p data-i18n="accountsHint">余额按已入账流水计算，离线暂存记录单独显示。</p></div><button id="showAccountForm" class="button secondary" data-i18n="addAccount">＋ 添加账户</button></div>
@@ -94,7 +102,7 @@
         <form id="accountForm" class="inline-form hidden">
           <label><span data-i18n="accountName">账户名称</span><input name="name" required maxlength="80"></label>
           <label><span data-i18n="accountType">类型</span><select name="type" required></select></label>
-          <label><span data-i18n="currency">币种</span><select name="currency"><option>JPY</option><option>CNY</option></select></label>
+          <label><span data-i18n="currency">币种</span><select name="currency"><option>JPY</option><option>CNY</option><option>USD</option></select></label>
           <label><span data-i18n="openingBalance">期初余额</span><input name="openingBalance" required inputmode="decimal" value="0"></label>
           <label><span data-i18n="openingDate">期初日期</span><input name="openingDate" type="date" required></label>
           <label><span data-i18n="completeness">余额状态</span><select name="completeness"><option value="known" data-i18n="known">完整</option><option value="partial" data-i18n="partial">部分核实</option><option value="inferred" data-i18n="inferred">包含推算</option></select></label>
@@ -146,6 +154,23 @@
     </section>
   </main>
 
+  <dialog id="firstRunSetupDialog" class="dialog-card first-run-setup" aria-labelledby="firstRunSetupTitle"></dialog>
+  <dialog id="actionConfirmDialog" class="dialog-card confirm-dialog" aria-labelledby="actionConfirmTitle" aria-describedby="actionConfirmImpact">
+    <h2 id="actionConfirmTitle"></h2>
+    <p id="actionConfirmImpact"></p>
+    <div class="button-row confirm-actions">
+      <button id="actionConfirmCancel" type="button" class="button secondary">取消</button>
+      <button id="actionConfirmAccept" type="button" class="button primary">确认</button>
+    </div>
+  </dialog>
+  <dialog id="cloudProgressDialog" class="dialog-card cloud-progress-dialog" aria-labelledby="cloudProgressTitle" aria-describedby="cloudProgressDetail">
+    <span class="cloud-progress-spinner" aria-hidden="true"></span>
+    <div class="cloud-progress-copy" role="status" aria-live="polite">
+      <h2 id="cloudProgressTitle">正在处理云端备份…</h2>
+      <p id="cloudProgressDetail">请稍候。</p>
+    </div>
+    <button id="cloudProgressCancel" type="button" class="button secondary cloud-progress-cancel hidden" disabled>取消任务</button>
+  </dialog>
   <dialog id="recoveryDialog" class="dialog-card">
     <h2 data-i18n="saveRecovery">请保存账号恢复码</h2>
     <p data-i18n="recoveryExplain">恢复码只显示这一次。丢失密码且没有恢复码时，目前无法通过邮件找回。</p>

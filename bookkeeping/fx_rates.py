@@ -78,12 +78,12 @@ def convert_minor_at_rate(
         return int(target_minor.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def _cached_rate(database: Any, requested_date: date) -> JpyRate | None:
+def _cached_rate(database: Any, requested_date: date, currency: str = "CNY") -> JpyRate | None:
     row = database.connection.execute(
         "SELECT rate,rate_date,source FROM fx_rates "
-        "WHERE base_currency='CNY' AND quote_currency='JPY' AND rate_date<=? "
+        "WHERE base_currency=? AND quote_currency='JPY' AND rate_date<=? "
         "ORDER BY rate_date DESC LIMIT 1",
-        (requested_date.isoformat(),),
+        (currency.upper(), requested_date.isoformat()),
     ).fetchone()
     if row is None:
         return None
@@ -97,11 +97,11 @@ def _cached_rate(database: Any, requested_date: date) -> JpyRate | None:
     return JpyRate(rate=rate, rate_date=rate_date.isoformat(), source=str(row["source"]))
 
 
-def _download_ecb_cross_rates(start: date, end: date) -> list[dict[str, str]]:
+def _download_ecb_cross_rates(start: date, end: date, *, opener=None) -> list[dict[str, str]]:
     query = urlencode(
         {
             "base": "EUR",
-            "quotes": "CNY,JPY",
+            "quotes": "CNY,JPY,USD",
             "from": start.isoformat(),
             "to": end.isoformat(),
         }
@@ -111,10 +111,10 @@ def _download_ecb_cross_rates(start: date, end: date) -> list[dict[str, str]]:
         headers={"Accept": "application/json", "User-Agent": "HouseholdBookkeeping/1.0"},
     )
     try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        with (opener or urlopen)(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             body = response.read(256_000)
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        raise FxRateUnavailable("无法取得人民币的交易日参考汇率。请检查网络后重试。") from exc
+        raise FxRateUnavailable("无法取得交易日参考汇率。请检查网络后重试。") from exc
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -126,7 +126,7 @@ def _download_ecb_cross_rates(start: date, end: date) -> list[dict[str, str]]:
         if not isinstance(item, dict) or item.get("base") != "EUR":
             continue
         quote = item.get("quote")
-        if quote not in {"CNY", "JPY"}:
+        if quote not in {"CNY", "JPY", "USD"}:
             continue
         try:
             rate_date = date.fromisoformat(str(item["date"]))
@@ -139,17 +139,17 @@ def _download_ecb_cross_rates(start: date, end: date) -> list[dict[str, str]]:
 
 
 def resolve_jpy_rate(database: Any, currency: str, occurred_on: str) -> JpyRate:
-    """Resolve the recorded daily JPY equivalent for one currency and transaction date.
+    """Resolve the daily JPY equivalent for one currency and transaction date.
 
-    CNY/JPY cross rates are derived from the ECB's daily EUR reference rates. If
-    the transaction falls on a non-publication day, the latest prior publication
-    is applied and its effective date is saved with the transaction.
+    CNY/JPY and USD/JPY cross rates are derived from the ECB's daily EUR reference
+    rates. If the transaction falls on a non-publication day, the latest prior
+    publication is applied and its effective date is saved with the transaction.
     """
     code = currency.upper()
     requested_date = date.fromisoformat(occurred_on)
     if code == "JPY":
         return JpyRate(Decimal("1"), requested_date.isoformat(), "同币种（JPY）")
-    if code != "CNY":
+    if code not in {"CNY", "USD"}:
         raise FxRateUnavailable(f"当前没有配置{code}到JPY的报表汇率。")
 
     today_jst = datetime.now(timezone(timedelta(hours=9))).date()
@@ -158,8 +158,8 @@ def resolve_jpy_rate(database: Any, currency: str, occurred_on: str) -> JpyRate:
 
     cached_exact = database.connection.execute(
         "SELECT rate,rate_date,source FROM fx_rates "
-        "WHERE base_currency='CNY' AND quote_currency='JPY' AND rate_date=?",
-        (requested_date.isoformat(),),
+        "WHERE base_currency=? AND quote_currency='JPY' AND rate_date=?",
+        (code, requested_date.isoformat()),
     ).fetchone()
     if cached_exact is not None:
         try:
@@ -169,11 +169,17 @@ def resolve_jpy_rate(database: Any, currency: str, occurred_on: str) -> JpyRate:
         except InvalidOperation:
             pass
 
+    cached = _cached_rate(database, requested_date, code)
+    if cached is not None:
+        return cached
+
     first_day = requested_date - timedelta(days=MAX_CACHED_AGE_DAYS)
     try:
-        observations = _download_ecb_cross_rates(first_day, requested_date)
+        opener = getattr(database, "external_opener", None)
+        observations = (_download_ecb_cross_rates(first_day, requested_date, opener=opener)
+                        if opener is not None else _download_ecb_cross_rates(first_day, requested_date))
     except FxRateUnavailable:
-        cached = _cached_rate(database, requested_date)
+        cached = _cached_rate(database, requested_date, code)
         if cached is not None:
             return cached
         raise
@@ -185,36 +191,44 @@ def resolve_jpy_rate(database: Any, currency: str, occurred_on: str) -> JpyRate:
         except InvalidOperation:
             continue
 
-    valid_rates: list[tuple[str, str]] = []
+    valid_rates: dict[str, list[tuple[str, str]]] = {"CNY": [], "USD": []}
     for rate_date, values in by_date.items():
-        cny_per_eur = values.get("CNY")
         jpy_per_eur = values.get("JPY")
-        if cny_per_eur is None or jpy_per_eur is None or cny_per_eur <= 0 or jpy_per_eur <= 0:
+        if jpy_per_eur is None or jpy_per_eur <= 0:
             continue
-        with localcontext() as context:
-            context.prec = 32
-            cross_rate = jpy_per_eur / cny_per_eur
-        valid_rates.append((rate_date, _canonical_rate(cross_rate)))
-    if valid_rates:
+        for quote in ("CNY", "USD"):
+            quote_per_eur = values.get(quote)
+            if quote_per_eur is None or quote_per_eur <= 0:
+                continue
+            with localcontext() as context:
+                context.prec = 32
+                cross_rate = jpy_per_eur / quote_per_eur
+            valid_rates[quote].append((rate_date, _canonical_rate(cross_rate)))
+    cached_rates = [
+        (quote, rate_date, rate)
+        for quote, observations_for_quote in valid_rates.items()
+        for rate_date, rate in observations_for_quote
+    ]
+    if cached_rates:
         with database.connection:
             database.connection.executemany(
                 "INSERT OR REPLACE INTO fx_rates "
                 "(base_currency,quote_currency,rate_date,rate,source,retrieved_at) "
-                "VALUES ('CNY','JPY',?,?,?,?)",
+                "VALUES (?, 'JPY', ?, ?, ?, ?)",
                 [
-                    (rate_date, rate, ECB_SOURCE, datetime.now(timezone.utc).isoformat(timespec="seconds"))
-                    for rate_date, rate in valid_rates
+                    (quote, rate_date, rate, ECB_SOURCE, datetime.now(timezone.utc).isoformat(timespec="seconds"))
+                    for quote, rate_date, rate in cached_rates
                 ],
             )
-        applicable = [item for item in valid_rates if item[0] <= requested_date.isoformat()]
+        applicable = [item for item in valid_rates[code] if item[0] <= requested_date.isoformat()]
         if applicable:
             rate_date, rate_text = max(applicable, key=lambda item: item[0])
             return JpyRate(Decimal(rate_text), rate_date, ECB_SOURCE)
 
-    cached = _cached_rate(database, requested_date)
+    cached = _cached_rate(database, requested_date, code)
     if cached is not None:
         return cached
-    raise FxRateUnavailable("该日期没有可用的人民币/日元参考汇率，账本未写入。")
+    raise FxRateUnavailable(f"该日期没有可用的{code}/JPY参考汇率，账本未写入。")
 
 
 def resolve_exchange_rate(
@@ -225,26 +239,32 @@ def resolve_exchange_rate(
 ) -> ExchangeRate:
     """Resolve the daily reference conversion rate from source to target currency.
 
-    JPY/CNY conversions share the cached ECB cross rate. The reciprocal is used
-    for JPY-to-CNY payments so the effective reference date and source stay the
-    same in both directions.
+    Supported currencies share ECB EUR reference observations, cached as
+    currency-to-JPY cross rates. Cross-currency amounts use the matching daily
+    reference date for both legs.
     """
     source = source_currency.upper()
     target = target_currency.upper()
     requested_date = date.fromisoformat(occurred_on)
     if source == target:
         return ExchangeRate(Decimal("1"), requested_date.isoformat(), "同币种")
-    if {source, target} != {"JPY", "CNY"}:
+    if source not in {"JPY", "CNY", "USD"} or target not in {"JPY", "CNY", "USD"}:
         raise FxRateUnavailable(f"暂不支持{source}与{target}之间的参考汇率换算。")
-    cny_to_jpy = resolve_jpy_rate(database, "CNY", requested_date.isoformat())
-    if source == "CNY":
-        rate = cny_to_jpy.rate
-    else:
-        with localcontext() as context:
-            context.prec = 32
-            rate = Decimal("1") / cny_to_jpy.rate
+    source_to_jpy = resolve_jpy_rate(database, source, requested_date.isoformat())
+    target_to_jpy = resolve_jpy_rate(database, target, requested_date.isoformat())
+    if source != "JPY" and target != "JPY" and source_to_jpy.rate_date != target_to_jpy.rate_date:
+        # A pre-existing one-currency cache may be older than the second leg.
+        # Resolving both again uses the paired observations cached by the refresh.
+        source_to_jpy = resolve_jpy_rate(database, source, requested_date.isoformat())
+        target_to_jpy = resolve_jpy_rate(database, target, requested_date.isoformat())
+    if source != "JPY" and target != "JPY" and source_to_jpy.rate_date != target_to_jpy.rate_date:
+        raise FxRateUnavailable(f"{source}/{target}参考汇率日期不一致，暂不能安全换算。")
+    with localcontext() as context:
+        context.prec = 32
+        rate = source_to_jpy.rate / target_to_jpy.rate
+    effective = source_to_jpy if source != "JPY" else target_to_jpy
     return ExchangeRate(
         rate=Decimal(_canonical_rate(rate)),
-        rate_date=cny_to_jpy.rate_date,
-        source=cny_to_jpy.source,
+        rate_date=effective.rate_date,
+        source=effective.source,
     )

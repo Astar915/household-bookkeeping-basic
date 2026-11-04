@@ -88,7 +88,9 @@ def _read_items(text: str) -> list[tuple[str, str]]:
     return result
 
 
-def open_food_tracking(root: tk.Misc, database_path: Path) -> None:
+def open_food_tracking(
+    root: tk.Misc, database_path: Path, *, on_changed: Any = None
+) -> None:
     ui_font_family = choose_ui_font_family(root)
     database = Database(database_path)
     try:
@@ -292,6 +294,8 @@ def open_food_tracking(root: tk.Misc, database_path: Path) -> None:
             "已开启：食品采购计作已吃；其他商品排除，待识别项不参与营养分类。" if enabled
             else "饮食回顾只统计食用记录。"
         )
+        if callable(on_changed):
+            on_changed()
 
     def save_manual_entries(*, purchase: bool) -> None:
         entry = tk.Toplevel(dialog)
@@ -369,6 +373,8 @@ def open_food_tracking(root: tk.Misc, database_path: Path) -> None:
                 return
             entry.destroy()
             refresh()
+            if callable(on_changed):
+                on_changed()
 
         ttk.Button(buttons, text="取消", command=entry.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(buttons, text="保存", style="Send.TButton", command=save).pack(side="right")
@@ -451,6 +457,8 @@ def open_food_tracking(root: tk.Misc, database_path: Path) -> None:
                 translate("已导入 {count} 条可识别食品商品行；非食品和无法确认的项目不加入食材记录。")
                 .format(count=inserted)
             )
+            if callable(on_changed):
+                on_changed()
 
         ttk.Button(picker_buttons, text="取消", command=picker.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(picker_buttons, text="导入所选", style="Send.TButton", command=import_selected).pack(side="right")
@@ -525,6 +533,8 @@ def open_food_tracking(root: tk.Misc, database_path: Path) -> None:
                 purchase_tree.selection_set(str(item_id))
                 purchase_tree.focus(str(item_id))
             category_status_var.set("分类已应用；名称和数量请点保存后生效。")
+            if callable(on_changed):
+                on_changed()
 
         def reclassify_editor_item() -> None:
             group = classify_food_name(name_var.get())
@@ -555,6 +565,8 @@ def open_food_tracking(root: tk.Misc, database_path: Path) -> None:
                 return
             editor.destroy()
             refresh()
+            if callable(on_changed):
+                on_changed()
 
         ttk.Button(buttons, text="取消", command=editor.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(buttons, text="保存", style="Send.TButton", command=save_edit).pack(side="right")
@@ -581,6 +593,8 @@ def open_food_tracking(root: tk.Misc, database_path: Path) -> None:
             messagebox.showerror("移除失败", str(exc), parent=dialog)
             return
         refresh()
+        if callable(on_changed):
+            on_changed()
 
     def remove_consumption() -> None:
         selection = consumption_tree.selection()
@@ -603,6 +617,8 @@ def open_food_tracking(root: tk.Misc, database_path: Path) -> None:
             messagebox.showerror("删除失败", str(exc), parent=dialog)
             return
         refresh()
+        if callable(on_changed):
+            on_changed()
 
     ttk.Button(
         actions, text="＋ 记录采购食材", style="Settings.TButton",

@@ -321,30 +321,42 @@ class GradientHero(tk.Canvas):
         show_profit = self.shell.hero_profit_mode
         if show_profit:
             profit = data["profit"] if data else None
-            jpy_summary = profit["currencies"].get("JPY", {}) if profit else {}
-            amount = jpy_summary.get("net_minor") if profit else None
-            cny_summary = profit["currencies"].get("CNY", {}) if profit else {}
-            cny_amount = cny_summary.get("net_minor") if profit else None
-            cny_jpy_amount = cny_summary.get("jpy_equivalent_net_minor") if profit else None
-            cny_missing_rates = int(cny_summary.get("missing_jpy_conversion_count", 0)) if profit else 0
-            title = translate("当期纯利润 · JPY", self.shell.locale)
-            subtitle = translate("人民币净利润", self.shell.locale) + " · " + self.shell.money(
-                cny_amount, "CNY", mask_key="period-profit-cny"
+            base_summary = profit.get("base_equivalent", {}) if profit else {}
+            base_currency = str(base_summary.get("currency") or "JPY")
+            amount = base_summary.get("net_minor") if profit else None
+            title = translate("当期纯利润 · {currency}", self.shell.locale).format(
+                currency=base_currency
             )
-            if cny_missing_rates:
-                subtitle += "（" + translate("汇率不全", self.shell.locale) + "）"
-            else:
-                subtitle += "（≈ " + self.shell.money(
-                    cny_jpy_amount, "JPY", mask_key="period-profit-cny-jpy"
-                ) + "）"
-            amount_mask_key = "period-profit-jpy"
+            foreign_profit = []
+            for code, summary in sorted((profit or {}).get("currencies", {}).items()):
+                if code == base_currency or not int(summary.get("net_minor", 0)):
+                    continue
+                foreign_profit.append(
+                    f"{code} {self.shell.money(summary['net_minor'], code, mask_key='period-profit-foreign:'+code)}"
+                )
+            subtitle = (
+                translate("外币净利润", self.shell.locale) + " · " + " / ".join(foreign_profit)
+                if foreign_profit else ""
+            )
+            amount_mask_key = "period-profit-base"
         else:
             balance = data["balance"] if data else None
-            amount = None if balance is None else balance["net_assets"].get("JPY", 0)
-            cny_amount = None if balance is None else balance["net_assets"].get("CNY", 0)
-            title = translate("总净资产 · JPY", self.shell.locale)
-            subtitle = translate("人民币资产独立核算", self.shell.locale) + " · " + self.shell.money(
-                cny_amount, "CNY", mask_key="cny-assets"
+            base_summary = balance.get("base_equivalent", {}) if balance else {}
+            base_currency = str(base_summary.get("currency") or "JPY")
+            amount = base_summary.get("net_assets_minor") if balance else None
+            title = translate("主要记账货币资产 · {currency}", self.shell.locale).format(
+                currency=base_currency
+            )
+            foreign_assets = []
+            for code, value in sorted((balance or {}).get("net_assets", {}).items()):
+                if code == base_currency or not int(value):
+                    continue
+                foreign_assets.append(
+                    f"{code} {self.shell.money(value, code, mask_key='foreign-assets:'+code)}"
+                )
+            subtitle = (
+                translate("外币净资产", self.shell.locale) + " · " + " / ".join(foreign_assets)
+                if foreign_assets else ""
             )
             amount_mask_key = "net-assets"
         self.create_text(24, 20, anchor="nw", text=title,
@@ -572,7 +584,7 @@ class DesktopShell:
         self.nav_buttons = {}
         for index, (page, title) in enumerate((
             ("home", "总览"), ("entry", "记录"), ("ledger", "账单"),
-            ("assets", "资产"), ("more", "更多"),
+            ("assets", "余额"), ("more", "更多"),
         )):
             button = ttk.Button(self.navigation, text="  "+translate(title), width=11, compound="left",
                                 style="Dock.TButton", command=lambda value=page: self.navigate(value))
@@ -607,11 +619,16 @@ class DesktopShell:
         self.favorite_list.grid(row=7, column=0, sticky="new")
         self.navigation.rowconfigure(8, weight=1)
         ttk.Separator(self.navigation).grid(row=9, column=0, sticky="ew", pady=(10, 8))
+        self.sidebar_tutorial_button = ttk.Button(
+            self.navigation, text=translate("新手教程", self.locale), style="Dock.TButton",
+            command=self.app.open_desktop_tutorial,
+        )
+        self.sidebar_tutorial_button.grid(row=10, column=0, sticky="ew", pady=(0, 5))
         self.sidebar_settings_button = ttk.Button(
             self.navigation, text=translate("⚙  设置", self.locale), style="Dock.TButton",
-            command=self.app.open_settings,
+            command=lambda: self.app.open_settings("通用设置"),
         )
-        self.sidebar_settings_button.grid(row=10, column=0, sticky="ew")
+        self.sidebar_settings_button.grid(row=11, column=0, sticky="ew")
         self.nav_icons = {}
         self.update_icons()
         self._render_favorites()
@@ -947,6 +964,17 @@ class DesktopShell:
         title.grid(row=0, column=0, sticky="w", padx=(0, 24))
         drag_area = ttk.Frame(top, style="Surface.TFrame")
         drag_area.grid(row=0, column=1, sticky="nsew")
+        style = ttk.Style(self.root)
+        style.configure(
+            "CloudStatus.TLabel",
+            background=PALETTE["surface"],
+            foreground="#667085",
+            font=(self.family, 9),
+        )
+        self.cloud_status_label = ttk.Label(
+            top, text=translate("● 云端未连接", self.locale), style="CloudStatus.TLabel"
+        )
+        self.cloud_status_label.grid(row=0, column=2, sticky="ns", padx=(4, 10))
         for target in (top, title, drag_area):
             self.window_frame.bind_drag(target)
         def caption_icon(column, text, command, tooltip, hover_style="CaptionIconHover.TLabel"):
@@ -967,14 +995,17 @@ class DesktopShell:
             Tooltip(icon, tooltip)
             return icon
 
-        caption_icon(2, "🔄", self.app.restart_application, lambda: translate("重启软件", self.locale))
-        caption_icon(3, "−", self.root.iconify, "最小化")
+        caption_icon(3, "🔄", self.app.restart_application, lambda: translate("重启软件", self.locale))
+        caption_icon(4, "−", self.root.iconify, "最小化")
         caption_icon(
-            4, "□", self.window_frame.maximize,
+            5, "□", self.window_frame.maximize,
             lambda: translate("还原窗口", self.locale)
             if self.root.state() == "zoomed" else translate("最大化", self.locale),
         )
-        caption_icon(5, "×", self.app.close, "关闭窗口", "CaptionCloseHover.TLabel")
+        caption_icon(6, "×", self.app.close, "关闭窗口", "CaptionCloseHover.TLabel")
+
+    def set_cloud_status(self, text, foreground):
+        self.cloud_status_label.configure(text=text, foreground=foreground)
 
     def _scroll_page(self, page, parent):
         parent.columnconfigure(0, weight=1)
@@ -1132,7 +1163,7 @@ class DesktopShell:
             return self.mask(mask_key)
         if value is None:
             return "—"
-        return minor_to_text(int(value), 2 if currency == "CNY" else 0, currency)
+        return minor_to_text(int(value), 2 if currency in {"CNY", "USD"} else 0, currency)
 
     def toggle_hidden(self):
         self.hidden = not self.hidden
@@ -1177,7 +1208,7 @@ class DesktopShell:
         position = self.canvases[page].yview()[0]
         for child in body.winfo_children():
             child.destroy()
-        self.heading(body, {"home":"总览", "ledger":"账单", "assets":"资产", "more":"更多"}[page])
+        self.heading(body, {"home":"总览", "ledger":"账单", "assets":"余额", "more":"更多"}[page])
         if self.error:
             card = self.card(body)
             card.pack(fill="x", pady=(0,12))
@@ -1196,7 +1227,9 @@ class DesktopShell:
         metrics.columnconfigure(2,weight=2,uniform="metrics")
         data = self.snapshot
         profit = data["profit"] if data else None
-        summary = profit["jpy_equivalent"] if profit else {}
+        summary = profit.get("base_equivalent", {}) if profit else {}
+        base_currency = str(summary.get("currency") or "JPY")
+        jpy_summary = profit.get("jpy_equivalent", {}) if profit else {}
         small_cards=[]
         for column, title, key, tone, note in (
             (0,"本期支出","expense_minor",PALETTE["expense"], (profit["start"]+" — "+profit["through"]) if profit else ""),
@@ -1206,7 +1239,7 @@ class DesktopShell:
             card.grid(row=0,column=column,sticky="nsew",padx=(0,14))
             small_cards.append(card)
             self.label(card.body,title,10,"muted").pack(anchor="w")
-            self.label(card.body,self.money(summary.get(key),mask_key=key),18,tone,True).pack(anchor="w",pady=(12,10))
+            self.label(card.body,self.money(summary.get(key),base_currency,mask_key=key),18,tone,True).pack(anchor="w",pady=(12,10))
             text = self.label(card.body,note,9,"muted")
             text.configure(wraplength=225)
             text.pack(anchor="w")
@@ -1232,7 +1265,8 @@ class DesktopShell:
         self.label(row,"预算，还剩",12,bold=True).pack(side="left")
         ttk.Button(row,text="›",width=3,style="Surface.Settings.TButton",command=self.app.open_savings_plan).pack(side="right")
         budget = int(data["settings"].get("monthly_jpy_budget_minor", "0")) if data else 0
-        expense = int(summary.get("expense_minor",0))
+        # The current-period budget is intentionally still denominated in JPY.
+        expense = int(jpy_summary.get("expense_minor", 0))
         self.label(budget_card.body,self.money(budget-expense,mask_key="budget-remaining") if data else "—",20,bold=True).pack(anchor="w",pady=(14,14))
         percent = max(0,min(100,expense*100//budget)) if budget>0 else 0
         RoundedProgressBar(budget_card.body, percent / 100, height=8,

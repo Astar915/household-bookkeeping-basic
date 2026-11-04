@@ -1,4 +1,27 @@
-# 家庭记账完整手机网页云端版
+# 家庭记账「网页版」
+
+用户已指定 Python Worker + D1 作为唯一正式网页版。**后续网页版功能修改和发布都以 `python-d1/` 为目标**；稳定访问地址为 [网页版](https://household-bookkeeping-python-d1-stage.household-bookkeeping-cloud-test.workers.dev/)。桌面程序继续作为独立本地版本。
+
+## 正式网页版部署目标
+
+- API 与账本数据：`python-d1/`，Cloudflare Python Worker + D1。
+- 后台任务：`python-d1/workflow/`，Cloudflare Workflows。
+- 页面文件：`public/`。未来网页版的修改直接更新这里和 `python-d1/`；不要从桌面目录自动同步或覆盖网页源文件。
+- 正式 Wrangler 配置：`python-d1/wrangler.web.jsonc` 和 `python-d1/workflow/wrangler.web.jsonc`。
+- 旧的密码简化 Worker 不再作为产品版本。移除 Worker 时保留其 D1 数据库，避免误删账本或配置。
+- 正式网页版只用 D1，目前没有 R2 绑定或 R2 存储需求；不要为它启用 R2。
+
+根目录的 `wrangler.jsonc` 是尚需 Workers Paid 的 Container 旧方案，**不要用它发布网页版**。新版 Python+D1 不依赖 Container。Cloudflare 已确认本账号为 Workers Free；目前网页版使用免费计划默认 CPU 限制，不要升级到 Workers Paid，也不要部署 Container。
+
+发布顺序：先用 `python-d1/wrangler.web.jsonc` 检查并应用 D1 迁移，再用 `python-d1/workflow/wrangler.web.jsonc` 发布后台 Worker，最后从 `python-d1/` 用 `pywrangler deploy --config wrangler.web.jsonc` 发布网页版 API。部署命令不会更改 MVP D1 数据库。
+
+## Container 旧方案说明
+
+以下 Container 实现仅作为技术参考保留，不是网页版的后续更新目标。它依赖 Cloudflare Workers Paid 与容器用量，不要因其文件仍在仓库中而部署或升级套餐。
+
+---
+
+## Container 旧方案架构
 
 此目录复用 `bookkeeping/web_static/` 的完整手机 PWA 和原有 Python Web API。GitHub 登录、桌面 GitHub 备份恢复、自然语言双 Agent、账户、流水、预算、报表、信用卡、固定资产、饮食、收据及离线队列继续使用原实现。
 
@@ -12,19 +35,7 @@ Cloudflare Worker 负责 HTTPS 与静态网页；Durable Object 将请求串行�
 - Cloudflare 的预算提醒只发送通知，不会自动暂停服务。此应用保护不限制 Workers Paid 或容器本身的费用。
 - 云端版暂不把识图记账的原图归档到服务器，也不把已有小票图片打进 GitHub/Gitee 同步包；识图仍可临时发送给你自己配置的视觉模型。已存在的图片不会自动删除，仍可能包含在 R2 的完整账本快照内。
 
-## 本机检查
-
-需要 Docker Desktop、Node.js、Cloudflare Wrangler 和 Python 3.13 镜像构建环境。发布前先从桌面端同步最新手机界面，再构建容器：
-
-```powershell
-pnpm install
-pnpm sync:pwa
-pnpm exec wrangler login
-pnpm exec wrangler r2 bucket create household-bookkeeping-cloud-ledger --location apac
-pnpm exec wrangler dev
-```
-
-容器在本地由 Wrangler/Docker 启动；部署 Cloudflare Containers 需要 Workers Paid（官方基础计划为每月 5 美元，超出套餐包含量后按实际用量计费）。正式部署使用当前 Worker 名称，会替换简化测试版的网页/API；原 D1 测试数据不删除。先在本地和部署预览验证后再切换线上站点。
+旧 Container 方案依赖 Docker、Workers Paid 和 R2。其历史发布步骤已停用；用户已指定免费计划上的 Python+D1 为正式网页版，因此不要部署这个旧方案、创建 R2 资源或更改套餐。
 
 ## 数据安全
 
@@ -32,4 +43,4 @@ pnpm exec wrangler dev
 - 恢复归档会限制文件类型、路径和展开大小；容器仅接受 Worker 内部随机令牌控制的初始化/导出请求。
 - 用户的账本、同步配置、票据、技能和加密后的模型配置都保存在每次云快照内。模型 API 密钥不会写入开源代码或桌面 GitHub 同步包。
 - 容器休眠或重新部署时从 R2 恢复；若云端快照失败，接口会返回 `X-Bookkeeping-Cloud-Saved: false`，网页显示提醒。
-- `pnpm sync:pwa` 从桌面程序的 `bookkeeping/web_static/` 同步全部 PWA 文件，避免网页与桌面版的手机界面逐渐分叉。
+- Container 旧方案曾从桌面程序同步 PWA；此同步路径已不再用于「网页版」，避免改动或覆盖桌面版本。

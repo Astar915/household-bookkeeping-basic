@@ -123,7 +123,7 @@ def _normalize_plan_categories(plan: dict[str, int], ledger_categories: set[str]
 
 
 def _draw_line_chart(canvas: tk.Canvas, values: list[int], labels: list[str], font_family: str) -> None:
-    """Draw compact daily/monthly bars and retain hit points for hover details."""
+    """Draw daily/monthly spending as a line and retain points for hover details."""
     canvas.delete("all")
     canvas._chart_points = []
     width = max(120, canvas.winfo_width())
@@ -165,7 +165,6 @@ def _draw_line_chart(canvas: tk.Canvas, values: list[int], labels: list[str], fo
         count = len(values)
         x_span = right - left
         slot_width = x_span / max(1, count)
-        bar_width = max(3.0, min(22.0, slot_width * 0.78))
         points: list[tuple[float, float]] = []
         for index, value in enumerate(values):
             x = left + slot_width * (index + 0.5)
@@ -175,19 +174,20 @@ def _draw_line_chart(canvas: tk.Canvas, values: list[int], labels: list[str], fo
             (x, y, int(values[index]), labels[index] if index < len(labels) else str(index + 1))
             for index, (x, y) in enumerate(points)
         ]
+        for first, second in zip(points, points[1:]):
+            draw_line((first[0], first[1], second[0], second[1]), color("#3976b8"), 3)
+        point_radius = 4
         for x, y in points:
-            bounds = (
-                round((x - bar_width / 2) * scale),
-                round(y * scale),
-                round((x + bar_width / 2) * scale),
-                round(bottom * scale),
-            )
             if drawing is not None:
-                drawing.rounded_rectangle(bounds, radius=2 * scale, fill=color("#3976b8"))
+                bounds = (
+                    round((x - point_radius) * scale), round((y - point_radius) * scale),
+                    round((x + point_radius) * scale), round((y + point_radius) * scale),
+                )
+                drawing.ellipse(bounds, fill=color("#3976b8"), outline=color("#ffffff"), width=2 * scale)
             else:
-                canvas.create_rectangle(
-                    x - bar_width / 2, y, x + bar_width / 2, bottom,
-                    fill=color("#3976b8"), outline="",
+                canvas.create_oval(
+                    x - point_radius, y - point_radius, x + point_radius, y + point_radius,
+                    fill=color("#3976b8"), outline=color("#ffffff"), width=2,
                 )
 
     if image is not None and ImageTk is not None:
@@ -205,7 +205,7 @@ def _draw_line_chart(canvas: tk.Canvas, values: list[int], labels: list[str], fo
         y = bottom - (bottom - top) * tick / 4
         canvas.create_text(
             left - 9, y, text=f"{int(value):,}", fill=color("#667085"),
-            anchor="e", font=(font_family, 9),
+            anchor="e", font=(font_family, 11),
         )
     label_count = min(6, len(values))
     for tick in range(label_count):
@@ -213,7 +213,7 @@ def _draw_line_chart(canvas: tk.Canvas, values: list[int], labels: list[str], fo
         x = left + ((right - left) * index / max(1, len(values) - 1))
         canvas.create_text(
             x, bottom + 20, text=labels[index], fill=color("#667085"),
-            anchor="n", font=(font_family, 9),
+            anchor="n", font=(font_family, 11),
         )
 
 
@@ -286,11 +286,11 @@ def _draw_pie_chart(
         amount_label = f"{amount / total:.0%}  {minor_to_text(amount, 0, 'JPY')}"
         canvas.create_text(
             legend_x + 17, y + 8, text=short_name, fill=color("#344054"),
-            anchor="w", font=(font_family, 10),
+            anchor="w", font=(font_family, 11),
         )
         canvas.create_text(
             width - 8, y + 8, text=amount_label, fill=color("#667085"),
-            anchor="e", font=(font_family, 9),
+            anchor="e", font=(font_family, 10),
         )
 
 
@@ -301,6 +301,7 @@ def open_savings_plan(
     *,
     container: tk.Misc | None = None,
     database_lock: Any = None,
+    on_changed: Any = None,
 ) -> None:
     if container is None:
         dialog = tk.Toplevel(parent)
@@ -450,7 +451,7 @@ def open_savings_plan(
             return
         _build_savings_plan_loaded(
             parent, database_path, font_family, container=layout_parent,
-            database_lock=database_lock, _loaded_data=data,
+            database_lock=database_lock, on_changed=on_changed, _loaded_data=data,
         )
 
     try:
@@ -466,6 +467,7 @@ def _build_savings_plan_loaded(
     *,
     container: tk.Misc | None = None,
     database_lock: Any = None,
+    on_changed: Any = None,
     _loaded_data: dict[str, Any],
 ) -> None:
     today = _loaded_data["today"]
@@ -554,14 +556,14 @@ def _build_savings_plan_loaded(
     ).pack(side="left", padx=(3, 0))
     plot_area = ttk.Frame(trend_frame)
     plot_area.grid(row=1, column=0, sticky="nsew")
-    trend_canvas = tk.Canvas(plot_area, bg=color("#ffffff"), highlightthickness=0, height=260)
+    trend_canvas = tk.Canvas(plot_area, bg=color("#ffffff"), highlightthickness=0, height=290)
     trend_canvas.pack(fill="both", expand=True)
     trend_empty = ttk.Label(plot_area, text="所选期间暂无已入账消费", style="Hint.TLabel")
     category_frame = ttk.LabelFrame(left, text="消费类别", padding=8)
     category_frame.grid(row=4, column=0, sticky="nsew")
     category_frame.columnconfigure(0, weight=1)
     category_frame.rowconfigure(0, weight=1)
-    actual_pie_canvas = tk.Canvas(category_frame, bg=color("#ffffff"), highlightthickness=0, height=230)
+    actual_pie_canvas = tk.Canvas(category_frame, bg=color("#ffffff"), highlightthickness=0, height=280)
     actual_pie_canvas.grid(row=0, column=0, sticky="nsew")
     actual_pie_empty = ttk.Label(category_frame, text="本期暂无分类支出", style="Hint.TLabel")
 
@@ -672,7 +674,7 @@ def _build_savings_plan_loaded(
     plan_frame.grid(row=2, column=0, sticky="nsew")
     plan_frame.columnconfigure(0, weight=1)
     plan_frame.rowconfigure(0, weight=1)
-    plan_pie_canvas = tk.Canvas(plan_frame, bg=color("#ffffff"), highlightthickness=0, height=300)
+    plan_pie_canvas = tk.Canvas(plan_frame, bg=color("#ffffff"), highlightthickness=0, height=330)
     plan_pie_canvas.grid(row=0, column=0, sticky="nsew")
     plan_pie_empty = ttk.Label(plan_frame, text=translate("添加类别预算后显示预算分配"), style="Hint.TLabel")
 
@@ -789,6 +791,8 @@ def _build_savings_plan_loaded(
             plan.update(previous_plan)
             refresh_plan()
             messagebox.showerror("无法保存", f"{translate('类别预算保存失败：')}{error}", parent=dialog)
+        elif callable(on_changed):
+            on_changed()
 
     def persist_plan(previous_plan: dict[str, int]) -> bool:
         if save_state["running"]:
@@ -1060,7 +1064,7 @@ def _build_savings_plan_loaded(
             text=f"{label} 消费：{amount:,} JPY",
             anchor="sw",
             fill=color("#1d2939"),
-            font=(font_family, 9),
+            font=(font_family, 11),
             tags=("trend-hover-tooltip",),
         )
         bounds = trend_canvas.bbox(text_id)

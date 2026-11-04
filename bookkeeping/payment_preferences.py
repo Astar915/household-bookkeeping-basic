@@ -225,7 +225,7 @@ class PaymentPromptStore:
             currency = currency.strip().upper()
             if currency in {"不限", "ANY", "ALL"}:
                 currency = ""
-            if currency not in {"", "JPY", "CNY"}:
+            if currency not in {"", "JPY", "CNY", "USD"}:
                 raise ValueError("profile currency is unsupported")
             if not method:
                 raise ValueError("payment method cannot be empty")
@@ -339,8 +339,8 @@ class PaymentPromptStore:
                 currency = str(profile.get("currency") or "").strip().upper()
                 if currency in {"不限", "ANY", "ALL"}:
                     currency = ""
-                if currency not in {"", "JPY", "CNY"}:
-                    raise PaymentPromptSettingsError("适用币种只能选择不限、JPY或CNY。")
+                if currency not in {"", "JPY", "CNY", "USD"}:
+                    raise PaymentPromptSettingsError("适用币种只能选择不限、JPY、CNY或USD。")
                 cleaned_profile["currency"] = currency
             if "account_order" in profile:
                 raw_order = profile.get("account_order")

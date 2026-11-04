@@ -184,6 +184,21 @@ def build_balance_sheet(database: Database, as_of: str | date) -> dict[str, Any]
             ),
         })
 
+    base_currency = database.get_base_currency()
+    base_equivalent = {
+        "currency": base_currency,
+        "minor_digits": int(database.currency(base_currency)["minor_digits"]),
+        # Keep the asset headline in its native currency. Foreign currencies
+        # remain visible as separate subtotals below the headline.
+        "assets_minor": int(assets.get(base_currency, 0)),
+        "bank_deposits_minor": int(deposits.get(base_currency, 0)),
+        "known_liabilities_minor": int(known_liabilities.get(base_currency, 0)),
+        "estimated_liabilities_minor": int(estimated_liabilities.get(base_currency, 0)),
+        "net_assets_minor": int(assets.get(base_currency, 0))
+        - int(known_liabilities.get(base_currency, 0))
+        - int(estimated_liabilities.get(base_currency, 0)),
+        "missing_conversion_count": 0,
+    }
     return {
         "as_of": as_of_date.isoformat(),
         "assets": assets,
@@ -196,6 +211,10 @@ def build_balance_sheet(database: Database, as_of: str | date) -> dict[str, Any]
             - int(estimated_liabilities.get(code, 0))
             for code in monetary_codes
         },
+        "currency_minor_digits": {
+            code: int(database.currency(code)["minor_digits"]) for code in monetary_codes
+        },
+        "base_equivalent": base_equivalent,
         "unknown_liability_count": unknown_liability_count,
         "points_total": points_total,
         "rows": rows,
@@ -211,11 +230,12 @@ def _completeness_label(value: str) -> str:
 
 
 def build_profit_statement(database: Database, as_of: str | date) -> dict[str, Any]:
-    """Summarize native-currency activity and a transaction-date JPY total."""
+    """Summarize native-currency activity and transaction-date totals in the main currency."""
     as_of_date = parse_date(as_of) if isinstance(as_of, str) else as_of
     start, end = billing_cycle(as_of_date, database.get_billing_cycle_start_day())
     through = min(end, as_of_date)
     rows = database.report_rows(start.isoformat(), through.isoformat())
+    base_currency = database.get_base_currency()
     currency_codes = {row["currency"] for row in rows}
     currency_codes.add("JPY")
     summaries: dict[str, dict[str, Any]] = {}
@@ -228,6 +248,14 @@ def build_profit_statement(database: Database, as_of: str | date) -> dict[str, A
     missing_jpy_conversion_count = 0
     currency_jpy_net: dict[str, int] = defaultdict(int)
     currency_missing_jpy_conversion: dict[str, int] = defaultdict(int)
+    base_income = 0
+    base_expense = 0
+    base_posted_expense = 0
+    base_memo_expense = 0
+    base_needs_review_expense = 0
+    base_categories: dict[str, int] = defaultdict(int)
+    base_missing_conversion_count = 0
+    exchange_cache: dict[tuple[str, str], Any] = {}
 
     for code in sorted(currency_codes):
         currency_rows = [row for row in rows if row["currency"] == code]
@@ -264,20 +292,57 @@ def build_profit_statement(database: Database, as_of: str | date) -> dict[str, A
         else:
             missing_jpy_conversion_count += 1
             currency_missing_jpy_conversion[str(row["currency"])] += 1
-            continue
+            equivalent = None
+        if equivalent is not None:
+            if row["kind"] == "income":
+                jpy_income += equivalent
+                currency_jpy_net[str(row["currency"])] += equivalent
+            elif row["kind"] == "expense":
+                jpy_expense += equivalent
+                currency_jpy_net[str(row["currency"])] -= equivalent
+                jpy_categories[row["category_name"] or "未分类"] += equivalent
+                if row["balance_effect"] == "posted":
+                    jpy_posted_expense += equivalent
+                else:
+                    jpy_memo_expense += equivalent
+                if bool(row["needs_review"]):
+                    jpy_needs_review_expense += equivalent
+
+        code = str(row["currency"])
+        amount = int(row["amount_minor"])
+        if code == base_currency:
+            base_amount = amount
+        else:
+            cache_key = (code, str(row["occurred_on"]))
+            try:
+                if cache_key not in exchange_cache:
+                    from .fx_rates import resolve_exchange_rate
+
+                    exchange_cache[cache_key] = resolve_exchange_rate(
+                        database, code, base_currency, str(row["occurred_on"])
+                    )
+                from .fx_rates import convert_minor_at_rate
+
+                base_amount = convert_minor_at_rate(
+                    amount,
+                    int(database.currency(code)["minor_digits"]),
+                    int(database.currency(base_currency)["minor_digits"]),
+                    exchange_cache[cache_key].rate,
+                )
+            except (ValueError, RuntimeError):
+                base_missing_conversion_count += 1
+                continue
         if row["kind"] == "income":
-            jpy_income += equivalent
-            currency_jpy_net[str(row["currency"])] += equivalent
+            base_income += base_amount
         elif row["kind"] == "expense":
-            jpy_expense += equivalent
-            currency_jpy_net[str(row["currency"])] -= equivalent
-            jpy_categories[row["category_name"] or "未分类"] += equivalent
+            base_expense += base_amount
+            base_categories[row["category_name"] or "未分类"] += base_amount
             if row["balance_effect"] == "posted":
-                jpy_posted_expense += equivalent
+                base_posted_expense += base_amount
             else:
-                jpy_memo_expense += equivalent
+                base_memo_expense += base_amount
             if bool(row["needs_review"]):
-                jpy_needs_review_expense += equivalent
+                base_needs_review_expense += base_amount
 
     for code, summary in summaries.items():
         summary["jpy_equivalent_net_minor"] = currency_jpy_net[code]
@@ -298,5 +363,17 @@ def build_profit_statement(database: Database, as_of: str | date) -> dict[str, A
             "net_minor": jpy_income - jpy_expense,
             "categories": dict(jpy_categories),
             "missing_conversion_count": missing_jpy_conversion_count,
+        },
+        "base_equivalent": {
+            "currency": base_currency,
+            "minor_digits": int(database.currency(base_currency)["minor_digits"]),
+            "income_minor": base_income,
+            "expense_minor": base_expense,
+            "posted_expense_minor": base_posted_expense,
+            "memo_expense_minor": base_memo_expense,
+            "needs_review_expense_minor": base_needs_review_expense,
+            "net_minor": base_income - base_expense,
+            "categories": dict(base_categories),
+            "missing_conversion_count": base_missing_conversion_count,
         },
     }

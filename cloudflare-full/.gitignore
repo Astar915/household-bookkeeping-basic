@@ -4,3 +4,6 @@ node_modules/
 coverage/
 wrangler.local.jsonc
 worker-configuration.d.ts
+wrangler.stage.local.jsonc
+.stage-secrets.local.json
+.workflow-stage-secret.local.json

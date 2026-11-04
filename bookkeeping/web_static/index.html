@@ -146,6 +146,22 @@
     </section>
   </main>
 
+  <dialog id="actionConfirmDialog" class="dialog-card confirm-dialog" aria-labelledby="actionConfirmTitle" aria-describedby="actionConfirmImpact">
+    <h2 id="actionConfirmTitle"></h2>
+    <p id="actionConfirmImpact"></p>
+    <div class="button-row confirm-actions">
+      <button id="actionConfirmCancel" type="button" class="button secondary">取消</button>
+      <button id="actionConfirmAccept" type="button" class="button primary">确认</button>
+    </div>
+  </dialog>
+  <dialog id="cloudProgressDialog" class="dialog-card cloud-progress-dialog" aria-labelledby="cloudProgressTitle" aria-describedby="cloudProgressDetail">
+    <span class="cloud-progress-spinner" aria-hidden="true"></span>
+    <div class="cloud-progress-copy" role="status" aria-live="polite">
+      <h2 id="cloudProgressTitle">正在处理…</h2>
+      <p id="cloudProgressDetail">请稍候，完成后会自动刷新。</p>
+    </div>
+    <button id="cloudProgressCancel" type="button" class="button secondary cloud-progress-cancel hidden" disabled>取消任务</button>
+  </dialog>
   <dialog id="recoveryDialog" class="dialog-card">
     <h2 data-i18n="saveRecovery">请保存账号恢复码</h2>
     <p data-i18n="recoveryExplain">恢复码只显示这一次。丢失密码且没有恢复码时，目前无法通过邮件找回。</p>

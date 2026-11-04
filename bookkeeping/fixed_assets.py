@@ -16,7 +16,9 @@ from .storage import Database, LedgerError, minor_to_text, to_minor
 from .ui_confirm import confirm_delete_once
 
 
-def open_fixed_asset_management(root: tk.Misc, database_path: Path) -> None:
+def open_fixed_asset_management(
+    root: tk.Misc, database_path: Path, *, on_changed: Any = None
+) -> None:
     # The Tk localization wrapper captures source labels and refreshes this
     # window if the application language changes.
     tr = lambda value: value
@@ -303,6 +305,8 @@ def open_fixed_asset_management(root: tk.Misc, database_path: Path) -> None:
                 return
             editor.destroy()
             refresh(saved_id)
+            if callable(on_changed):
+                on_changed()
 
         ttk.Button(button_row, text="取消", command=editor.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(button_row, text="保存", style="Send.TButton", command=save).pack(side="right")
@@ -374,6 +378,8 @@ def open_fixed_asset_management(root: tk.Misc, database_path: Path) -> None:
             messagebox.showerror(tr("更新失败"), str(exc), parent=dialog)
             return
         refresh(int(asset["id"]))
+        if callable(on_changed):
+            on_changed()
 
     def delete_selected() -> None:
         asset = selected_asset()
@@ -393,6 +399,8 @@ def open_fixed_asset_management(root: tk.Misc, database_path: Path) -> None:
             messagebox.showerror(tr("删除失败"), str(exc), parent=dialog)
             return
         refresh()
+        if callable(on_changed):
+            on_changed()
 
     ttk.Button(
         actions, text="＋ 登记固定资产", style="Settings.TButton",

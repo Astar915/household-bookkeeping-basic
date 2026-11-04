@@ -6,7 +6,7 @@ import re
 from typing import Any
 import unicodedata
 
-from .cash_management import CASH_ACCOUNTS
+from .cash_management import cash_currency_for_name
 from .credit_management import credit_card_overview
 from .storage import Database, LedgerError, format_account_amount, parse_date, to_minor_allow_zero
 from .localization import translate
@@ -32,13 +32,21 @@ def count_amount(text: str, *, bare_answer: bool = False) -> tuple[str | None, s
                  r"decrease(?:d)?\s+by|increase(?:d)?\s+by", normalized, re.IGNORECASE):
         return None, None
     number = r"(?P<amount>[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
-    unit = r"(?P<unit>人民币元|人民币|CNY|RMB|日元|JPY|円|元|块(?:钱)?|积分|積分|点|ポイント|points?)?"
+    unit = r"(?P<unit>人民币元|人民币|CNY|RMB|美元|美金|USD|US\$|\$|日元|JPY|円|元|块(?:钱)?|积分|積分|点|ポイント|points?)?"
     prefix = (r"(?:仅剩|僅剩|只剩|还剩|還剩|剩余|剩餘|剩下|剩|只有|实盘(?:余额)?|實盤(?:餘額)?|"
               r"实际(?:余额|额度)?|実際(?:の残高)?|盘点后(?:的)?(?:余额|额度)?|盤點後(?:的)?(?:餘額|額度)?|"
               r"盘点(?:余额|额度)|盤點(?:餘額|額度)|余额(?:盘点后)?|餘額(?:盤點後)?|"
               r"残高|利用可能額|available\s+credit|balance|调整到|調整到|调整成|調整成|校准到|校準到|校正为|校正為|改成|改为|改為)"
               r"\s*(?:仅剩|僅剩|只剩|还剩|還剩|剩余|剩餘|剩下|剩|调整到|調整到|调整成|調整成|改成|改为|改為|为|為|是|:|=|is|of)?\s*")
     matches = list(re.finditer(prefix + number + r"\s*" + unit, normalized, re.IGNORECASE))
+    usd_prefix_matches = list(re.finditer(
+        prefix + r"(?:美元|美金|USD|US\$|\$)\s*" + number,
+        normalized,
+        re.IGNORECASE,
+    ))
+    if not matches and len(usd_prefix_matches) == 1:
+        amount = usd_prefix_matches[0].group("amount").replace(",", "")
+        return (None, None) if amount.startswith("-") else (amount, "USD")
     if not matches and bare_answer:
         bare = re.fullmatch(r"\s*(?:为|為|是|改为|改成|is)?\s*" + number + r"\s*" + unit + r"[。.!！]?\s*", normalized, re.IGNORECASE)
         matches = [bare] if bare else []
@@ -50,7 +58,9 @@ def count_amount(text: str, *, bare_answer: bool = False) -> tuple[str | None, s
         return None, None
     unit_text = (match.group("unit") or "").casefold()
     currency = "CNY" if unit_text in {"人民币元", "人民币", "cny", "rmb"} else (
-        "JPY" if unit_text in {"日元", "jpy", "円", "积分", "積分", "点", "ポイント", "point", "points"} else None
+        "USD" if unit_text in {"美元", "美金", "usd", "us$", "$"} else (
+            "JPY" if unit_text in {"日元", "jpy", "円", "积分", "積分", "点", "ポイント", "point", "points"} else None
+        )
     )
     return amount, currency
 
@@ -117,13 +127,13 @@ def reconcile_named_balance(
         connection.execute("BEGIN IMMEDIATE")
         before_minor, _limit = current_balance()
         difference = counted_minor - before_minor
-        if difference and code == "CNY":
+        if difference and code != "JPY" and account["account_type"] != "points":
             # Network/cache access must not occur while holding a write lock.
             connection.rollback()
             from .fx_rates import resolve_jpy_rate
 
             try:
-                rate = resolve_jpy_rate(database, "CNY", date_text)
+                rate = resolve_jpy_rate(database, code, date_text)
             except (ValueError, RuntimeError) as exc:
                 raise LedgerError(str(exc)) from exc
             if connection.in_transaction:
@@ -136,7 +146,7 @@ def reconcile_named_balance(
         category_name = None
         if difference:
             group = "积分" if account["account_type"] == "points" else (
-                "现金" if account_name in CASH_ACCOUNTS.values() else "余额"
+                "现金" if cash_currency_for_name(database, account_name) else "余额"
             )
             kind = "income" if difference > 0 else "expense"
             category_name = f"{group}盘{'盈' if difference > 0 else '亏'}"
@@ -145,9 +155,9 @@ def reconcile_named_balance(
             counted_text = format_account_amount(counted_minor, digits, code, account["account_type"])
             subject = "可用额度" if is_credit else "余额"
             fx_values: tuple[Any, ...] = (None, None, None, None)
-            if code == "CNY":
+            if code != "JPY" and account["account_type"] != "points":
                 if rate is None:
-                    raise LedgerError("人民币余额调整缺少交易日JPY汇率，未修改余额。")
+                    raise LedgerError(f"{code}余额调整缺少交易日JPY汇率，未修改余额。")
                 from .fx_rates import convert_minor_to_jpy_minor
                 fx_values = (convert_minor_to_jpy_minor(abs(difference), digits, rate.rate),
                              format(rate.rate, "f"), rate.rate_date, rate.source)
@@ -173,6 +183,145 @@ def reconcile_named_balance(
             "currency": code, "minor_digits": digits, "before_minor": before_minor,
             "counted_minor": counted_minor, "difference_minor": difference,
             "category_name": category_name, "transaction_id": transaction_id}
+
+
+def record_credit_snapshot(
+    database: Database,
+    account_name: str,
+    limit_amount: str | int | Decimal,
+    available_amount: str | int | Decimal,
+    occurred_on: str,
+    note: str = "",
+    *,
+    include_difference: bool = False,
+) -> dict[str, Any]:
+    """Save a credit-limit snapshot and optionally post its debt difference to P&L."""
+    date_text = parse_date(occurred_on).isoformat()
+    account = database.account(account_name)
+    if account["account_type"] != "credit":
+        raise LedgerError("额度快照只能绑定信用卡账户")
+    currency = database.currency(str(account["currency"]))
+    code = str(currency["code"])
+    digits = int(currency["minor_digits"])
+    if date_text < str(account["opening_date"]):
+        raise LedgerError("快照日期早于信用卡的开户日期")
+    limit_minor = to_minor_allow_zero(limit_amount, code, digits)
+    available_minor = to_minor_allow_zero(available_amount, code, digits)
+    if available_minor > limit_minor:
+        raise LedgerError("可用额度不能高于总额度")
+    connection = database.connection
+    if connection.in_transaction:
+        raise LedgerError("账本正在执行其他写入，请稍后再录入快照。")
+
+    duplicate = connection.execute(
+        "SELECT 1 FROM credit_limit_snapshots WHERE account_id=? AND snapshot_date=?",
+        (int(account["id"]), date_text),
+    ).fetchone()
+    if duplicate:
+        raise LedgerError("每张信用卡每天只能保存一条手动额度快照。")
+
+    if include_difference:
+        later = connection.execute(
+            """SELECT 1 FROM transactions WHERE occurred_on>? AND balance_effect='posted'
+                 AND (account_id=? OR to_account_id=?)
+               UNION ALL SELECT 1 FROM credit_limit_snapshots WHERE account_id=? AND snapshot_date>?
+               UNION ALL SELECT 1 FROM credit_limit_recovery_points WHERE account_id=? AND snapshot_date>?
+               LIMIT 1""",
+            (date_text, int(account["id"]), int(account["id"]), int(account["id"]), date_text,
+             int(account["id"]), date_text),
+        ).fetchone()
+        if later:
+            raise LedgerError("快照日期之后已有信用卡流水或快照。请改用今天的日期，或先核对后续记录。")
+
+    target_debt_minor = limit_minor - available_minor
+    before_minor = database.account_balance_as_of(int(account["id"]), date_text)
+    difference = target_debt_minor - before_minor if include_difference else 0
+    rate = None
+    if difference and code != "JPY":
+        from .fx_rates import resolve_jpy_rate
+        try:
+            rate = resolve_jpy_rate(database, code, date_text)
+        except (ValueError, RuntimeError) as exc:
+            raise LedgerError(str(exc)) from exc
+        if connection.in_transaction:
+            connection.commit()
+
+    transaction_id = None
+    category_name = None
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        duplicate = connection.execute(
+            "SELECT 1 FROM credit_limit_snapshots WHERE account_id=? AND snapshot_date=?",
+            (int(account["id"]), date_text),
+        ).fetchone()
+        if duplicate:
+            raise LedgerError("每张信用卡每天只能保存一条手动额度快照。")
+        if include_difference:
+            later = connection.execute(
+                """SELECT 1 FROM transactions WHERE occurred_on>? AND balance_effect='posted'
+                     AND (account_id=? OR to_account_id=?)
+                   UNION ALL SELECT 1 FROM credit_limit_snapshots WHERE account_id=? AND snapshot_date>?
+                   UNION ALL SELECT 1 FROM credit_limit_recovery_points WHERE account_id=? AND snapshot_date>?
+                   LIMIT 1""",
+                (date_text, int(account["id"]), int(account["id"]), int(account["id"]), date_text,
+                 int(account["id"]), date_text),
+            ).fetchone()
+            if later:
+                raise LedgerError("快照日期之后已有信用卡流水或快照。请改用今天的日期，或先核对后续记录。")
+            before_minor = database.account_balance_as_of(int(account["id"]), date_text)
+            difference = target_debt_minor - before_minor
+
+        if difference:
+            kind = "expense" if difference > 0 else "income"
+            category_name = "余额盘亏" if difference > 0 else "余额盘盈"
+            category = database.category(category_name, kind)
+            before_text = format_account_amount(before_minor, digits, code, "credit")
+            target_text = format_account_amount(target_debt_minor, digits, code, "credit")
+            fx_values: tuple[Any, ...] = (None, None, None, None)
+            if code != "JPY":
+                if rate is None:
+                    raise LedgerError(f"{code}信用卡余额调整缺少交易日JPY汇率，未修改账本。")
+                from .fx_rates import convert_minor_to_jpy_minor
+                fx_values = (convert_minor_to_jpy_minor(abs(difference), digits, rate.rate),
+                             format(rate.rate, "f"), rate.rate_date, rate.source)
+            transaction_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+            cursor = connection.execute(
+                """INSERT INTO transactions
+                   (occurred_on,kind,amount_minor,currency,account_id,category_id,description,
+                    balance_effect,jpy_equiv_minor,fx_rate,fx_rate_date,fx_source,needs_review,source,created_at)
+                   VALUES (?,?,?,?,?,?,?,'posted',?,?,?,?,0,'balance_reconciliation',?)""",
+                (date_text, kind, abs(difference), code, int(account["id"]), category["id"],
+                 f"信用卡欠款调整：账面{before_text}，快照估算欠款{target_text}", *fx_values, transaction_time),
+            )
+            transaction_id = int(cursor.lastrowid)
+            database._record_credit_recovery_points([transaction_id])
+
+        snapshot_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor = connection.execute(
+            """INSERT INTO credit_limit_snapshots
+               (account_id,snapshot_date,limit_minor,available_minor,note,created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (int(account["id"]), date_text, limit_minor, available_minor, str(note or ""), snapshot_time),
+        )
+        snapshot_id = int(cursor.lastrowid)
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    return {
+        "snapshot_id": snapshot_id,
+        "account_name": account_name,
+        "snapshot_date": date_text,
+        "limit_minor": limit_minor,
+        "available_minor": available_minor,
+        "estimated_debt_minor": target_debt_minor,
+        "difference_minor": difference,
+        "category_name": category_name,
+        "transaction_id": transaction_id,
+        "currency": code,
+        "minor_digits": digits,
+    }
 
 
 def handle_balance_count(session: Any, text: str) -> str:

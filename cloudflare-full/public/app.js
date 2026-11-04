@@ -10,6 +10,39 @@ const WORDS = {
   }
 };
 
+for (const [language, messages] of Object.entries({
+  "zh-CN": {
+    syncNow: "立即上传", syncing: "正在上传…",
+    networkHint: "无法连接服务。新记录会保存在此设备，恢复网络后可点击“立即上传”。",
+    nothingToUpload: "账本已保存在云端，没有待上传记录。",
+    uploadWaiting: "正在检查云端账本，请稍候再上传。",
+    uploadConflict: "存在待处理的同步冲突，请先刷新并核对记录。",
+    uploadComplete: "上传完成，账本已保存到云端。",
+    uploadRefreshFailed: "记录已上传到云端，但页面刷新失败。请点击刷新核对，不要重复记账。",
+    uploadHint: "只上传本机待同步记录；不会覆盖整本云端账本。",
+  },
+  "ja-JP": {
+    syncNow: "今すぐアップロード", syncing: "アップロード中…",
+    networkHint: "サービスに接続できません。新しい記録はこの端末に保存され、再接続後に「今すぐアップロード」できます。",
+    nothingToUpload: "台帳はクラウドに保存済みです。アップロード待ちの記録はありません。",
+    uploadWaiting: "クラウド台帳を確認中です。完了後にアップロードしてください。",
+    uploadConflict: "未解決の同期競合があります。先に台帳を更新して記録を確認してください。",
+    uploadComplete: "アップロード完了。台帳をクラウドに保存しました。",
+    uploadRefreshFailed: "記録はクラウドに保存されましたが、画面を更新できません。再記帳せず、更新して確認してください。",
+    uploadHint: "端末で同期待ちの記録だけを送信します。クラウド台帳全体は上書きしません。",
+  },
+  "en-US": {
+    syncNow: "Upload now", syncing: "Uploading…",
+    networkHint: "The service is unavailable. New entries stay on this device; click Upload now after reconnecting.",
+    nothingToUpload: "Your ledger is already saved in the cloud. Nothing is waiting to upload.",
+    uploadWaiting: "The cloud ledger is being checked. Try uploading again in a moment.",
+    uploadConflict: "A sync conflict needs review. Refresh the ledger and check the pending entry first.",
+    uploadComplete: "Upload complete. Your ledger is saved in the cloud.",
+    uploadRefreshFailed: "The entry reached the cloud, but the page could not refresh. Refresh to verify it; do not enter it again.",
+    uploadHint: "Uploads only pending entries from this device; it does not replace the full cloud ledger.",
+  },
+})) Object.assign(WORDS[language], messages);
+
 const DB_NAME = "household-ledger-web-v1";
 const DB_VERSION = 1;
 let idb;
@@ -20,6 +53,10 @@ let runtimeConfig = {};
 let serverReachable = false;
 let cachedBootstrap = null;
 let sending = false;
+let pendingSyncCount = 0;
+let syncConflict = false;
+let syncRetryTimer = null;
+let syncRetryAttempt = 0;
 let selectedKind = "expense";
 let toastTimer;
 
@@ -35,14 +72,26 @@ function applyLanguage() {
   document.documentElement.lang = currentLanguage;
   document.title = WORDS[currentLanguage].appName;
   $$('[data-i18n]').forEach(node => { node.textContent = t(node.dataset.i18n); });
-  $("#languageSelect").value = currentLanguage;
-  $("#languageSelect").setAttribute("aria-label", currentLanguage === "ja-JP" ? "表示言語" : currentLanguage === "en-US" ? "Display language" : "显示语言");
+  const languageSelect = $("#languageSelect");
+  if (languageSelect) {
+    languageSelect.value = currentLanguage;
+    languageSelect.setAttribute("aria-label", currentLanguage === "ja-JP" ? "表示言語" : currentLanguage === "en-US" ? "Display language" : "显示语言");
+  }
+  const authLanguageSelect = $("#authLanguageSelect");
+  if (authLanguageSelect) {
+    authLanguageSelect.value = currentLanguage;
+    authLanguageSelect.setAttribute("aria-label", currentLanguage === "ja-JP" ? "表示言語" : currentLanguage === "en-US" ? "Display language" : "显示语言");
+    $("#authLanguageLabel").textContent = currentLanguage === "ja-JP" ? "表示言語" : currentLanguage === "en-US" ? "Language" : "界面语言";
+  }
+  const tutorialButton = $("#tutorialButton");
+  if (tutorialButton) tutorialButton.textContent = currentLanguage === "ja-JP" ? "チュートリアル" : currentLanguage === "en-US" ? "Tutorial" : "新手教程";
   $(".segmented").setAttribute("aria-label", currentLanguage === "ja-JP" ? "取引の種類" : currentLanguage === "en-US" ? "Transaction type" : "交易类型");
   $("#showCategoryForm").setAttribute("aria-label", currentLanguage === "ja-JP" ? "カテゴリを追加" : currentLanguage === "en-US" ? "Add category" : "添加类别");
   $("#accountForm [name=type]").innerHTML = ["bank","wallet","prepaid","transit","points","credit"].map(type => `<option value="${type}">${escapeHtml(WORDS[currentLanguage].accountTypes[type])}</option>`).join("");
   $("#exportLedger").textContent = currentLanguage === "ja-JP" ? "クラウド台帳をエクスポート" : currentLanguage === "en-US" ? "Export cloud ledger" : "导出云端账本";
   $("#transactionForm [name=description]").placeholder = currentLanguage === "zh-CN" ? "例如：超市买菜" : currentLanguage === "ja-JP" ? "例：スーパーで食材" : "e.g. groceries";
   if (cachedBootstrap) renderAll();
+  window.dispatchEvent(new CustomEvent("household-language-changed", {detail: {language: currentLanguage}}));
 }
 
 function escapeHtml(value) {
@@ -52,6 +101,11 @@ function escapeHtml(value) {
 function localizeServerError(message) {
   const source = String(message || "");
   if (currentLanguage === "zh-CN") return source;
+  if (/云端账本已更新|云端已有更新|云端版本冲突/.test(source)) {
+    return currentLanguage === "ja-JP"
+      ? "クラウド台帳に新しい変更があるため同期を停止しました。記録はこの端末に保持しています。台帳を更新して確認してください。"
+      : "A newer cloud change was found, so sync paused. The entry remains on this device. Refresh the ledger and review it.";
+  }
   const cloudErrors = {
     "本机有尚未同步的修改，已暂停自动下载；请先核对并上传或手动恢复。":["未同期の変更があるため自動取得を保留しました。確認後にアップロードするか、手動で復元してください。","Automatic download paused because local edits have not synced. Review and upload them, or restore manually."],
     "无法检查云端账本，请检查网络与云端授权。":["クラウド台帳を確認できません。接続と認証を確認してください。","Cannot check the cloud ledger. Check the connection and authorization."],
@@ -94,6 +148,34 @@ const cacheSet = (key, value) => idbRequest("cache", "readwrite", s => s.put(val
 const outboxAll = async () => (await idbRequest("outbox", "readonly", s => s.getAll())).filter(item => item.ownerId === currentUser?.id);
 const outboxDelete = opId => idbRequest("outbox", "readwrite", s => s.delete(opId));
 const outboxPut = operation => idbRequest("outbox", "readwrite", s => s.put(operation));
+function outboxMutate(opId, mutate) {
+  return new Promise((resolve,reject)=>{
+    const tx=idb.transaction("outbox","readwrite"),store=tx.objectStore("outbox"),request=store.get(opId);
+    let result=null;
+    request.onsuccess=()=>{
+      const item=request.result;
+      if(!item||item.ownerId!==currentUser?.id)return;
+      result=mutate(item);
+      if(result===null){store.delete(opId);result={removed:true};}else if(result)store.put(result);
+    };
+    tx.oncomplete=()=>resolve(result);
+    tx.onerror=()=>reject(tx.error||request.error);
+    tx.onabort=()=>reject(tx.error||request.error||new Error("本机待处理队列更新失败。"));
+  });
+}
+const outboxStartDispatch = opId => outboxMutate(opId,item=>({...item,dispatchStarted:true,dispatchStartedAt:item.dispatchStartedAt||new Date().toISOString(),error:""}));
+const outboxUndoDelete = async opId => (await outboxMutate(opId,item=>item.type==="pending_delete"&&!item.dispatchStarted?null:item))?.removed===true;
+const outboxUndoPendingAction = async opId => {
+  const queue=(await outboxAll()).sort((a,b)=>a.createdAt.localeCompare(b.createdAt));
+  if(queue.at(-1)?.opId!==opId)return false;
+  return (await outboxMutate(opId,item=>item.type==="pending_action"&&!item.dispatchStarted&&!item.serverAccepted?null:item))?.removed===true;
+};
+function scheduleSyncRetry() {
+  if(syncRetryTimer||!navigator.onLine)return;
+  const delay=Math.min(1000*2**syncRetryAttempt,30000);
+  syncRetryAttempt=Math.min(syncRetryAttempt+1,5);
+  syncRetryTimer=setTimeout(()=>{syncRetryTimer=null;void syncQueue();},delay);
+}
 
 function readCookie(name) {
   const prefix = `${name}=`;
@@ -135,6 +217,34 @@ function setAuthMessage(message, isError = false) {
   node.classList.toggle("error", isError);
 }
 
+function showCloudProgress(title, detail, {modal = true} = {}) {
+  const dialog = $("#cloudProgressDialog");
+  if (!dialog) { setAuthMessage(title); return; }
+  $("#cloudProgressTitle").textContent = title;
+  $("#cloudProgressDetail").textContent = detail;
+  dialog.classList.toggle("nonblocking", !modal);
+  const spinner = $("#cloudProgressDialog .cloud-progress-spinner");
+  if (spinner) spinner.dataset.state = "running";
+  const nextMode = modal ? "modal" : "nonblocking";
+  if (dialog.open && dialog.dataset.progressMode !== nextMode) dialog.close();
+  if (!dialog.open) {
+    if (modal) dialog.showModal();
+    else dialog.show();
+    dialog.dataset.progressMode = nextMode;
+  }
+}
+
+$("#cloudProgressDialog")?.addEventListener("cancel", event => event.preventDefault());
+
+function hideCloudProgress() {
+  const dialog = $("#cloudProgressDialog");
+  if (dialog?.open) dialog.close();
+  dialog?.classList.remove("nonblocking");
+  if (dialog) delete dialog.dataset.progressMode;
+  const cancel = $("#cloudProgressCancel");
+  if (cancel) { cancel.classList.add("hidden"); cancel.disabled = false; cancel.onclick = null; }
+}
+
 function showToast(message, error = false) {
   const node = $("#toast");
   node.textContent = message;
@@ -155,7 +265,46 @@ function updateTopbarLayout(isAuthenticated) {
   topbar.classList.toggle("is-authenticated", isAuthenticated);
 }
 
+const topbarForViewport = $(".topbar");
+if (topbarForViewport && "ResizeObserver" in window) {
+  const topbarHeightObserver = new ResizeObserver(() => {
+    document.documentElement.style.setProperty(
+      "--topbar-height",
+      `${Math.ceil(topbarForViewport.getBoundingClientRect().height)}px`,
+    );
+  });
+  topbarHeightObserver.observe(topbarForViewport);
+}
+
+function renderSessionStatus() {
+  const text = (zh,ja,en) => currentLanguage === "ja-JP" ? ja : currentLanguage === "en-US" ? en : zh;
+  $("#sessionIdentity").textContent = currentUser
+    ? text("已登录：", "ログイン中：", "Signed in: ") + (currentUser.username || "")
+    : text("正在恢复安全会话", "安全なセッションを確認中", "Restoring your secure session");
+  $("#sessionWelcome").textContent = currentUser
+    ? text("欢迎回来", "おかえりなさい", "Welcome back")
+    : text("正在打开家庭记账", "家計簿を開いています", "Opening your ledger");
+  $("#sessionLoadingText").textContent = cloudBootstrapFailed
+    ? text("网页仍保持登录。以下提示仅涉及 GitHub 备份，不需要重新注册或创建账本。", "Web版にはログイン済みです。以下はGitHubバックアップの状態であり、新規登録や台帳作成は不要です。", "You are still signed in. The message below concerns your GitHub backup; no new account or ledger is needed.")
+    : currentUser
+      ? text("正在打开你的账本，请稍候。", "台帳を開いています。しばらくお待ちください。", "Opening your ledger. Please wait.")
+      : text("正在检查此浏览器的登录状态，请稍候。", "このブラウザーのログイン状態を確認しています。", "Checking this browser's saved session. Please wait.");
+}
+
+function showSessionPending(blocked = false) {
+  $("#authScreen").classList.add("hidden");
+  $("#appScreen").classList.add("hidden");
+  $("#toolbar").classList.add("hidden");
+  $("#sessionScreen").classList.remove("hidden");
+  $("#cloudBootstrapBlocked").classList.toggle("hidden", !blocked);
+  $("#sessionLoadingIndicator").classList.toggle("hidden", blocked);
+  renderSessionStatus();
+  updateTopbarLayout(false);
+}
+
 function showLoggedIn() {
+  cloudBootstrapFailed = false;
+  $("#sessionScreen").classList.add("hidden");
   $("#authScreen").classList.add("hidden");
   $("#appScreen").classList.remove("hidden");
   $("#toolbar").classList.remove("hidden");
@@ -165,10 +314,17 @@ function showLoggedIn() {
 }
 
 function showLoggedOut() {
+  $("#sessionScreen").classList.add("hidden");
   $("#authScreen").classList.remove("hidden");
   $("#appScreen").classList.add("hidden");
   $("#toolbar").classList.add("hidden");
   updateTopbarLayout(false);
+}
+
+function showCloudBootstrapBlocked(message) {
+  cloudBootstrapFailed = true;
+  showSessionPending(true);
+  $("#cloudBootstrapError").textContent = message;
 }
 
 function formatMinor(minor, currency, digits, accountType = "") {
@@ -187,7 +343,7 @@ function formatMinor(minor, currency, digits, accountType = "") {
 }
 
 function parseMinorPreview(input, currency) {
-  const digits = currency === "CNY" ? 2 : 0;
+  const digits = ["CNY","USD"].includes(currency) ? 2 : 0;
   const match = String(input || "").trim().match(digits ? /^(\d+)(?:\.(\d{0,2}))?$/ : /^(\d+)$/);
   if (!match) return 0;
   const whole = BigInt(match[1]);
@@ -204,11 +360,24 @@ function localDate() {
 
 function updateConnection() {
   const online = serverReachable && navigator.onLine;
-  $("#connectionState").textContent = online ? `● ${t("online")}` : `● ${t("offline")}`;
-  $("#connectionState").classList.toggle("is-offline", !online);
+  const state = !navigator.onLine ? "offline" : syncConflict ? "conflict" : sending ? "syncing" : window.backgroundBackupActive ? "backup" : window.cloudJobActive ? "working" : pendingSyncCount ? "pending" : online ? "online" : "offline";
+  const labels = {
+    "zh-CN": {online:"服务已连接",offline:"离线保存",syncing:"云端上传中…",backup:"云端备份中…",working:"云端处理中…",pending:`等待云端同步 ${pendingSyncCount} 条`,conflict:"同步冲突，需处理"},
+    "ja-JP": {online:"サービス接続中",offline:"オフライン保存",syncing:"クラウドへ同期中…",backup:"クラウドにバックアップ中…",working:"クラウドで処理中…",pending:`同期待ち ${pendingSyncCount} 件`,conflict:"同期の競合を確認してください"},
+    "en-US": {online:"Service connected",offline:"Saved offline",syncing:"Uploading to cloud…",backup:"Backing up to cloud…",working:"Processing in the cloud…",pending:`${pendingSyncCount} pending`,conflict:"Sync conflict needs attention"},
+  };
+  const status = $("#connectionState");
+  status.textContent = labels[currentLanguage]?.[state] || labels["zh-CN"][state];
+  status.dataset.state = state;
+  status.classList.toggle("is-offline", state === "offline");
+  status.classList.toggle("is-syncing", state === "syncing" || state === "backup" || state === "working");
+  status.classList.toggle("has-pending", state === "pending");
+  status.classList.toggle("has-conflict", state === "conflict");
   $("#offlineBanner").classList.toggle("hidden", online || !currentUser);
   $("#offlineBanner").textContent = t("networkHint");
   $("#syncButton").disabled = sending || !navigator.onLine;
+  $("#syncButton").textContent = sending ? t("syncing") : t("syncNow");
+  $("#syncButton").title = t("uploadHint");
 }
 
 function renderAll() {
@@ -223,7 +392,7 @@ async function localAccountsAndCategories() {
   const queue = await outboxAll();
   const optimisticAccounts = queue.filter(item => item.type === "account").map(item => ({
     id:`pending-${item.opId}`, name:item.data.name, type:item.data.type, currency:item.data.currency,
-    minorDigits:item.data.currency === "CNY" ? 2 : 0, openingDate:item.data.openingDate,
+    minorDigits:["CNY","USD"].includes(item.data.currency) ? 2 : 0, openingDate:item.data.openingDate,
     balanceMinor:parseMinorPreview(item.data.openingBalance,item.data.currency), pending:true
   }));
   const optimisticCategories = queue.filter(item => item.type === "category").map(item => ({name:item.data.name,kind:item.data.kind,display_name:item.data.name,pending:true}));
@@ -320,6 +489,9 @@ function renderTransactions() {
 
 async function renderOutbox() {
   const queue = (await outboxAll()).sort((a,b) => a.createdAt.localeCompare(b.createdAt));
+  pendingSyncCount = queue.length;
+  syncConflict = queue.some(item => item.conflict);
+  updateConnection();
   $("#pendingCount").textContent = String(queue.length);
   $("#syncSummary").textContent = queue.length ? t("pendingCount", {count:queue.length}) : "";
   const list = $("#outboxList");
@@ -330,99 +502,74 @@ async function renderOutbox() {
     const row = document.createElement("div"); row.className = "outbox-item";
     const main = document.createElement("div"); main.className = "outbox-main";
     const title = document.createElement("strong");
-    if (item.type === "transaction") title.textContent = `${item.data.date} · ${item.data.description} · ${item.data.amount} ${item.data.currency}`;
+    if (item.type === "prepared_agent") title.textContent = item.previewTitle || (currentLanguage === "ja-JP" ? "Agent の記帳" : currentLanguage === "en-US" ? "Agent entry" : "Agent 记账");
+    else if (item.type === "pending_delete") title.textContent = `${currentLanguage === "ja-JP" ? "削除待ち" : currentLanguage === "en-US" ? "Pending deletion" : "待删除"}: ${item.rowSnapshot?.description || item.data?.id || ""}`;
+    else if (item.type === "pending_action") title.textContent = item.displayLabel || (currentLanguage === "ja-JP" ? "台帳の変更" : currentLanguage === "en-US" ? "Ledger change" : "账本变更");
+    else if (item.type === "transaction") title.textContent = `${item.data.date} · ${item.data.description} · ${item.data.amount} ${item.data.currency}`;
     else if (item.type === "account") title.textContent = `${t("newAccount")}: ${item.data.name}`;
     else title.textContent = `${t("categoryName")}: ${item.data.name}`;
-    const detail = document.createElement("small"); detail.textContent = item.error ? t("syncError", {message:item.error}) : t("queued");
+    const detail = document.createElement("small");
+    if(item.type==="pending_action") detail.textContent=item.error
+      ? (item.serverAccepted ? (currentLanguage==="ja-JP"?"クラウド側の処理状態を確認中です。":currentLanguage==="en-US"?"Cloud task status is being checked.":"云端任务状态待确认；重试会继续同一任务。"):item.dispatchStarted?(currentLanguage==="ja-JP"?"送信結果を確認中です。同じ操作番号で再試行します。":currentLanguage==="en-US"?"Dispatch status is uncertain; retrying with the same operation ID.":"发送结果待确认；重试会沿用同一操作编号。"):"")+" "+item.error
+      : item.serverAccepted ? (currentLanguage==="ja-JP"?"クラウドが受け付けました。処理はサーバー側で続き、ページを閉じても中断しません。":currentLanguage==="en-US"?"Accepted by the cloud. Processing continues on the server if you close this page.":"云端已接收，任务会在服务器继续；关闭网页不会中断。")
+      : item.dispatchStarted ? (currentLanguage==="ja-JP"?"クラウドの受付を確認中です。確認中は取り消せません。":currentLanguage==="en-US"?"Checking whether the cloud accepted it. Undo is paused until confirmed.":"正在确认云端是否已接收，确认期间不能撤销。")
+      : (currentLanguage==="ja-JP"?"端末に保存済みです。クラウド受付前なら取り消せます。":currentLanguage==="en-US"?"Saved on this device. You can undo before cloud acceptance.":"已先保存在本机，正在等待云端接收；接收前可以撤销。");
+    else if(item.type==="pending_delete") detail.textContent=item.error
+      ? (item.serverAccepted ? (currentLanguage==="ja-JP"?"クラウド側の処理状態を確認中です。":currentLanguage==="en-US"?"Cloud task status is being checked.":"云端任务状态待确认；重试会继续同一任务。"):item.dispatchStarted?(currentLanguage==="ja-JP"?"送信結果を確認中です。同じ操作番号で再試行します。":currentLanguage==="en-US"?"Dispatch status is uncertain; retrying with the same operation ID.":"发送结果待确认；重试会沿用同一操作编号。"):"")+" "+item.error
+      : item.serverAccepted ? (currentLanguage==="ja-JP"?"クラウドが受け付けました。バックアップ後に削除します。":currentLanguage==="en-US"?"Accepted by the cloud. It will be backed up and deleted; closing this page will not stop it.":"云端已接收，将在备份后删除；关闭网页不影响任务继续。")
+      : item.dispatchStarted ? (currentLanguage==="ja-JP"?"送信結果を確認中です。確認中は取り消せません。":currentLanguage==="en-US"?"Checking dispatch status. Undo is paused until confirmed.":"正在确认云端是否已接收，确认期间不能撤销。")
+      : (currentLanguage==="ja-JP"?"送信待ちです。送信前なら取り消せます。":currentLanguage==="en-US"?"Waiting to send. You can undo before dispatch.":"等待发送；发送前可以撤销。");
+    else detail.textContent = item.error ? t("syncError", {message:item.error}) : t("queued");
     main.append(title,detail); row.append(main); list.append(row);
+    if(item.type==="pending_delete"&&!item.dispatchStarted){
+      const undo=document.createElement("button");undo.type="button";undo.className="button text-button";
+      undo.dataset.action="queue-undo-delete";undo.dataset.id=item.opId;
+      undo.textContent=currentLanguage==="ja-JP"?"取り消す":currentLanguage==="en-US"?"Undo":"撤销";
+      row.append(undo);
+    }
+    if(item.type==="pending_action"&&!item.dispatchStarted&&!item.serverAccepted&&queue.at(-1)?.opId===item.opId){
+      const undo=document.createElement("button");undo.type="button";undo.className="button text-button";
+      undo.dataset.action="queue-undo-action";undo.dataset.id=item.opId;
+      undo.textContent=currentLanguage==="ja-JP"?"取り消す":currentLanguage==="en-US"?"Undo":"撤销";
+      row.append(undo);
+    }
+    if(item.conflict&&item.type==="prepared_agent"){
+      const discard=document.createElement("button");discard.type="button";discard.className="button text-button";
+      discard.dataset.action="queue-discard";discard.dataset.id=item.opId;
+      discard.textContent=currentLanguage==="ja-JP"?"この端末の草稿を破棄":currentLanguage==="en-US"?"Discard local draft":"丢弃本机草稿";
+      row.append(discard);
+    }
   }
 }
 
 async function fetchBootstrap() {
+  if(typeof loadWorkspace==="function"){
+    const owner=currentUser?.id;
+    await loadWorkspace(true);
+    if(currentUser?.id!==owner)return;
+    if(workspaceError)throw new Error(workspaceError);
+    return;
+  }
+  const owner=currentUser?.id;if(!owner)return;
   const data = await api(`/api/bootstrap?lang=${encodeURIComponent(currentLanguage)}`);
+  if(currentUser?.id!==owner)return;
   cachedBootstrap = data;
-  await cacheSet(`bootstrap:${currentUser.id}`, data);
+  await cacheSet(`bootstrap:${owner}`, data);
   await renderAll();
 }
 
-let startupPullRunning = false;
-function chooseLoginLedger(text) {
-  return new Promise(resolve => {
-    const dialog = document.createElement("dialog");
-    dialog.className = "dialog-card";
-    const title = document.createElement("h2");
-    title.textContent = text("选择登录后的账本","ログイン後の台帳を選択","Choose the ledger after sign-in");
-    const description = document.createElement("p");
-    description.textContent = text("GitHub 已连接。下载云端账本会替换当前账本，恢复前会完整备份。保留本机后，自动下载将暂停，直到你手动从云端恢复。","GitHubに接続しました。クラウドの台帳を取得すると完全バックアップ後に台帳を置き換えます。保持を選ぶと手動で復元するまで自動取得を停止します。","GitHub is connected. Downloading the cloud ledger replaces this ledger after a full backup. Keeping local pauses automatic downloads until you manually restore from the cloud.");
-    const actions = document.createElement("div");
-    actions.className = "button-row";
-    const download = document.createElement("button"), keep = document.createElement("button");
-    download.type = keep.type = "button";
-    download.className = "button secondary"; keep.className = "button primary";
-    download.textContent = text("下载云端账本","クラウドの台帳を取得","Download cloud ledger");
-    keep.textContent = text("保留本机账本","この端末の台帳を保持","Keep local ledger");
-    let settled = false;
-    const finish = value => { if (settled) return; settled = true; dialog.close(); dialog.remove(); resolve(value); };
-    download.onclick = () => finish(true); keep.onclick = () => finish(false);
-    dialog.addEventListener("cancel", event => {event.preventDefault(); finish(false);});
-    dialog.addEventListener("close", () => finish(false));
-    actions.append(download,keep); dialog.append(title,description,actions); document.body.append(dialog);
-    dialog.showModal(); keep.focus();
-  });
-}
-async function pullCloudOnLogin() {
-  if (!currentUser || startupPullRunning) return "";
-  const owner = currentUser.id;
-  const text = (zh,ja,en) => currentLanguage === "ja-JP" ? ja : currentLanguage === "en-US" ? en : zh;
-  if ((await outboxAll()).length) return text("手机有离线待同步记录，已暂停自动下载。","未送信の記録があるため、自動ダウンロードを保留しました。","Automatic download is paused while this device has unsent entries.");
-  startupPullRunning = true;
-  setAuthMessage(text("正在检查云端最新账本…","クラウドの最新台帳を確認中…","Checking the latest cloud ledger…"));
-  try {
-    async function perform(action, data={}) {
-      let job = await api("/api/action", {method:"POST",body:JSON.stringify({action,data,opId:crypto.randomUUID()})});
-      while (job.state === "running") {
-        await new Promise(resolve => setTimeout(resolve,500));
-        if (currentUser?.id !== owner) throw new Error(t("logout"));
-        job = await api("/api/job?id="+encodeURIComponent(job.id));
-      }
-      if (currentUser?.id !== owner) throw new Error(t("logout"));
-      if (job.state !== "done") throw new Error(localizeServerError(job.result?.error || job.message));
-      return job;
-    }
-    let job = await perform("startup_pull");
-    if (job.result?.status === "choice_required") {
-      const download = await chooseLoginLedger(text);
-      if (currentUser?.id !== owner) return "";
-      if (!download) {
-        await perform("keep_local_cloud");
-        return text("已保留本机账本，自动下载已暂停。","この端末の台帳を保持し、自動取得を停止しました。","Local ledger kept. Automatic downloads are paused.");
-      }
-      if ((await outboxAll()).length) throw new Error(text("请先同步离线记录，再下载云端账本。","先に未送信の記録を同期してください。","Sync offline entries before downloading the cloud ledger."));
-      job = await perform("cloud_restore", {provider:"github",confirmed:true});
-      job.result.restored = true;
-    }
-    if (job.result?.restored) {
-      for (const agent of ["bookkeeping","food_health"]) await cacheSet("chat:"+owner+":"+agent,[]);
-      window.onCloudLedgerRestored?.();
-      return text("已自动下载最新云端账本，恢复前已备份。","最新のクラウド台帳を取得しました。復元前にバックアップしました。","Latest cloud ledger downloaded. A recovery backup was saved first.");
-    }
-    return "";
-  } catch (error) {
-    return text("自动下载未完成：","自動ダウンロード未完了：","Automatic download did not complete: ")+error.message;
-  } finally {
-    startupPullRunning=false;
-    setAuthMessage("");
-  }
-}
-
+let cloudBootstrapFailed = false;
 async function establishSession(user) {
   currentUser = user;
+  cloudBootstrapFailed = false;
+  showSessionPending();
   await cacheSet("identity", user);
+  $("#cloudBootstrapBlocked").classList.add("hidden");
+  $("#githubSignIn").classList.remove("hidden");
+  $("#retryCloudBootstrap").disabled=false;
   try {
     const session = await api("/api/session");
     csrfToken = session.csrfToken || readCookie("hh_csrf");
-    const cloudMessage = await pullCloudOnLogin();
-    if (cloudMessage) setTimeout(() => showToast(cloudMessage),500);
     await fetchBootstrap();
     serverReachable = true;
   } catch (error) {
@@ -434,11 +581,12 @@ async function establishSession(user) {
   showLoggedIn();
   await renderOutbox();
   updateConnection();
-  if (serverReachable) syncQueue();
+  if (serverReachable) setTimeout(() => window.runBackgroundCloudBackup?.("login"), 0);
 }
 
 async function initialize() {
   applyLanguage();
+  showSessionPending();
   $("#transactionForm [name=date]").value = localDate();
   $("#accountForm [name=openingDate]").value = localDate();
   idb = await openIdb();
@@ -473,40 +621,252 @@ function newOperation(type, data) {
   return {opId,type,data,ownerId:currentUser?.id,createdAt:`${new Date().toISOString()}-${String(sequence).padStart(8,"0")}`,error:""};
 }
 
+async function completePendingDelete(item, succeeded, message="") {
+  await outboxDelete(item.opId);
+  await window.onPendingDeleteFinished?.(item,succeeded,message);
+  await renderOutbox();
+}
+
+async function sendPendingDelete(item, owner) {
+  const started=await outboxStartDispatch(item.opId);
+  if(!started)return "removed";
+  let serverAccepted=Boolean(started.serverAccepted);
+  await window.onPendingDeleteDispatched?.(started);
+  let job;
+  try {
+    if(started.serverAccepted&&started.jobId){
+      job=await api("/api/job?id="+encodeURIComponent(started.jobId));
+    } else {
+      const data={id:started.data.id,confirmed:true};
+      if(started.data.baseRevision)data.baseRevision=started.data.baseRevision;
+      job=await api("/api/action",{method:"POST",body:JSON.stringify({action:"delete_transaction",data,opId:started.opId})});
+      serverAccepted=true;
+      const accepted={...started,serverAccepted:true,jobId:job.id||started.opId,serverAcceptedAt:new Date().toISOString(),error:""};
+      await outboxPut(accepted);
+      await window.onPendingDeleteDispatched?.(accepted);
+    }
+    while(job?.state==="running"||job?.state==="queued"){
+      await new Promise(resolve=>setTimeout(resolve,1000));
+      if(currentUser?.id!==owner)return "stopped";
+      job=await api("/api/job?id="+encodeURIComponent(job.id||started.opId));
+    }
+    if(currentUser?.id!==owner)return "stopped";
+    if(job?.state!=="done"){
+      const message=localizeServerError(job?.result?.error||job?.message||"删除任务未完成。");
+      await completePendingDelete(started,false,message);
+      const conflict=/云端账本已更新|云端已有更新|版本冲突|revision conflict|newer cloud change/i.test(message);
+      showToast(conflict
+        ? (currentLanguage==="ja-JP"?"台帳が別の端末で更新されたため、削除を中止しました。最新の台帳を読み直します。":currentLanguage==="en-US"?"The ledger changed on another device. Deletion was cancelled; the latest ledger is being reloaded.":"账本已在其他设备更新，删除已取消；正在刷新最新账本。")
+        : (currentLanguage==="ja-JP"?"削除できませんでした。記録を表示に戻しました。":"删除未完成，账目已恢复显示：")+message,true);
+      return "stopped";
+    }
+    await completePendingDelete(started,true);
+    return "done";
+  } catch(error) {
+    const rejectedBeforeAcceptance=!serverAccepted&&error.status>=400&&error.status<500&&![408,429].includes(error.status);
+    if(rejectedBeforeAcceptance&&error.status!==401){
+      await completePendingDelete(started,false,error.message);
+      const conflict=error.status===409||/版本冲突|云端账本已更新|云端已有更新/i.test(error.message);
+      showToast(conflict
+        ? (currentLanguage==="ja-JP"?"台帳の版が変わったため削除を中止しました。":"账本版本已变化，删除已取消；正在刷新核对。")
+        : (currentLanguage==="ja-JP"?"削除要求が受け付けられませんでした。記録を表示に戻しました。":"删除请求未被接收，账目已恢复显示：")+error.message,true);
+      return "stopped";
+    }
+    if(error.status===401&&!serverAccepted){
+      await outboxPut({...started,dispatchStarted:false,dispatchStartedAt:"",error:error.message});
+      await window.onPendingDeleteDispatched?.({...started,dispatchStarted:false,error:error.message});
+      await renderOutbox();
+      showToast(error.message,true);
+      return "stopped";
+    }
+    const latest=(await outboxAll()).find(row=>row.opId===item.opId);
+    if(latest){await outboxPut({...latest,dispatchStarted:true,error:error.message||"连接中断，云端任务状态待确认。"});await window.onPendingDeleteDispatched?.({...latest,dispatchStarted:true,error:error.message});}
+    throw error;
+  }
+}
+
+async function sendPendingAction(item, owner) {
+  const started=await outboxStartDispatch(item.opId);
+  if(!started)return "removed";
+  let serverAccepted=Boolean(started.serverAccepted);
+  await window.onPendingActionDispatched?.(started);
+  let job;
+  try {
+    if(started.serverAccepted&&started.jobId){
+      job=await api("/api/job?id="+encodeURIComponent(started.jobId));
+    }else{
+      job=await api("/api/action",{method:"POST",body:JSON.stringify({action:started.action,data:started.data,opId:started.opId})});
+      serverAccepted=true;
+      const accepted={...started,serverAccepted:true,jobId:job.id||started.opId,serverAcceptedAt:new Date().toISOString(),error:""};
+      delete accepted.data;
+      await outboxPut(accepted);
+      await window.onPendingActionDispatched?.(accepted);
+    }
+    let pollFailures=0;
+    while(job?.state==="running"||job?.state==="queued"){
+      await new Promise(resolve=>setTimeout(resolve,pollFailures?Math.min(1000*2**Math.min(pollFailures-1,3),8000):1000));
+      if(currentUser?.id!==owner)return "stopped";
+      try{job=await api("/api/job?id="+encodeURIComponent(job.id||started.opId));pollFailures=0;}
+      catch(error){
+        const retryable=!error.status||[408,429,500,502,503,504].includes(error.status);
+        if(!retryable)throw error;
+        pollFailures++;
+      }
+    }
+    if(currentUser?.id!==owner)return "stopped";
+    if(job?.state!=="done"){
+      const message=localizeServerError(job?.result?.error||job?.message||"操作未完成。");
+      await outboxDelete(item.opId);
+      await window.onPendingActionFinished?.(started,false,message);
+      await renderOutbox();
+      showToast(message,true);
+      return "failed";
+    }
+    await outboxDelete(item.opId);
+    await window.onPendingActionFinished?.(started,true);
+    if(job.cloudSnapshotSaved===false||job.result?.cloudSnapshotSaved===false){
+      showToast(currentLanguage==="ja-JP"?"変更は反映されましたが、クラウドスナップショットを保存できませんでした。後でバックアップを確認してください。":currentLanguage==="en-US"?"The change was applied, but its cloud snapshot was not saved. Check the backup later.":"更改已完成，但云端快照未保存；请稍后检查备份。",true);
+    }
+    return "done";
+  }catch(error){
+    const rejectedBeforeAcceptance=!serverAccepted&&error.status>=400&&error.status<500&&![408,429].includes(error.status);
+    if(rejectedBeforeAcceptance&&error.status!==401){
+      await outboxDelete(item.opId);
+      await window.onPendingActionFinished?.(started,false,error.message);
+      showToast(error.message,true);
+      return "failed";
+    }
+    if(error.status===401&&!serverAccepted){
+      await outboxPut({...started,dispatchStarted:false,dispatchStartedAt:"",error:error.message});
+      await window.onPendingActionDispatched?.({...started,dispatchStarted:false,error:error.message});
+      await renderOutbox();showToast(error.message,true);return "stopped";
+    }
+    const latest=(await outboxAll()).find(row=>row.opId===item.opId);
+    if(latest){await outboxPut({...latest,dispatchStarted:true,serverAccepted,error:error.message||"连接中断，云端任务状态待确认。"});await window.onPendingActionDispatched?.({...latest,dispatchStarted:true,serverAccepted,error:error.message});}
+    throw error;
+  }
+}
+
 async function saveOperation(type, data, successMessage) {
+  if(window.confirmBeforeQueuedOperation&&!await window.confirmBeforeQueuedOperation())throw new Error(currentLanguage==="ja-JP"?"今回の変更は取り消しました。前の同期が完了してから再度お試しください。":currentLanguage==="en-US"?"This change was cancelled. Try again after the earlier sync finishes.":"已取消本次操作；请等前一项同步完成后再试。");
   const operation = newOperation(type, data);
   await outboxPut(operation);
   await renderOutbox();
-  if (navigator.onLine && serverReachable) await syncQueue();
-  else showToast(successMessage);
+  await window.onLocalQueueChanged?.(operation);
+  showToast(currentLanguage === "ja-JP" ? "端末に保存しました。クラウドへバックグラウンドで同期します。" : currentLanguage === "en-US" ? "Saved on this device. Syncing to the cloud in the background." : "已先保存在本机，正在后台同步云端。");
+  if (navigator.onLine && serverReachable) void syncQueue();
   renderAccounts(); renderCategories();
 }
 
-async function syncQueue() {
-  if (startupPullRunning) return;
+async function syncQueue({manual=false}={}) {
   if (sending || !navigator.onLine || !currentUser) { updateConnection(); return; }
   const queue = (await outboxAll()).sort((a,b) => a.createdAt.localeCompare(b.createdAt));
-  if (!queue.length) { updateConnection(); return; }
+  if (!queue.length) { syncRetryAttempt=0; updateConnection(); if(manual)showToast(t("nothingToUpload")); return; }
+  if(queue.some(item=>item.conflict)){updateConnection();if(manual)showToast(t("uploadConflict"),true);return;}
+  if($("#cloudProgressDialog")?.open||$("#actionConfirmDialog")?.open){
+    if(!syncRetryTimer)syncRetryTimer=setTimeout(()=>{syncRetryTimer=null;syncQueue();},700);
+    if(manual)showToast(t("uploadWaiting"));
+    return;
+  }
   sending = true; updateConnection();
   try {
-    for (let start = 0; start < queue.length; start += 100) {
-      const batch = queue.slice(start,start + 100);
-      const response = await api("/api/sync", {method:"POST", body:JSON.stringify({operations:batch.map(({opId,type,data,ownerId}) => ({opId,type,data,ownerId}))})});
+    let needsBootstrapRefresh = false;
+    let completedDelete = false;
+    let completedAction = false;
+    let completedActionFailed = false;
+    for (let start = 0; start < queue.length; ) {
+      const first = queue[start];
+      if(first.type==="pending_delete"){
+        if(Date.now()<Number(first.notBefore||0)){
+          const delay=Math.max(100,Number(first.notBefore)-Date.now());
+          if(!syncRetryTimer)syncRetryTimer=setTimeout(()=>{syncRetryTimer=null;void syncQueue();},delay);
+          if(manual)showToast(t("uploadWaiting"));
+          return;
+        }
+        if(activeJob){
+          if(!syncRetryTimer)syncRetryTimer=setTimeout(()=>{syncRetryTimer=null;void syncQueue();},700);
+          if(manual)showToast(t("uploadWaiting"));
+          return;
+        }
+        const result=await sendPendingDelete(first,currentUser.id);
+        if(result==="done"){completedDelete=true;needsBootstrapRefresh=true;start++;continue;}
+        if(result==="removed"){start++;continue;}
+        return;
+      }
+      if(first.type==="pending_action"){
+        if(Date.now()<Number(first.notBefore||0)){
+          const delay=Math.max(100,Number(first.notBefore)-Date.now());
+          if(!syncRetryTimer)syncRetryTimer=setTimeout(()=>{syncRetryTimer=null;void syncQueue();},delay);
+          if(manual)showToast(t("uploadWaiting"));
+          return;
+        }
+        if(activeJob){
+          if(!syncRetryTimer)syncRetryTimer=setTimeout(()=>{syncRetryTimer=null;void syncQueue();},700);
+          if(manual)showToast(t("uploadWaiting"));
+          return;
+        }
+        const result=await sendPendingAction(first,currentUser.id);
+        if(result==="done"){completedAction=true;needsBootstrapRefresh=true;start++;continue;}
+        if(result==="failed"){completedActionFailed=true;needsBootstrapRefresh=true;start++;continue;}
+        if(result==="removed"){start++;continue;}
+        return;
+      }
+      // Prepared Agent writes are based on one exact cloud revision. Send them
+      // alone so two device snapshots can never be layered onto one another.
+      let end=start+1;
+      if(first.type!=="prepared_agent")while(end<queue.length&&end<start+100&&queue[end].type!=="prepared_agent"&&queue[end].type!=="pending_delete"&&queue[end].type!=="pending_action")end++;
+      const batch=queue.slice(start,end);
+      const owner = currentUser.id;
+      let job = await api("/api/sync", {method:"POST", body:JSON.stringify({operations:batch.map(({opId,type,data,ownerId}) => ({opId,type,data,ownerId}))})});
+      while (job.state === "running") {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        if (currentUser?.id !== owner) return;
+        job = await api("/api/job?id=" + encodeURIComponent(job.id));
+      }
+      if (job.state !== "done") {
+        const message = localizeServerError(job.result?.error || job.message || "同步失败");
+        const conflict = /云端账本已更新|云端已有更新|同步冲突|newer cloud change|base revision|revision conflict/i.test(message);
+        for (const item of batch) await outboxPut({...item,error:message,conflict});
+        await renderOutbox();
+        if(conflict)for(const item of batch)if(item.type==="prepared_agent")void window.onPreparedAgentConflict?.({...item,error:message,conflict:true});
+        showToast(conflict ? (currentLanguage === "ja-JP" ? "クラウド側に新しい変更があるため同期を停止しました。記録はこの端末に保持しています。" : currentLanguage === "en-US" ? "A newer cloud change was found. Sync paused and the entry remains on this device." : "云端已有更新，已暂停同步；待同步记录仍保留在本机。") : message, true);
+        if(!conflict)scheduleSyncRetry();
+        return;
+      }
+      const response = job.result || {};
       if(response.cloudSnapshotSaved===false){const error=new Error(currentLanguage==="ja-JP"?"クラウドスナップショットを保存できませんでした。取引は端末の同期キューに残っています。後でもう一度お試しください。":currentLanguage==="en-US"?"The cloud snapshot was not saved. Entries remain in this device's sync queue; retry later.":"云端快照未保存；记录仍保留在本机待同步队列，请稍后重试。");error.cloudSnapshotFailed=true;throw error;}
       const results = new Map((response.results || []).map(item => [item.opId,item]));
       for (const item of batch) {
         const result = results.get(item.opId);
-        if (result?.ok) await outboxDelete(item.opId);
-        else if (result) await outboxPut({...item,error:localizeServerError(result.error || "同步失败")});
+        if (result?.ok) {
+          if (item.type === "prepared_agent") await window.onPreparedAgentSynced?.(item, response.revision || "");
+          else { window.onLocalQueueSynced?.(item); needsBootstrapRefresh = true; }
+          await outboxDelete(item.opId);
+        } else if (result) {
+          const message=localizeServerError(result.error || "同步失败"),conflict=/云端账本已更新|云端已有更新|同步冲突|newer cloud change|base revision|revision conflict/i.test(message);
+          await outboxPut({...item,error:message,conflict});
+          if(conflict&&item.type==="prepared_agent")void window.onPreparedAgentConflict?.({...item,error:message,conflict:true});
+        }
       }
+      start += batch.length;
     }
     const remaining = await outboxAll();
     if (!remaining.length) {
-      showToast(t("synced"));
-      await fetchBootstrap();
+      syncRetryAttempt=0;
+      if (needsBootstrapRefresh) {
+        try { await fetchBootstrap(); }
+        catch { showToast(t("uploadRefreshFailed"),true); return; }
+      }
+      if(completedActionFailed){
+        // The rejected action already showed its error and restored the local view.
+      }else if(completedAction){
+        showToast(currentLanguage==="ja-JP"?"変更をクラウドに同期しました。":currentLanguage==="en-US"?"Changes synced to the cloud.":"更改已同步到云端。");
+      }else showToast(completedDelete
+        ? (currentLanguage==="ja-JP"?"削除が完了しました。実行前のバックアップを保存しました。":currentLanguage==="en-US"?"Deletion completed. A pre-delete backup was saved.":"删除已完成，删除前备份已保留。")
+        : manual ? t("uploadComplete") : t("synced"));
     } else {
       await renderOutbox();
-      showToast(t("syncFailed"), true);
+      if (!remaining.some(item=>item.conflict)) { showToast(t("syncFailed"), true); scheduleSyncRetry(); }
     }
   } catch (error) {
     if (error.cloudSnapshotFailed) {
@@ -514,6 +874,7 @@ async function syncQueue() {
       await Promise.all(latest.map(item => outboxPut({...item,error:error.message})));
       await renderOutbox();
       showToast(error.message,true);
+      scheduleSyncRetry();
       return;
     }
     serverReachable = false;
@@ -521,8 +882,10 @@ async function syncQueue() {
     await Promise.all(latest.map(item => outboxPut({...item,error:error.message || "offline"})));
     await renderOutbox();
     showToast(t("networkUnavailable"), true);
+    scheduleSyncRetry();
   } finally {
     sending = false; updateConnection(); await renderOutbox();
+    if (!pendingSyncCount && serverReachable && navigator.onLine) void window.runBackgroundCloudBackup?.("write");
   }
 }
 
@@ -537,16 +900,17 @@ async function handleImport(file) {
     const message = currentLanguage === "ja-JP" ? "未同期の記録を先に同期してから、台帳を取り込んでください。" : currentLanguage === "en-US" ? "Sync pending entries before importing a ledger." : "请先同步本机待处理记录，再导入桌面账本。";
     showToast(message,true); $("#ledgerFile").value=""; return;
   }
-  if (!confirm(t("importConfirm"))) { $("#ledgerFile").value=""; return; }
+  if (!await confirmOnce(t("importDesktop"),t("importConfirm"))) { $("#ledgerFile").value=""; return; }
   const button = $("#ledgerFile").closest("label"); button.classList.add("disabled");
-  showToast(t("importing"));
+  showCloudProgress(t("importing"), currentLanguage === "ja-JP" ? "台帳ファイルをサーバーに送信しています。完了まで操作しないでください。" : currentLanguage === "en-US" ? "Uploading the ledger file to the server. Please wait and do not repeat the action." : "正在把账本文件上传到服务器，请勿重复点击或关闭页面。");
   try {
     const result = await api("/api/import-ledger", {method:"POST",body:file,headers:{"Content-Type":"application/vnd.sqlite3"}});
     await fetchBootstrap();
+    void window.runBackgroundCloudBackup?.("write");
     showToast(t("importDone", result));
   } catch (error) {
     showToast(`${t("importError")} ${error.message}`, true);
-  } finally { button.classList.remove("disabled"); $("#ledgerFile").value=""; }
+  } finally { button.classList.remove("disabled"); $("#ledgerFile").value=""; hideCloudProgress(); }
 }
 
 async function exportLedger() {
@@ -565,13 +929,13 @@ async function exportLedger() {
 
 function setupEvents() {
   $$(".auth-tab").forEach(button => button.addEventListener("click", () => showAuthTab(button.dataset.authTab)));
-  $("#loginForm").addEventListener("submit", async event => {
+  $("#loginForm")?.addEventListener("submit", async event => {
     event.preventDefault(); setAuthMessage("");
     const form = new FormData(event.currentTarget);
     try { const result = await postAuth("/api/login", {username:form.get("username"),password:form.get("password")}); await establishSession(result.user); }
     catch (error) { setAuthMessage(error.message, true); }
   });
-  $("#recoverForm").addEventListener("submit", async event => {
+  $("#recoverForm")?.addEventListener("submit", async event => {
     event.preventDefault(); setAuthMessage("");
     const form = new FormData(event.currentTarget);
     try {
@@ -586,18 +950,20 @@ function setupEvents() {
     catch { showToast($("#recoveryCodeDisplay").textContent); }
   });
   $("#closeRecovery").addEventListener("click", () => $("#recoveryDialog").close());
-  $("#languageSelect").addEventListener("change", async event => {
-    const next=event.target.value;
-    if(currentUser && typeof chats!=="undefined") {
-      if(!confirm(currentLanguage==="ja-JP"?"言語を変更すると会話と未送信入力をクリアします。続行しますか？":currentLanguage==="en-US"?"Changing language clears chats and unsent input. Continue?":"切换语言会清空对话和未发送的内容，继续吗？")){event.target.value=currentLanguage;return;}
+  document.addEventListener("change", async event => {
+    const languageSelect=event.target;
+    if(!["languageSelect","authLanguageSelect"].includes(languageSelect?.id))return;
+    const next=languageSelect.value;
+    if(languageSelect.id==="languageSelect"&&currentUser && typeof chats!=="undefined") {
+      if(!confirm(currentLanguage==="ja-JP"?"言語を変更すると会話と未送信入力をクリアします。続行しますか？":currentLanguage==="en-US"?"Changing language clears chats and unsent input. Continue?":"切换语言会清空对话和未发送的内容，继续吗？")){languageSelect.value=currentLanguage;return;}
       try { for(const agent of ["bookkeeping","food_health"]) await runAction("agent_reset",{agent},null,false); }
-      catch(error){event.target.value=currentLanguage;showToast(error.message,true);return;}
+      catch(error){languageSelect.value=currentLanguage;showToast(error.message,true);return;}
       chats={bookkeeping:[],food_health:[]};attachments=[];for(const agent of ["bookkeeping","food_health"]) await cacheSet("chat:"+currentUser.id+":"+agent,[]);
     }
     currentLanguage = next; localStorage.setItem("hh-language",currentLanguage); applyLanguage();
     if (currentUser && serverReachable) try { await fetchBootstrap(); } catch {}
   });
-  $("#syncButton").addEventListener("click", syncQueue);
+  $("#syncButton").addEventListener("click", () => { void syncQueue({manual:true}); });
   $("#logoutButton").addEventListener("click", async () => {
     if (!navigator.onLine || !serverReachable) { showToast(t("logoutOffline"),true); return; }
     if ((await outboxAll()).length) {
@@ -651,7 +1017,10 @@ function setupEvents() {
       submit.disabled = false;
     }
   });
-  $("#showAccountForm").addEventListener("click", () => $("#accountForm").classList.toggle("hidden"));
+  $("#showAccountForm").addEventListener("click", () => {
+    const form=$("#accountForm");form.classList.toggle("hidden");
+    if(!form.classList.contains("hidden"))requestAnimationFrame(()=>form.scrollIntoView({behavior:"smooth",block:"center"}));
+  });
   $("#cancelAccount").addEventListener("click", () => $("#accountForm").classList.add("hidden"));
   $("#accountForm").addEventListener("submit", async event => {
     event.preventDefault(); const target=event.currentTarget;

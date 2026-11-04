@@ -1,0 +1,15 @@
+[project]
+name = "household-bookkeeping-python-d1"
+version = "0.1.0"
+description = "Python Worker + D1 runtime for the full Household Bookkeeping PWA"
+requires-python = ">=3.13"
+dependencies = [
+  "cryptography>=43.0",
+  "Pillow>=10.0",
+]
+
+[dependency-groups]
+dev = [
+  "workers-py>=1.9",
+  "workers-runtime-sdk",
+]

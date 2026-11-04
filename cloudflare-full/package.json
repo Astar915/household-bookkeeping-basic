@@ -3,8 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "sync:pwa": "node scripts/sync-pwa.mjs",
-    "dev": "wrangler dev"
+    "deploy:web": "node python-d1/scripts/deploy-web.mjs",
+    "smoke:python": "node python-d1/scripts/smoke_local.mjs",
+    "deploy:web:workflow": "wrangler deploy --config python-d1/workflow/wrangler.web.jsonc"
   },
   "devDependencies": {
     "wrangler": "^4.153.0"

@@ -20,6 +20,7 @@ let runtimeConfig = {};
 let serverReachable = false;
 let cachedBootstrap = null;
 let sending = false;
+let syncRetryTimer = null;
 let selectedKind = "expense";
 let toastTimer;
 
@@ -133,6 +134,32 @@ function setAuthMessage(message, isError = false) {
   node.textContent = message;
   node.classList.toggle("hidden", !message);
   node.classList.toggle("error", isError);
+}
+
+function showCloudProgress(title, detail, {modal = true} = {}) {
+  const dialog = $("#cloudProgressDialog");
+  if (!dialog) { setAuthMessage(title); return; }
+  $("#cloudProgressTitle").textContent = title;
+  $("#cloudProgressDetail").textContent = detail;
+  dialog.classList.toggle("nonblocking", !modal);
+  const spinner = $("#cloudProgressDialog .cloud-progress-spinner");
+  if (spinner) spinner.dataset.state = "running";
+  const nextMode = modal ? "modal" : "nonblocking";
+  if (dialog.open && dialog.dataset.progressMode !== nextMode) dialog.close();
+  if (!dialog.open) {
+    if (modal) dialog.showModal();
+    else dialog.show();
+    dialog.dataset.progressMode = nextMode;
+  }
+}
+$("#cloudProgressDialog")?.addEventListener("cancel", event => event.preventDefault());
+function hideCloudProgress() {
+  const dialog = $("#cloudProgressDialog");
+  if (dialog?.open) dialog.close();
+  dialog?.classList.remove("nonblocking");
+  if (dialog) delete dialog.dataset.progressMode;
+  const cancel = $("#cloudProgressCancel");
+  if (cancel) { cancel.classList.add("hidden"); cancel.disabled = false; cancel.onclick = null; }
 }
 
 function showToast(message, error = false) {
@@ -487,10 +514,16 @@ async function syncQueue() {
   if (sending || !navigator.onLine || !currentUser) { updateConnection(); return; }
   const queue = (await outboxAll()).sort((a,b) => a.createdAt.localeCompare(b.createdAt));
   if (!queue.length) { updateConnection(); return; }
+  if($("#cloudProgressDialog")?.open||$("#actionConfirmDialog")?.open){
+    if(!syncRetryTimer)syncRetryTimer=setTimeout(()=>{syncRetryTimer=null;syncQueue();},700);
+    return;
+  }
   sending = true; updateConnection();
+  showCloudProgress(t("syncing"), currentLanguage === "ja-JP" ? "同期待ちの記録をサーバーへ送信しています。重複して操作しないでください。" : currentLanguage === "en-US" ? "Sending queued entries to the server. Please wait and avoid repeating this action." : "正在把待同步记录发送到服务器，请勿重复点击，完成后会自动刷新。");
   try {
     for (let start = 0; start < queue.length; start += 100) {
       const batch = queue.slice(start,start + 100);
+      showCloudProgress(t("syncing"), currentLanguage === "ja-JP" ? `${Math.min(start+batch.length,queue.length)} / ${queue.length} 件を同期しています。` : currentLanguage === "en-US" ? `Syncing ${Math.min(start+batch.length,queue.length)} of ${queue.length} entries.` : `正在同步第 ${Math.min(start+batch.length,queue.length)} / ${queue.length} 条记录。`);
       const response = await api("/api/sync", {method:"POST", body:JSON.stringify({operations:batch.map(({opId,type,data,ownerId}) => ({opId,type,data,ownerId}))})});
       if(response.cloudSnapshotSaved===false){const error=new Error(currentLanguage==="ja-JP"?"クラウドスナップショットを保存できませんでした。取引は端末の同期キューに残っています。後でもう一度お試しください。":currentLanguage==="en-US"?"The cloud snapshot was not saved. Entries remain in this device's sync queue; retry later.":"云端快照未保存；记录仍保留在本机待同步队列，请稍后重试。");error.cloudSnapshotFailed=true;throw error;}
       const results = new Map((response.results || []).map(item => [item.opId,item]));
@@ -522,7 +555,7 @@ async function syncQueue() {
     await renderOutbox();
     showToast(t("networkUnavailable"), true);
   } finally {
-    sending = false; updateConnection(); await renderOutbox();
+    sending = false; updateConnection(); await renderOutbox(); hideCloudProgress();
   }
 }
 
@@ -537,16 +570,16 @@ async function handleImport(file) {
     const message = currentLanguage === "ja-JP" ? "未同期の記録を先に同期してから、台帳を取り込んでください。" : currentLanguage === "en-US" ? "Sync pending entries before importing a ledger." : "请先同步本机待处理记录，再导入桌面账本。";
     showToast(message,true); $("#ledgerFile").value=""; return;
   }
-  if (!confirm(t("importConfirm"))) { $("#ledgerFile").value=""; return; }
+  if (!await confirmOnce(t("importDesktop"),t("importConfirm"))) { $("#ledgerFile").value=""; return; }
   const button = $("#ledgerFile").closest("label"); button.classList.add("disabled");
-  showToast(t("importing"));
+  showCloudProgress(t("importing"), currentLanguage === "ja-JP" ? "台帳ファイルをサーバーに送信しています。完了まで操作しないでください。" : currentLanguage === "en-US" ? "Uploading the ledger file to the server. Please wait and do not repeat the action." : "正在把账本文件上传到服务器，请勿重复点击或关闭页面。");
   try {
     const result = await api("/api/import-ledger", {method:"POST",body:file,headers:{"Content-Type":"application/vnd.sqlite3"}});
     await fetchBootstrap();
     showToast(t("importDone", result));
   } catch (error) {
     showToast(`${t("importError")} ${error.message}`, true);
-  } finally { button.classList.remove("disabled"); $("#ledgerFile").value=""; }
+  } finally { button.classList.remove("disabled"); $("#ledgerFile").value=""; hideCloudProgress(); }
 }
 
 async function exportLedger() {

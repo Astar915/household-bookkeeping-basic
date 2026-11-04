@@ -24,6 +24,23 @@ CASH_ACCOUNTS = {
 MANAGED_ACCOUNT_TYPES = ("bank", "wallet", "prepaid", "transit", "points")
 
 
+def cash_account_name(database: Database, currency: str) -> str | None:
+    """Return the user's current label for a built-in physical-cash account."""
+    code = currency.upper()
+    default_name = CASH_ACCOUNTS.get(code)
+    if default_name is None:
+        return None
+    return database.get_setting(f"cash_management_default_cash_name_{code}", default_name) or default_name
+
+
+def cash_currency_for_name(database: Database, account_name: str) -> str | None:
+    """Resolve a physical-cash account label, including a user-renamed label."""
+    for code in CASH_ACCOUNTS:
+        if cash_account_name(database, code) == account_name:
+            return code
+    return None
+
+
 def managed_balances(database: Database) -> list[dict[str, Any]]:
     """Return all non-credit balances plus uninitialized physical-cash rows."""
     query = """SELECT a.id,a.name,a.account_type,a.currency,a.opening_date,
@@ -37,7 +54,10 @@ def managed_balances(database: Database) -> list[dict[str, Any]]:
     account_rows = database.connection.execute(query).fetchall()
     rows: list[dict[str, Any]] = []
     existing_names: set[str] = set()
-    cash_name_to_currency = {name: code for code, name in CASH_ACCOUNTS.items()}
+    cash_name_to_currency = {
+        name: code for code in CASH_ACCOUNTS
+        if (name := cash_account_name(database, code)) is not None
+    }
     for row in account_rows:
         existing_names.add(row["name"])
         account_type = row["account_type"]
@@ -62,7 +82,10 @@ def managed_balances(database: Database) -> list[dict[str, Any]]:
     # Physical cash is separate from the user's wallets, transit cards, and points.
     # Show its first-count rows by default, unless the user explicitly deleted one.
     cash_rows = []
-    for code, name in CASH_ACCOUNTS.items():
+    for code in CASH_ACCOUNTS:
+        name = cash_account_name(database, code)
+        if name is None:
+            continue
         if name in existing_names:
             continue
         if database.get_setting(f"cash_management_hidden_default_cash_{code}") == "1":
@@ -81,7 +104,10 @@ def managed_balances(database: Database) -> list[dict[str, Any]]:
             "opening_date": None,
         })
     ordered = cash_rows + rows
-    cash_order = {name: index for index, name in enumerate(CASH_ACCOUNTS.values())}
+    cash_order = {
+        name: index for index, code in enumerate(CASH_ACCOUNTS)
+        if (name := cash_account_name(database, code)) is not None
+    }
     return sorted(
         ordered,
         key=lambda row: (0, cash_order[row["account_name"]])
@@ -105,7 +131,7 @@ def sort_managed_balances(
 
 def cash_balances(database: Database) -> list[dict[str, Any]]:
     """Compatibility helper returning only the physical-cash rows."""
-    cash_names = set(CASH_ACCOUNTS.values())
+    cash_names = {name for code in CASH_ACCOUNTS if (name := cash_account_name(database, code)) is not None}
     return [row for row in managed_balances(database) if row["account_name"] in cash_names]
 
 
@@ -131,18 +157,21 @@ def reconcile_account_balances(
     # Resolve FX before taking the write lock. A CNY adjustment is a single CNY
     # ledger posting with a saved JPY reporting equivalent, not a second posting.
     pre_rows = {row["account_name"]: row for row in managed_balances(database)}
-    cny_rate = None
-    if post_differences and any(
-        (pre_rows.get(name) or {}).get("currency") == "CNY"
-        and (pre_rows.get(name) or {}).get("initialized")
+    rates_by_currency = {}
+    currencies_to_resolve = {
+        str((pre_rows.get(name) or {}).get("currency") or "")
         for name in counted_amounts
-    ):
+        if (pre_rows.get(name) or {}).get("initialized")
+        and str((pre_rows.get(name) or {}).get("currency") or "") not in {"", "JPY"}
+    }
+    if post_differences and currencies_to_resolve:
         from .fx_rates import FxRateUnavailable, resolve_jpy_rate
 
-        try:
-            cny_rate = resolve_jpy_rate(database, "CNY", date_text)
-        except FxRateUnavailable as exc:
-            raise LedgerError(str(exc)) from exc
+        for currency in currencies_to_resolve:
+            try:
+                rates_by_currency[currency] = resolve_jpy_rate(database, currency, date_text)
+            except FxRateUnavailable as exc:
+                raise LedgerError(str(exc)) from exc
     results: list[dict[str, Any]] = []
     connection = database.connection
     try:
@@ -227,19 +256,20 @@ def reconcile_account_balances(
                             "现金" if item["account_type"] == "cash" else "余额"
                         )
                         source = "cash_reconciliation" if group == "现金" else "balance_reconciliation"
-                        if code == "CNY":
-                            if cny_rate is None:
-                                raise LedgerError("人民币余额调整缺少交易日JPY汇率，未修改余额。")
+                        if code != "JPY" and item["account_type"] != "points":
+                            rate = rates_by_currency.get(code)
+                            if rate is None:
+                                raise LedgerError(f"{code}余额调整缺少交易日JPY汇率，未修改余额。")
                             from .fx_rates import convert_minor_to_jpy_minor
 
                             jpy_equiv_minor = convert_minor_to_jpy_minor(
-                                abs(difference), item["minor_digits"], cny_rate.rate
+                                abs(difference), item["minor_digits"], rate.rate
                             )
                             fx_values = (
                                 jpy_equiv_minor,
-                                format(cny_rate.rate, "f"),
-                                cny_rate.rate_date,
-                                cny_rate.source,
+                                format(rate.rate, "f"),
+                                rate.rate_date,
+                                rate.source,
                             )
                         else:
                             fx_values = (None, None, None, None)
@@ -313,7 +343,10 @@ def reconcile_cash_balances(
         code = raw_code.upper()
         if code not in CASH_ACCOUNTS:
             raise LedgerError("实体现金盘点仅支持JPY和CNY。")
-        account_amounts[CASH_ACCOUNTS[code]] = amount
+        account_name = cash_account_name(database, code)
+        if account_name is None:
+            raise LedgerError("找不到实体现金账户。")
+        account_amounts[account_name] = amount
     return reconcile_account_balances(
         database, account_amounts, occurred_on, post_differences=post_differences
     )
