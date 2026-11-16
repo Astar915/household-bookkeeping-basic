@@ -384,7 +384,11 @@ function parseMinorPreview(input, currency) {
 }
 
 function localDate() {
-  const timeZone=workspace?.preferences?.timeZone||cachedBootstrap?.timeZone||"Asia/Tokyo";
+  // app.js starts initialization before the deferred mobile.js script declares
+  // its top-level `workspace` binding. Guard that startup window so date
+  // defaults do not abort session restoration on a fresh page load.
+  const activeWorkspace = typeof workspace === "undefined" ? null : workspace;
+  const timeZone=activeWorkspace?.preferences?.timeZone||cachedBootstrap?.timeZone||"Asia/Tokyo";
   const parts = new Intl.DateTimeFormat("en-US", {timeZone,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(new Date());
   const values=Object.fromEntries(parts.map(part=>[part.type,part.value]));
   return values.year+"-"+values.month+"-"+values.day;

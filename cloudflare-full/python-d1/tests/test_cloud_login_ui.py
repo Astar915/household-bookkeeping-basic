@@ -14,6 +14,16 @@ class CloudLoginSessionTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_local_date_does_not_require_mobile_workspace_during_startup(self):
+        self.run_script(r'''
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const app=fs.readFileSync('cloudflare-full/public/app.js','utf8');
+const source=app.slice(app.indexOf('function localDate('),app.indexOf('function updateConnection('));
+const context={cachedBootstrap:null,Intl,Date};
+vm.createContext(context);vm.runInContext(source,context);
+assert.match(context.localDate(),/^\d{4}-\d{2}-\d{2}$/);
+''')
+
     def test_returning_user_opens_app_without_waiting_for_first_device_workspace(self):
         self.run_script(r'''
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
