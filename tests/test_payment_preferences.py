@@ -147,9 +147,13 @@ class PaymentPromptStoreTests(unittest.TestCase):
                 profiles[1],
             ],
         )
+        self.store.save_profiles(
+            [{"payment_method": "PayPal", "purpose": "美元交易", "currency": "USD"}]
+        )
+        self.assertEqual(self.store.all_profiles()[0]["currency"], "USD")
         with self.assertRaises(PaymentPromptSettingsError):
             self.store.save_profiles(
-                [{"payment_method": "PayPay", "purpose": "用途", "currency": "USD"}]
+                [{"payment_method": "PayPay", "purpose": "用途", "currency": "EUR"}]
             )
 
     def test_legacy_profiles_without_currency_remain_unrestricted(self) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import urllib.error
@@ -26,6 +27,11 @@ _EXPECTED_SHA_UNSET = object()
 
 def _app_data_dir() -> Path:
     return app_data_directory()
+
+
+def _snapshot_api():
+    from .sync_snapshot import SNAPSHOT_ROOT
+    return SNAPSHOT_ROOT
 
 
 class GiteeSyncError(RuntimeError):
@@ -220,6 +226,7 @@ class GiteeClient:
         params: dict[str, Any] | None = None,
         form: dict[str, Any] | None = None,
         empty_array_is_missing: bool = False,
+        allow_array: bool = False,
         timeout: float = 45,
     ) -> dict[str, Any]:
         headers = {
@@ -245,7 +252,7 @@ class GiteeClient:
             # for the sync bundle treat that shape as "no snapshot yet".
             if empty_array_is_missing and result == []:
                 return {}
-            if not isinstance(result, dict):
+            if not isinstance(result, dict) and not (allow_array and isinstance(result, list)):
                 raise GiteeSyncError("Gitee 返回了无法识别的响应。")
             return result
         except urllib.error.HTTPError as exc:
@@ -274,7 +281,44 @@ class GiteeClient:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GiteeSyncError("Gitee 返回的数据无法读取。") from exc
 
-    def _request_raw(self, path: str, *, timeout: float = 90) -> bytes:
+    def _request_json_payload(self, path: str, *, method: str, payload: dict[str, Any], timeout: float = 180):
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            self._url(path), data=body,
+            headers={"Accept": "application/json", "Content-Type": "application/json",
+                     "User-Agent": "HouseholdBookkeeping/1.0"},
+            method=method,
+        )
+        try:
+            with (self.opener or urllib.request.urlopen)(request, timeout=timeout) as response:
+                raw = response.read(MAX_GITEE_SYNC_BUNDLE_BYTES * 4 + 1)
+            result = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(result, dict):
+                raise GiteeSyncError("Gitee 返回了无法识别的响应。")
+            return result
+        except urllib.error.HTTPError as exc:
+            details = ""
+            try:
+                parsed = json.loads(exc.read().decode("utf-8", errors="replace"))
+                if isinstance(parsed, dict):
+                    details = str(parsed.get("message") or parsed.get("error_description") or parsed.get("error") or "")
+            except (ValueError, OSError):
+                pass
+            if exc.code == 404:
+                raise GiteeNotFound(details or "Gitee 仓库或文件不存在。") from exc
+            if exc.code in {401, 403}:
+                raise GiteeAuthError("Gitee 令牌无效或权限不足；请检查仓库读写权限。") from exc
+            if exc.code in {409, 422}:
+                raise GiteeSyncConflict("Gitee 云端目录已被其他设备更新；本次提交未覆盖云端数据。") from exc
+            if exc.code == 413:
+                raise GiteeSyncError("Gitee 拒绝了过大的分区提交；请减少小票图片后重试。") from exc
+            raise GiteeSyncError(details or f"Gitee 请求失败（HTTP {exc.code}）。") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise GiteeSyncError("无法连接 Gitee；请检查网络连接后重试。") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GiteeSyncError("Gitee 返回的数据无法读取。") from exc
+
+    def _request_raw(self, path: str, *, timeout: float = 90, limit: int = MAX_GITEE_SYNC_BUNDLE_BYTES) -> bytes:
         request = urllib.request.Request(
             self._url(path),
             headers={
@@ -284,9 +328,9 @@ class GiteeClient:
         )
         try:
             with (self.opener or urllib.request.urlopen)(request, timeout=timeout) as response:
-                data = response.read(MAX_GITEE_SYNC_BUNDLE_BYTES + 1)
-            if len(data) > MAX_GITEE_SYNC_BUNDLE_BYTES:
-                raise GiteeSyncError("Gitee 同步包超过 45 MiB，无法下载。")
+                data = response.read(limit + 1)
+            if len(data) > limit:
+                raise GiteeSyncError("Gitee 云端文件超过安全大小限制，无法下载。")
             return data
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
@@ -336,12 +380,28 @@ class GiteeClient:
         )
 
     @staticmethod
+    def _contents_path_for(repository: str, file_path: str) -> str:
+        owner, repo = repository.split("/", 1)
+        return "/repos/{}/{}/contents/{}".format(
+            urllib.parse.quote(owner, safe=""), urllib.parse.quote(repo, safe=""),
+            urllib.parse.quote(file_path, safe="/"),
+        )
+
+    @staticmethod
     def _raw_path(repository: str) -> str:
         owner, repo = repository.split("/", 1)
         return "/repos/{}/{}/raw/{}".format(
             urllib.parse.quote(owner, safe=""),
             urllib.parse.quote(repo, safe=""),
             urllib.parse.quote(GITEE_SYNC_FILE_PATH, safe="/"),
+        )
+
+    @staticmethod
+    def _raw_path_for(repository: str, file_path: str) -> str:
+        owner, repo = repository.split("/", 1)
+        return "/repos/{}/{}/raw/{}".format(
+            urllib.parse.quote(owner, safe=""), urllib.parse.quote(repo, safe=""),
+            urllib.parse.quote(file_path, safe="/"),
         )
 
     def bundle_sha(self, repository: str) -> str | None:
@@ -358,6 +418,154 @@ class GiteeClient:
         if not isinstance(sha, str) or not sha:
             raise GiteeSyncError("Gitee 未返回同步文件版本编号。")
         return sha
+
+    def _snapshot_content(self, repository: str):
+        from .sync_snapshot import SnapshotFormatError, parse_manifest
+        path = self._contents_path_for(repository, _snapshot_api() + "/manifest.json")
+        try:
+            result = self._request_json(path, empty_array_is_missing=True)
+        except GiteeNotFound:
+            return None, None, None
+        if not result:
+            return None, None, None
+        sha = result.get("sha")
+        encoded = result.get("content")
+        if not isinstance(sha, str) or not sha:
+            raise GiteeSyncError("Gitee 未返回分区备份版本编号。")
+        if not isinstance(encoded, str) or not encoded:
+            raise GiteeSyncError("Gitee 分区备份清单缺少内容。")
+        try:
+            payload = base64.b64decode(encoded)
+            manifest = parse_manifest(payload)
+        except (ValueError, SnapshotFormatError) as exc:
+            raise GiteeSyncError("Gitee 分区备份清单无效。") from exc
+        actual_sha = hashlib.sha1(f"blob {len(payload)}\0".encode("ascii") + payload).hexdigest()
+        if actual_sha != sha:
+            raise GiteeSyncError("Gitee 分区备份清单校验失败。")
+        return manifest, sha, str(result.get("last_commit_id") or "")
+
+    def read_snapshot_manifest(self, repository: str, etag: str | None = None):
+        manifest, sha, _last_commit_id = self._snapshot_content(repository)
+        if manifest is not None and sha:
+            self._snapshot_manifest_cache = (sha, manifest)
+        return manifest, sha, None, False
+
+    def cloud_revision(self, repository: str) -> str | None:
+        _manifest, sha, _last_commit_id = self._snapshot_content(repository)
+        return sha or self.bundle_sha(repository)
+
+    def bundle_snapshot_with_etag(self, repository: str, etag: str | None = None):
+        manifest, sha, _last_commit_id = self._snapshot_content(repository)
+        if manifest is not None:
+            self._snapshot_manifest_cache = (sha, manifest)
+            return sha, None, False, None
+        # Gitee does not expose an ETag through the contents endpoint; SHA is
+        # still a stable no-download revision check for the legacy bundle.
+        return self.bundle_sha(repository), None, False, None
+
+    def upload_snapshot(self, repository: str, plan, *, expected_sha: str | None = None) -> str:
+        """Submit the changed files and new manifest as one Gitee commit."""
+        from .sync_snapshot import SNAPSHOT_ROOT, SnapshotFormatError, snapshot_manifest_bytes
+
+        manifest_body = snapshot_manifest_bytes(plan.manifest)
+        if sum(len(body) for body in plan.changed.values()) + len(manifest_body) > MAX_GITEE_SYNC_BUNDLE_BYTES:
+            raise GiteeSyncError("本次 Gitee 分区提交超过 45 MiB；请减少小票图片后重试。")
+        current_revision = self.cloud_revision(repository)
+        if expected_sha != current_revision:
+            raise GiteeSyncConflict("Gitee 云端备份在本机准备期间发生变化，本次没有覆盖云端数据；请刷新后重试。")
+        if plan.unchanged:
+            return current_revision or hashlib.sha1(f"blob {len(manifest_body)}\0".encode("ascii") + manifest_body).hexdigest()
+
+        owner, repo = repository.split("/", 1)
+        repo_path = f"/repos/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo, safe='')}"
+        repo_info = self._request_json(repo_path)
+        branch = str(repo_info.get("default_branch") or "master")
+        if self.cloud_revision(repository) != expected_sha:
+            raise GiteeSyncConflict("Gitee 云端备份已被其他设备更新；本次上传已取消。")
+
+        actions = []
+        new_items = dict(plan.changed)
+        old_files = set()
+        old_manifest, _old_sha, _old_commit = self._snapshot_content(repository)
+        if old_manifest:
+            old_files = set(old_manifest["files"])
+        changes = sorted(set(plan.changed) | set(plan.deleted))
+        # Existing file updates/deletes carry last_commit_id so Gitee refuses a
+        # stale writer. New files are created. The manifest is included in the
+        # same multi-action commit and acts as the atomic revision pointer.
+        existing_metadata = {}
+        for relative in changes:
+            if relative not in old_files:
+                continue
+            actual = f"{SNAPSHOT_ROOT}/{relative}"
+            try:
+                self._request_json(
+                    self._contents_path_for(repository, actual),
+                )
+            except GiteeNotFound as exc:
+                raise GiteeSyncConflict("Gitee 分区文件缺失或已被手动更改；本次上传已取消。") from exc
+            history = self._request_json(
+                f"{repo_path}/commits", params={"path": actual, "per_page": 1}, allow_array=True,
+            )
+            if not isinstance(history, list) or not history or not isinstance(history[0], dict):
+                raise GiteeSyncError("Gitee 未返回分区文件的冲突校验版本。")
+            commit_id = history[0].get("sha")
+            if not isinstance(commit_id, str) or not commit_id:
+                raise GiteeSyncError("Gitee 未返回分区文件的冲突校验版本。")
+            existing_metadata[relative] = {"last_commit_id": commit_id}
+        for relative, body in sorted(new_items.items()):
+            actual = f"{SNAPSHOT_ROOT}/{relative}" if relative != "manifest.json" else f"{SNAPSHOT_ROOT}/manifest.json"
+            old = existing_metadata.get(relative)
+            action = {"action": "update" if old else "create", "path": actual,
+                      "content": base64.b64encode(body).decode("ascii"), "encoding": "base64"}
+            if old:
+                commit_id = old.get("last_commit_id")
+                if not isinstance(commit_id, str) or not commit_id:
+                    raise GiteeSyncError("Gitee 未返回分区文件的冲突校验版本。")
+                action["last_commit_id"] = commit_id
+            actions.append(action)
+        for relative in plan.deleted:
+            old = existing_metadata.get(relative)
+            if not old:
+                continue
+            commit_id = old.get("last_commit_id")
+            if not isinstance(commit_id, str) or not commit_id:
+                raise GiteeSyncError("Gitee 未返回待删除分区文件的冲突校验版本。")
+            actions.append({"action": "delete", "path": f"{SNAPSHOT_ROOT}/{relative}",
+                            "last_commit_id": commit_id})
+        # The manifest must be the final action so clients never observe a
+        # revision that points to files from an incomplete commit.
+        manifest_info = None
+        if old_manifest:
+            history = self._request_json(
+                f"{repo_path}/commits",
+                params={"path": f"{SNAPSHOT_ROOT}/manifest.json", "per_page": 1},
+                allow_array=True,
+            )
+            if not isinstance(history, list) or not history or not isinstance(history[0], dict):
+                raise GiteeSyncError("Gitee 未返回清单的冲突校验版本。")
+            manifest_info = {"last_commit_id": history[0].get("sha")}
+        manifest_action = {"action": "update" if manifest_info else "create",
+                           "path": f"{SNAPSHOT_ROOT}/manifest.json",
+                           "content": base64.b64encode(manifest_body).decode("ascii"), "encoding": "base64"}
+        if manifest_info:
+            commit_id = manifest_info.get("last_commit_id")
+            if not isinstance(commit_id, str) or not commit_id:
+                raise GiteeSyncError("Gitee 未返回清单的冲突校验版本。")
+            manifest_action["last_commit_id"] = commit_id
+        actions.append(manifest_action)
+        if self.cloud_revision(repository) != expected_sha:
+            raise GiteeSyncConflict("Gitee 云端目录已被其他设备更新；本次上传已取消。")
+        payload = {"branch": branch, "message": "Update household bookkeeping snapshot", "actions": actions}
+        encoded_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded_payload) > MAX_GITEE_SYNC_BUNDLE_BYTES * 2:
+            raise GiteeSyncError("本次 Gitee 提交请求超过安全大小限制；请减少同步内容后重试。")
+        self._request_json_payload(f"{repo_path}/commits", method="POST", payload=payload, timeout=240)
+        expected_manifest_sha = hashlib.sha1(f"blob {len(manifest_body)}\0".encode("ascii") + manifest_body).hexdigest()
+        _verified_manifest, verified_sha, _commit_id = self._snapshot_content(repository)
+        if verified_sha != expected_manifest_sha:
+            raise GiteeSyncError("Gitee 未确认完整分区提交；请重新检查云端版本。")
+        return expected_manifest_sha
 
     def sync_bundle_exists(self, repository: str) -> bool:
         return self.bundle_sha(repository) is not None
@@ -395,7 +603,27 @@ class GiteeClient:
             raise GiteeSyncError("Gitee 未确认同步文件的版本编号；请重新读取云端版本。")
         return sha
 
-    def download_bundle_with_revision(self, repository: str) -> tuple[bytes, str]:
+    def download_bundle_with_revision(self, repository: str, *, initial_sha: str | None = None,
+                                      initial_etag: str | None = None, initial_data: bytes | None = None) -> tuple[bytes, str]:
+        from .sync_snapshot import (
+            MAX_ARCHIVE_BYTES, SnapshotFormatError, materialize_snapshot_bundle,
+            snapshot_from_repository_archive,
+        )
+        manifest, manifest_sha, _last_commit_id = self._snapshot_content(repository)
+        if manifest is not None:
+            if initial_sha and initial_sha != manifest_sha:
+                raise GiteeSyncConflict("Gitee 分区备份已变化，请重新恢复。")
+            owner, repo = repository.split("/", 1)
+            path = f"/repos/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo, safe='')}/zipball"
+            archive_body = self._request_raw(path, timeout=180, limit=MAX_ARCHIVE_BYTES)
+            try:
+                parsed_manifest, blobs = snapshot_from_repository_archive(archive_body, manifest_sha or "")
+                bundle = materialize_snapshot_bundle(parsed_manifest, blobs)
+            except SnapshotFormatError as exc:
+                raise GiteeSyncError(str(exc)) from exc
+            if self.cloud_revision(repository) != manifest_sha:
+                raise GiteeSyncConflict("下载期间 Gitee 云端目录发生变化，请重新恢复。")
+            return bundle, str(manifest_sha)
         path = self._raw_path(repository)
         for _attempt in range(3):
             before_sha = self.bundle_sha(repository)
@@ -406,6 +634,44 @@ class GiteeClient:
             if before_sha == after_sha:
                 return data, before_sha
         raise GiteeSyncConflict("下载期间 Gitee 云端同步文件发生变化，请重新恢复。")
+
+    def download_snapshot_delta_with_revision(
+        self, repository: str, local_files: dict[str, bytes], *, expected_sha: str,
+        manifest: dict[str, Any] | None = None,
+    ) -> tuple[bytes, str]:
+        """Restore a folder snapshot while downloading only changed file objects."""
+        from .sync_snapshot import (
+            SNAPSHOT_ROOT, SnapshotFormatError, materialize_snapshot_delta, snapshot_manifest_bytes,
+        )
+
+        revision = None
+        if manifest is None:
+            manifest, revision, _last_commit_id = self._snapshot_content(repository)
+        else:
+            payload = snapshot_manifest_bytes(manifest)
+            revision = hashlib.sha1(f"blob {len(payload)}\0".encode("ascii") + payload).hexdigest()
+        if manifest is None or revision != expected_sha:
+            raise GiteeSyncConflict("Gitee 分区备份已变化，请重新检查后再恢复。")
+
+        def fetch_file(relative: str, descriptor: dict[str, Any]) -> bytes:
+            try:
+                size = int(descriptor["size"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise GiteeSyncError("Gitee 分区文件大小无效。") from exc
+            if size > MAX_GITEE_SYNC_BUNDLE_BYTES:
+                raise GiteeSyncError("Gitee 分区文件超过安全大小限制。")
+            return self._request_raw(
+                self._raw_path_for(repository, f"{SNAPSHOT_ROOT}/{relative}"),
+                timeout=90, limit=size,
+            )
+
+        try:
+            bundle = materialize_snapshot_delta(manifest, local_files, fetch_file)
+        except SnapshotFormatError as exc:
+            raise GiteeSyncError(str(exc)) from exc
+        if self.cloud_revision(repository) != revision:
+            raise GiteeSyncConflict("下载期间 Gitee 云端目录发生变化，请重新恢复。")
+        return bundle, str(revision)
 
     def download_bundle(self, repository: str) -> bytes:
         data, _revision = self.download_bundle_with_revision(repository)

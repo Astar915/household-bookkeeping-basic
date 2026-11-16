@@ -115,7 +115,8 @@ def _paused_download_result(checkpoint):
     return None
 
 
-def automatic_pull(database_path, candidates, state, restore, *, stores=None, lock=None, cancelled=None):
+def automatic_pull(database_path, candidates, state, restore, *, stores=None, lock=None, cancelled=None,
+                   incremental_snapshots=False):
     """Download off-lock, then check local edits and restore with the caller's backup routine.
 
     candidates contain (provider, repository, client, save_remote_checkpoint).
@@ -170,10 +171,48 @@ def automatic_pull(database_path, candidates, state, restore, *, stores=None, lo
                         original = local_revision(database_path, **stores)
                     if checkpoint.get('revision') and original != checkpoint['revision']:
                         raise CloudPullConflict('本机有尚未同步的修改，已暂停自动下载；请先核对并上传或手动恢复。')
-                if download_kwargs is not None:
-                    body, sha = client.download_bundle_with_revision(repository, **download_kwargs)
-                else:
-                    body, sha = client.download_bundle_with_revision(repository)
+                used_delta = False
+                if (incremental_snapshots and download_kwargs is not None
+                        and checkpoint.get('revision') and original == checkpoint.get('revision')
+                        and getattr(type(client), 'download_snapshot_delta_with_revision', None)
+                        and getattr(type(client), 'read_snapshot_manifest', None)):
+                    try:
+                        from .sync_snapshot import SnapshotFormatError, build_snapshot
+                        cached_manifest = getattr(client, '_snapshot_manifest_cache', None)
+                        if (isinstance(cached_manifest, tuple) and len(cached_manifest) == 2
+                                and cached_manifest[0] == sha):
+                            remote_manifest = cached_manifest[1]
+                            remote_sha = cached_manifest[0]
+                        else:
+                            manifest_result = client.read_snapshot_manifest(repository)
+                            remote_manifest = manifest_result[0] if isinstance(manifest_result, tuple) else None
+                            remote_sha = manifest_result[1] if isinstance(manifest_result, tuple) and len(manifest_result) > 1 else None
+                        if remote_manifest is not None and remote_sha == sha:
+                            local_plan = build_snapshot(
+                                database_path,
+                                payment_store=stores.get('payment_store'),
+                                bookkeeping_skill_store=stores.get('bookkeeping_skill_store'),
+                                food_skill_store=stores.get('food_skill_store'),
+                                receipt_image_directory=stores.get('receipt_image_directory'),
+                                include_scope=remote_manifest.get('scope'),
+                                include_receipt_images=False,
+                                previous_manifest=remote_manifest,
+                            )
+                            body, sha = client.download_snapshot_delta_with_revision(
+                                repository, local_plan.files, expected_sha=sha,
+                                manifest=remote_manifest,
+                            )
+                            used_delta = True
+                    except SnapshotFormatError:
+                        # If the local cache cannot be represented as this
+                        # snapshot version, the provider's validated full
+                        # archive path remains the safe compatibility route.
+                        pass
+                if not used_delta:
+                    if download_kwargs is not None:
+                        body, sha = client.download_bundle_with_revision(repository, **download_kwargs)
+                    else:
+                        body, sha = client.download_bundle_with_revision(repository)
                 with zipfile.ZipFile(BytesIO(body)) as archive:
                     item = archive.getinfo('manifest.json')
                     if item.file_size > 1024 * 1024:

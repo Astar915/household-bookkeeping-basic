@@ -80,7 +80,7 @@ def reconcile_named_balance(
     are made under one write lock; the caller's isolated worker can then merge
     the result only if the live ledger is unchanged.
     """
-    date_text = parse_date(occurred_on).isoformat()
+    date_text = parse_date(occurred_on, getattr(database, "time_zone", "Asia/Tokyo")).isoformat()
     account = database.account(account_name)
     currency = database.currency(str(account["currency"]))
     code = str(currency["code"])
@@ -162,13 +162,18 @@ def reconcile_named_balance(
                 fx_values = (convert_minor_to_jpy_minor(abs(difference), digits, rate.rate),
                              format(rate.rate, "f"), rate.rate_date, rate.source)
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+            description = (
+                f"信用卡额度盘点调整：可用额度 {before_text} → {counted_text}"
+                if is_credit else
+                f"{group}盘点调整：账面{subject}{before_text}，实盘{counted_text}"
+            )
             cursor = connection.execute(
                 """INSERT INTO transactions
                    (occurred_on,kind,amount_minor,currency,account_id,category_id,description,
                     balance_effect,jpy_equiv_minor,fx_rate,fx_rate_date,fx_source,needs_review,source,created_at)
                    VALUES (?,?,?,?,?,?,?,'posted',?,?,?,?,0,?,?)""",
                 (date_text, kind, abs(difference), code, account_id, category["id"],
-                 f"{group}盘点调整：账面{subject}{before_text}，实盘{counted_text}",
+                 description,
                  *fx_values, "cash_reconciliation" if group == "现金" else "balance_reconciliation", now),
             )
             transaction_id = int(cursor.lastrowid)
@@ -195,8 +200,14 @@ def record_credit_snapshot(
     *,
     include_difference: bool = False,
 ) -> dict[str, Any]:
-    """Save a credit-limit snapshot and optionally post its debt difference to P&L."""
-    date_text = parse_date(occurred_on).isoformat()
+    """Save a credit-limit snapshot and optionally post only its debt change to P&L.
+
+    When a previous limit snapshot exists, that snapshot plus card transactions
+    since it is the comparison baseline. Comparing the new estimate with the
+    account's lifetime ledger balance would incorrectly post the whole card debt
+    as a gain/loss every time a user refreshes a snapshot.
+    """
+    date_text = parse_date(occurred_on, getattr(database, "time_zone", "Asia/Tokyo")).isoformat()
     account = database.account(account_name)
     if account["account_type"] != "credit":
         raise LedgerError("额度快照只能绑定信用卡账户")
@@ -234,7 +245,30 @@ def record_credit_snapshot(
             raise LedgerError("快照日期之后已有信用卡流水或快照。请改用今天的日期，或先核对后续记录。")
 
     target_debt_minor = limit_minor - available_minor
-    before_minor = database.account_balance_as_of(int(account["id"]), date_text)
+
+    def comparison_basis() -> tuple[int, str, int | None]:
+        """Return prior debt estimate when available, otherwise the ledger balance."""
+        card_state = next(
+            (row for row in credit_card_overview(database, date_text)
+             if int(row["account_id"]) == int(account["id"])),
+            None,
+        )
+        if card_state and card_state.get("debt_estimate_minor") is not None:
+            return (
+                int(card_state["debt_estimate_minor"]),
+                "上次额度快照估算欠款",
+                int(card_state["available_minor"]),
+            )
+        return (
+            database.account_balance_as_of(int(account["id"]), date_text),
+            "账面信用卡欠款",
+            None,
+        )
+
+    before_minor, basis_label, previous_available_minor = (
+        comparison_basis() if include_difference
+        else (database.account_balance_as_of(int(account["id"]), date_text), "账面信用卡欠款", None)
+    )
     difference = target_debt_minor - before_minor if include_difference else 0
     rate = None
     if difference and code != "JPY":
@@ -268,15 +302,13 @@ def record_credit_snapshot(
             ).fetchone()
             if later:
                 raise LedgerError("快照日期之后已有信用卡流水或快照。请改用今天的日期，或先核对后续记录。")
-            before_minor = database.account_balance_as_of(int(account["id"]), date_text)
+            before_minor, basis_label, previous_available_minor = comparison_basis()
             difference = target_debt_minor - before_minor
 
         if difference:
             kind = "expense" if difference > 0 else "income"
             category_name = "余额盘亏" if difference > 0 else "余额盘盈"
             category = database.category(category_name, kind)
-            before_text = format_account_amount(before_minor, digits, code, "credit")
-            target_text = format_account_amount(target_debt_minor, digits, code, "credit")
             fx_values: tuple[Any, ...] = (None, None, None, None)
             if code != "JPY":
                 if rate is None:
@@ -285,13 +317,20 @@ def record_credit_snapshot(
                 fx_values = (convert_minor_to_jpy_minor(abs(difference), digits, rate.rate),
                              format(rate.rate, "f"), rate.rate_date, rate.source)
             transaction_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+            previous_available = (
+                int(previous_available_minor)
+                if previous_available_minor is not None
+                else limit_minor - before_minor
+            )
+            previous_available_text = format_account_amount(previous_available, digits, code, "credit")
+            current_available_text = format_account_amount(available_minor, digits, code, "credit")
             cursor = connection.execute(
                 """INSERT INTO transactions
                    (occurred_on,kind,amount_minor,currency,account_id,category_id,description,
                     balance_effect,jpy_equiv_minor,fx_rate,fx_rate_date,fx_source,needs_review,source,created_at)
                    VALUES (?,?,?,?,?,?,?,'posted',?,?,?,?,0,'balance_reconciliation',?)""",
                 (date_text, kind, abs(difference), code, int(account["id"]), category["id"],
-                 f"信用卡欠款调整：账面{before_text}，快照估算欠款{target_text}", *fx_values, transaction_time),
+                 f"信用卡额度盘点调整：可用额度 {previous_available_text} → {current_available_text}", *fx_values, transaction_time),
             )
             transaction_id = int(cursor.lastrowid)
             database._record_credit_recovery_points([transaction_id])
@@ -316,7 +355,10 @@ def record_credit_snapshot(
         "limit_minor": limit_minor,
         "available_minor": available_minor,
         "estimated_debt_minor": target_debt_minor,
+        "before_minor": before_minor,
         "difference_minor": difference,
+        "comparison_basis": basis_label,
+        "previous_available_minor": previous_available_minor,
         "category_name": category_name,
         "transaction_id": transaction_id,
         "currency": code,
@@ -326,13 +368,13 @@ def record_credit_snapshot(
 
 def handle_balance_count(session: Any, text: str) -> str:
     """Complete a balance count locally, retaining account and amount across turns."""
-    from .natural_language import _date_reference, _now_japan, _normalize_account_label
+    from .natural_language import _date_reference, _normalize_account_label
 
     tr = lambda source: translate(source, session.response_language)
     previous = session.pending_state or {}
     state = dict(previous) if previous.get("workflow") == "balance_count" else {
         "workflow": "balance_count", "account": None, "amount": None,
-        "currency": None, "date": _now_japan().date().isoformat(), "original_text": "",
+        "currency": None, "date": session._now_japan().date().isoformat(), "original_text": "",
     }
     if previous and session._looks_like_new_transaction(text):
         answer = tr("上一笔余额盘点还没有完成，请先回答上一个问题，或说‘取消这笔’。")
@@ -355,14 +397,14 @@ def handle_balance_count(session: Any, text: str) -> str:
         state["amount"] = amount
         state["currency"] = currency
 
-    has_date, date_text = _date_reference(text, now=_now_japan())
+    has_date, date_text = _date_reference(text, now=session._now_japan())
     if has_date:
         try:
-            date_text = parse_date(str(date_text)).isoformat() if date_text else None
+            date_text = parse_date(str(date_text), session.time_zone).isoformat() if date_text else None
         except LedgerError:
             date_text = None
         state["date"] = date_text
-    if state.get("date") and state["date"] > _now_japan().date().isoformat():
+    if state.get("date") and state["date"] > session._now_japan().date().isoformat():
         state["date"] = None
 
     matches = session._mentioned_accounts(text)

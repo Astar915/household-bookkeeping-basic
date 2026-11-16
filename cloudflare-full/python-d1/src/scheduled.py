@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import uuid
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from api import _start_job
 from d1_snapshot_store import SnapshotConflict
 from ledger_runtime import load_mobile_config, process_scheduled_entries
+from model_jobs import expire_stale_queued_cloud_jobs
 
 
 MAX_USERS_PER_TICK = 10
+MAX_AUTO_SYNC_ATTEMPTS = 5
+AUTO_SYNC_RETRY_DELAY = timedelta(minutes=1)
 
 
 def _now():
@@ -27,6 +30,9 @@ def _changes(result):
 
 
 async def _active_job_exists(database, user_id):
+    # Old cloud jobs that never started must not hold the durable backup queue
+    # forever. A live Workflow moves its row to `running` before doing work.
+    await expire_stale_queued_cloud_jobs(database, user_id)
     row = await database.prepare(
         "SELECT 1 AS active FROM app_jobs WHERE user_id=? AND state IN ('queued','running') LIMIT 1"
     ).bind(user_id).first()
@@ -42,9 +48,37 @@ async def _mark_noop(database, user_id, revision):
 
 async def _queue_auto_sync(database, env, user_id):
     row = await database.prepare(
-        "SELECT revision,state,operation_id,attempts FROM auto_sync_queue WHERE user_id=?"
+        "SELECT revision,state,operation_id,attempts,updated_at FROM auto_sync_queue WHERE user_id=?"
     ).bind(user_id).first()
-    if row is None or str(_field(row, "state")) != "pending":
+    if row is None:
+        return
+    state = str(_field(row, "state"))
+    if state == "failed":
+        attempts = int(_field(row, "attempts") or 0)
+        if attempts >= MAX_AUTO_SYNC_ATTEMPTS:
+            return
+        try:
+            failed_at = datetime.fromisoformat(str(_field(row, "updated_at")))
+            if failed_at.tzinfo is None:
+                failed_at = failed_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return
+        if datetime.now(timezone.utc) - failed_at.astimezone(timezone.utc) < AUTO_SYNC_RETRY_DELAY:
+            return
+        revision = str(_field(row, "revision"))
+        reset = await database.prepare(
+            "UPDATE auto_sync_queue SET state='pending',operation_id=NULL,updated_at=? "
+            "WHERE user_id=? AND revision=? AND state='failed' AND attempts=? AND updated_at=?"
+        ).bind(_now(), user_id, revision, attempts, str(_field(row, "updated_at"))).run()
+        if _changes(reset) != 1:
+            return
+        row = await database.prepare(
+            "SELECT revision,state,operation_id,attempts,updated_at FROM auto_sync_queue WHERE user_id=?"
+        ).bind(user_id).first()
+        if row is None:
+            return
+        state = str(_field(row, "state"))
+    if state != "pending":
         return
     if await _active_job_exists(database, user_id):
         return
@@ -54,7 +88,7 @@ async def _queue_auto_sync(database, env, user_id):
         config = await load_mobile_config(database, env, user_id)
     except Exception:
         await database.prepare(
-            "UPDATE auto_sync_queue SET state='failed',operation_id=NULL,updated_at=? "
+            "UPDATE auto_sync_queue SET state='failed',operation_id=NULL,attempts=attempts+1,updated_at=? "
             "WHERE user_id=? AND revision=? AND state='pending'"
         ).bind(_now(), user_id, revision).run()
         return
@@ -92,6 +126,16 @@ async def _queue_auto_sync(database, env, user_id):
             "UPDATE auto_sync_queue SET state='failed',operation_id=NULL,updated_at=? "
             "WHERE user_id=? AND operation_id=?"
         ).bind(_now(), user_id, operation_id).run()
+
+
+async def dispatch_queued_backup(database, env, user_id):
+    """Best-effort immediate dispatch; the durable D1 queue and Cron remain authoritative."""
+    try:
+        await _queue_auto_sync(database, env, user_id)
+    except Exception as exc:
+        # The queue row was committed with the ledger. Cron can dispatch it if
+        # this fast path encounters a temporary D1 or Workflow API error.
+        print(f"Auto-sync dispatch deferred ({type(exc).__name__}).")
 
 
 async def run_scheduled(env):

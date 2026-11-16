@@ -328,11 +328,17 @@ def handle_balance_count(session: Any, text: str) -> str:
     """Complete a balance count locally, retaining account and amount across turns."""
     from .natural_language import _date_reference, _now_japan, _normalize_account_label
 
+    # Use the ledger's configured region for dates, just like ordinary
+    # bookkeeping requests. Keep the Japan clock only as a compatibility
+    # fallback for older session-like callers.
+    now_local = getattr(session, "_now_local", None)
+    now = now_local() if callable(now_local) else _now_japan()
+
     tr = lambda source: translate(source, session.response_language)
     previous = session.pending_state or {}
     state = dict(previous) if previous.get("workflow") == "balance_count" else {
         "workflow": "balance_count", "account": None, "amount": None,
-        "currency": None, "date": _now_japan().date().isoformat(), "original_text": "",
+        "currency": None, "date": now.date().isoformat(), "original_text": "",
     }
     if previous and session._looks_like_new_transaction(text):
         answer = tr("上一笔余额盘点还没有完成，请先回答上一个问题，或说‘取消这笔’。")
@@ -355,14 +361,14 @@ def handle_balance_count(session: Any, text: str) -> str:
         state["amount"] = amount
         state["currency"] = currency
 
-    has_date, date_text = _date_reference(text, now=_now_japan())
+    has_date, date_text = _date_reference(text, now=now)
     if has_date:
         try:
             date_text = parse_date(str(date_text)).isoformat() if date_text else None
         except LedgerError:
             date_text = None
         state["date"] = date_text
-    if state.get("date") and state["date"] > _now_japan().date().isoformat():
+    if state.get("date") and state["date"] > now.date().isoformat():
         state["date"] = None
 
     matches = session._mentioned_accounts(text)

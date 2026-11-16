@@ -13,6 +13,7 @@ const WORDS = {
 for (const [language, messages] of Object.entries({
   "zh-CN": {
     syncNow: "立即上传", syncing: "正在上传…",
+    connectionTimeout: "连接服务超时，请检查网络后重试。",
     networkHint: "无法连接服务。新记录会保存在此设备，恢复网络后可点击“立即上传”。",
     nothingToUpload: "账本已保存在云端，没有待上传记录。",
     uploadWaiting: "正在检查云端账本，请稍候再上传。",
@@ -23,6 +24,7 @@ for (const [language, messages] of Object.entries({
   },
   "ja-JP": {
     syncNow: "今すぐアップロード", syncing: "アップロード中…",
+    connectionTimeout: "サービスへの接続がタイムアウトしました。通信を確認して再試行してください。",
     networkHint: "サービスに接続できません。新しい記録はこの端末に保存され、再接続後に「今すぐアップロード」できます。",
     nothingToUpload: "台帳はクラウドに保存済みです。アップロード待ちの記録はありません。",
     uploadWaiting: "クラウド台帳を確認中です。完了後にアップロードしてください。",
@@ -33,6 +35,7 @@ for (const [language, messages] of Object.entries({
   },
   "en-US": {
     syncNow: "Upload now", syncing: "Uploading…",
+    connectionTimeout: "The service connection timed out. Check your network and try again.",
     networkHint: "The service is unavailable. New entries stay on this device; click Upload now after reconnecting.",
     nothingToUpload: "Your ledger is already saved in the cloud. Nothing is waiting to upload.",
     uploadWaiting: "The cloud ledger is being checked. Try uploading again in a moment.",
@@ -195,8 +198,29 @@ async function api(path, options = {}) {
     const token = csrfToken || readCookie("hh_csrf");
     if (token) headers.set("X-CSRF-Token", token);
   }
-  const response = await fetch(path, {...options, headers, credentials:"same-origin", cache:"no-store"});
-  const value = response.status === 204 ? null : await response.json().catch(() => ({}));
+  const needsHandshakeTimeout = !options.signal && /^\/api\/(?:session|config)(?:\?|$)/.test(path);
+  const handshakeController = needsHandshakeTimeout ? new AbortController() : null;
+  const handshakeTimer = handshakeController
+    ? setTimeout(() => handshakeController.abort(), 20000)
+    : null;
+  let response, value;
+  try {
+    response = await fetch(path, {
+      ...options,
+      ...(handshakeController ? {signal: handshakeController.signal} : {}),
+      headers,
+      credentials:"same-origin",
+      cache:"no-store",
+    });
+    value = response.status === 204 ? null : await response.json().catch(() => ({}));
+  } catch (error) {
+    if (handshakeController?.signal.aborted) {
+      throw new Error(t("connectionTimeout"));
+    }
+    throw error;
+  } finally {
+    if (handshakeTimer) clearTimeout(handshakeTimer);
+  }
   if (!response.ok) {
     const error = new Error(localizeServerError(value?.error || `HTTP ${response.status}`));
     error.status = response.status;
@@ -327,8 +351,16 @@ function showCloudBootstrapBlocked(message) {
   $("#cloudBootstrapError").textContent = message;
 }
 
+function currencyMinorDigits(currency, fallbackDigits = 0) {
+  const code = String(currency || "").trim().toUpperCase();
+  if (code === "JPY" || code === "PTS") return 0;
+  if (code === "CNY" || code === "USD") return 2;
+  const fallback = Number(fallbackDigits || 0);
+  return Number.isInteger(fallback) && fallback >= 0 && fallback <= 4 ? fallback : 0;
+}
+
 function formatMinor(minor, currency, digits, accountType = "") {
-  const places = Number(digits || 0);
+  const places = currencyMinorDigits(currency, digits);
   const locale = currentLanguage === "ja-JP" ? "ja-JP" : currentLanguage === "en-US" ? "en-US" : "zh-CN";
   const value = BigInt(String(minor || 0));
   const negative = value < 0n;
@@ -343,7 +375,7 @@ function formatMinor(minor, currency, digits, accountType = "") {
 }
 
 function parseMinorPreview(input, currency) {
-  const digits = ["CNY","USD"].includes(currency) ? 2 : 0;
+  const digits = currencyMinorDigits(currency, 0);
   const match = String(input || "").trim().match(digits ? /^(\d+)(?:\.(\d{0,2}))?$/ : /^(\d+)$/);
   if (!match) return 0;
   const whole = BigInt(match[1]);
@@ -352,25 +384,25 @@ function parseMinorPreview(input, currency) {
 }
 
 function localDate() {
-  if (cachedBootstrap?.serverDate) return cachedBootstrap.serverDate;
-  const parts = new Intl.DateTimeFormat("en-US", {timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(new Date());
+  const timeZone=workspace?.preferences?.timeZone||cachedBootstrap?.timeZone||"Asia/Tokyo";
+  const parts = new Intl.DateTimeFormat("en-US", {timeZone,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(new Date());
   const values=Object.fromEntries(parts.map(part=>[part.type,part.value]));
   return values.year+"-"+values.month+"-"+values.day;
 }
 
 function updateConnection() {
   const online = serverReachable && navigator.onLine;
-  const state = !navigator.onLine ? "offline" : syncConflict ? "conflict" : sending ? "syncing" : window.backgroundBackupActive ? "backup" : window.cloudJobActive ? "working" : pendingSyncCount ? "pending" : online ? "online" : "offline";
+  const state = !navigator.onLine ? "offline" : syncConflict ? "conflict" : sending ? "syncing" : window.cloudJobActive ? "working" : pendingSyncCount ? "pending" : online ? "online" : "offline";
   const labels = {
-    "zh-CN": {online:"服务已连接",offline:"离线保存",syncing:"云端上传中…",backup:"云端备份中…",working:"云端处理中…",pending:`等待云端同步 ${pendingSyncCount} 条`,conflict:"同步冲突，需处理"},
-    "ja-JP": {online:"サービス接続中",offline:"オフライン保存",syncing:"クラウドへ同期中…",backup:"クラウドにバックアップ中…",working:"クラウドで処理中…",pending:`同期待ち ${pendingSyncCount} 件`,conflict:"同期の競合を確認してください"},
-    "en-US": {online:"Service connected",offline:"Saved offline",syncing:"Uploading to cloud…",backup:"Backing up to cloud…",working:"Processing in the cloud…",pending:`${pendingSyncCount} pending`,conflict:"Sync conflict needs attention"},
+    "zh-CN": {online:"服务已连接",offline:"离线保存",syncing:"正在同步账本…",working:"云端处理中…",pending:`等待云端同步 ${pendingSyncCount} 条`,conflict:"同步冲突，需处理"},
+    "ja-JP": {online:"サービス接続中",offline:"オフライン保存",syncing:"台帳を同期中…",working:"クラウドで処理中…",pending:`同期待ち ${pendingSyncCount} 件`,conflict:"同期の競合を確認してください"},
+    "en-US": {online:"Service connected",offline:"Saved offline",syncing:"Syncing ledger…",working:"Processing in the cloud…",pending:`${pendingSyncCount} pending`,conflict:"Sync conflict needs attention"},
   };
   const status = $("#connectionState");
   status.textContent = labels[currentLanguage]?.[state] || labels["zh-CN"][state];
   status.dataset.state = state;
   status.classList.toggle("is-offline", state === "offline");
-  status.classList.toggle("is-syncing", state === "syncing" || state === "backup" || state === "working");
+  status.classList.toggle("is-syncing", state === "syncing" || state === "working");
   status.classList.toggle("has-pending", state === "pending");
   status.classList.toggle("has-conflict", state === "conflict");
   $("#offlineBanner").classList.toggle("hidden", online || !currentUser);
@@ -559,29 +591,45 @@ async function fetchBootstrap() {
 }
 
 let cloudBootstrapFailed = false;
-async function establishSession(user) {
+async function establishSession(user, sessionInfo = null) {
   currentUser = user;
   cloudBootstrapFailed = false;
   showSessionPending();
-  await cacheSet("identity", user);
+  void cacheSet("identity", user).catch(() => {});
   $("#cloudBootstrapBlocked").classList.add("hidden");
   $("#githubSignIn").classList.remove("hidden");
   $("#retryCloudBootstrap").disabled=false;
   try {
-    const session = await api("/api/session");
+    const session = sessionInfo?.user?.id === user?.id ? sessionInfo : await api("/api/session");
     csrfToken = session.csrfToken || readCookie("hh_csrf");
-    await fetchBootstrap();
     serverReachable = true;
+    // Do not hold the whole app behind a spinner while a new device downloads
+    // its first ledger snapshot. The mobile view immediately renders either
+    // a cached ledger or its retryable workspace error, then loads in the
+    // background. This also avoids issuing a second forced load here.
+    showLoggedIn();
+    await renderOutbox();
+    if (typeof loadWorkspace !== "function") {
+      try {
+        await fetchBootstrap();
+      } catch (error) {
+        showToast(error.message || t("云端账本暂时无法载入，请稍后重试。"), true);
+      }
+    }
   } catch (error) {
     serverReachable = false;
-    cachedBootstrap = await cacheGet(`bootstrap:${currentUser.id}`);
-    if (!cachedBootstrap) throw error;
-    await renderAll();
+    // An expired/offline session may still use the local cached workspace.
+    // Otherwise return to login with a visible reason instead of spinning.
+    cachedBootstrap = await cacheGet(`bootstrap:${currentUser.id}`).catch(() => null);
+    if (cachedBootstrap) {
+      showLoggedIn();
+      await renderAll();
+      await renderOutbox();
+    } else {
+      throw error;
+    }
   }
-  showLoggedIn();
-  await renderOutbox();
   updateConnection();
-  if (serverReachable) setTimeout(() => window.runBackgroundCloudBackup?.("login"), 0);
 }
 
 async function initialize() {
@@ -598,7 +646,7 @@ async function initialize() {
     const session = await api("/api/session");
     if (session.user) {
       csrfToken = session.csrfToken || readCookie("hh_csrf");
-      await establishSession(session.user);
+      await establishSession(session.user, session);
       return;
     }
     await cacheSet("identity", null);
@@ -723,11 +771,11 @@ async function sendPendingAction(item, owner) {
       return "failed";
     }
     await outboxDelete(item.opId);
-    await window.onPendingActionFinished?.(started,true);
+      await window.onPendingActionFinished?.(started,true,"",job.result||{});
     if(job.cloudSnapshotSaved===false||job.result?.cloudSnapshotSaved===false){
       showToast(currentLanguage==="ja-JP"?"変更は反映されましたが、クラウドスナップショットを保存できませんでした。後でバックアップを確認してください。":currentLanguage==="en-US"?"The change was applied, but its cloud snapshot was not saved. Check the backup later.":"更改已完成，但云端快照未保存；请稍后检查备份。",true);
     }
-    return "done";
+    return started.preview?.data?.localCommitComplete ? "done-local" : "done";
   }catch(error){
     const rejectedBeforeAcceptance=!serverAccepted&&error.status>=400&&error.status<500&&![408,429].includes(error.status);
     if(rejectedBeforeAcceptance&&error.status!==401){
@@ -806,7 +854,7 @@ async function syncQueue({manual=false}={}) {
           return;
         }
         const result=await sendPendingAction(first,currentUser.id);
-        if(result==="done"){completedAction=true;needsBootstrapRefresh=true;start++;continue;}
+        if(result==="done"||result==="done-local"){completedAction=true;needsBootstrapRefresh=needsBootstrapRefresh||result==="done";start++;continue;}
         if(result==="failed"){completedActionFailed=true;needsBootstrapRefresh=true;start++;continue;}
         if(result==="removed"){start++;continue;}
         return;
@@ -885,7 +933,6 @@ async function syncQueue({manual=false}={}) {
     scheduleSyncRetry();
   } finally {
     sending = false; updateConnection(); await renderOutbox();
-    if (!pendingSyncCount && serverReachable && navigator.onLine) void window.runBackgroundCloudBackup?.("write");
   }
 }
 
@@ -906,7 +953,6 @@ async function handleImport(file) {
   try {
     const result = await api("/api/import-ledger", {method:"POST",body:file,headers:{"Content-Type":"application/vnd.sqlite3"}});
     await fetchBootstrap();
-    void window.runBackgroundCloudBackup?.("write");
     showToast(t("importDone", result));
   } catch (error) {
     showToast(`${t("importError")} ${error.message}`, true);
@@ -956,9 +1002,9 @@ function setupEvents() {
     const next=languageSelect.value;
     if(languageSelect.id==="languageSelect"&&currentUser && typeof chats!=="undefined") {
       if(!confirm(currentLanguage==="ja-JP"?"言語を変更すると会話と未送信入力をクリアします。続行しますか？":currentLanguage==="en-US"?"Changing language clears chats and unsent input. Continue?":"切换语言会清空对话和未发送的内容，继续吗？")){languageSelect.value=currentLanguage;return;}
-      try { for(const agent of ["bookkeeping","food_health"]) await runAction("agent_reset",{agent},null,false); }
+      try { for(const agent of ["bookkeeping","food_health","ledger_query"]) await runAction("agent_reset",{agent},null,false); }
       catch(error){languageSelect.value=currentLanguage;showToast(error.message,true);return;}
-      chats={bookkeeping:[],food_health:[]};attachments=[];for(const agent of ["bookkeeping","food_health"]) await cacheSet("chat:"+currentUser.id+":"+agent,[]);
+      chats={bookkeeping:[],food_health:[],ledger_query:[]};attachments=[];for(const agent of ["bookkeeping","food_health","ledger_query"]) await cacheSet("chat:"+currentUser.id+":"+agent,[]);
     }
     currentLanguage = next; localStorage.setItem("hh-language",currentLanguage); applyLanguage();
     if (currentUser && serverReachable) try { await fetchBootstrap(); } catch {}

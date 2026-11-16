@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from .storage import Database, LedgerError, parse_date, to_minor
+from .region_time import DEFAULT_TIME_ZONE, regional_now
 
 
 REPAYMENT_SOURCE_TYPES = {"bank", "wallet", "prepaid", "transit"}
@@ -12,7 +13,7 @@ REPAYMENT_SOURCE_TYPES = {"bank", "wallet", "prepaid", "transit"}
 
 def credit_card_overview(database: Database, as_of: str | None = None) -> list[dict[str, Any]]:
     """Return current availability and user-defined debt estimates from limit snapshots."""
-    as_of_text = parse_date(as_of).isoformat() if as_of else None
+    as_of_text = parse_date(as_of, getattr(database, "time_zone", DEFAULT_TIME_ZONE)).isoformat() if as_of else None
     cards = database.connection.execute(
         "SELECT * FROM accounts WHERE account_type='credit' ORDER BY name"
     ).fetchall()
@@ -129,7 +130,9 @@ def save_credit_repayment_schedule(
     card_name: str,
     source_account_name: str,
     first_due_date: str,
+    due_time: str = "09:00",
     amount: str | int | None = None,
+    today_value: str | date | None = None,
 ) -> int:
     """Save fixed repayment routing and an optional amount for one due date only."""
     card = database.account(card_name)
@@ -146,8 +149,18 @@ def save_credit_repayment_schedule(
         to_minor(amount_text, currency["code"], int(currency["minor_digits"]))
         if amount_text else None
     )
-    due_date = parse_date(first_due_date)
-    if due_date < date.today():
+    due_date = parse_date(first_due_date, getattr(database, "time_zone", DEFAULT_TIME_ZONE))
+    due_time_text = str(due_time or "09:00").strip()
+    try:
+        parsed_due_time = datetime.strptime(due_time_text, "%H:%M")
+    except ValueError as exc:
+        raise LedgerError("还款时间格式无效，请选择具体时间。") from exc
+    if parsed_due_time.strftime("%H:%M") != due_time_text:
+        raise LedgerError("还款时间格式无效，请选择具体时间。")
+    local_today = parse_date(today_value, getattr(database, "time_zone", DEFAULT_TIME_ZONE)) if isinstance(today_value, str) else today_value
+    if local_today is None:
+        local_today = regional_now(getattr(database, "time_zone", DEFAULT_TIME_ZONE)).date()
+    if due_date < local_today:
         raise LedgerError("下次还款日期必须是今天或未来日期；过去日期请先核对实际扣款")
 
     existing = database.connection.execute(
@@ -186,18 +199,18 @@ def save_credit_repayment_schedule(
                         )
             database.connection.execute(
                 """UPDATE credit_repayment_rules
-                   SET source_account_id=?,currency=?,due_day=?,next_due_date=?,enabled=1,
+                   SET source_account_id=?,currency=?,due_day=?,next_due_date=?,due_time=?,enabled=1,
                        last_status='等待本期金额或还款日',updated_at=? WHERE id=?""",
-                (source["id"], currency["code"], due_day, due_date_text, now, schedule_id),
+                (source["id"], currency["code"], due_day, due_date_text, due_time_text, now, schedule_id),
             )
         else:
             cursor = database.connection.execute(
                 """INSERT INTO credit_repayment_rules
-                   (card_account_id,source_account_id,currency,due_day,next_due_date,
+                   (card_account_id,source_account_id,currency,due_day,next_due_date,due_time,
                     enabled,last_status,created_at,updated_at)
-                   VALUES (?,?,?,?,?,1,'等待本期金额或还款日',?,?)""",
+                   VALUES (?,?,?,?,?,?,1,'等待本期金额或还款日',?,?)""",
                 (card["id"], source["id"], currency["code"], due_day,
-                 due_date_text, now, now),
+                 due_date_text, due_time_text, now, now),
             )
             schedule_id = int(cursor.lastrowid)
 
@@ -208,15 +221,48 @@ def save_credit_repayment_schedule(
         if amount_minor is not None:
             if period and period["status"] == "posted":
                 raise LedgerError("这期还款已经记账，不能再修改金额")
-            database.connection.execute(
-                """INSERT INTO credit_repayment_periods
-                   (rule_id,due_date,amount_minor,status,transaction_id,created_at,updated_at)
-                   VALUES (?,?,?,'pending',NULL,?,?)
-                   ON CONFLICT(rule_id,due_date) DO UPDATE SET
-                       amount_minor=excluded.amount_minor,status='pending',transaction_id=NULL,
-                       updated_at=excluded.updated_at""",
-                (schedule_id, due_date_text, amount_minor, now, now),
-            )
+            if period:
+                # Update an existing month explicitly. Apart from being easier
+                # to reason about than an UPSERT across the deployed SQLite
+                # variants, this preserves the period row and its audit trail.
+                updated = database.connection.execute(
+                    """UPDATE credit_repayment_periods
+                       SET amount_minor=?,status='pending',transaction_id=NULL,updated_at=?
+                       WHERE id=? AND status!='posted'""",
+                    (amount_minor, now, period["id"]),
+                )
+                if updated.rowcount == 0:
+                    raise LedgerError("这期还款已记账，不能再修改金额；请刷新后核对。")
+            else:
+                try:
+                    database.connection.execute(
+                        """INSERT INTO credit_repayment_periods
+                           (rule_id,due_date,amount_minor,status,transaction_id,created_at,updated_at)
+                           VALUES (?,?,?,'pending',NULL,?,?)""",
+                        (schedule_id, due_date_text, amount_minor, now, now),
+                    )
+                except Exception as exc:
+                    # Two saves can race after the initial SELECT. If another
+                    # request created this exact period, update that row safely
+                    # instead of failing the whole repayment-plan change.
+                    if type(exc).__name__ != "IntegrityError":
+                        raise
+                    raced_period = database.connection.execute(
+                        "SELECT id,status FROM credit_repayment_periods WHERE rule_id=? AND due_date=?",
+                        (schedule_id, due_date_text),
+                    ).fetchone()
+                    if not raced_period:
+                        raise
+                    if raced_period["status"] == "posted":
+                        raise LedgerError("这期还款已记账，不能再修改金额；请刷新后核对。") from exc
+                    updated = database.connection.execute(
+                        """UPDATE credit_repayment_periods
+                           SET amount_minor=?,status='pending',transaction_id=NULL,updated_at=?
+                           WHERE id=? AND status!='posted'""",
+                        (amount_minor, now, raced_period["id"]),
+                    )
+                    if updated.rowcount == 0:
+                        raise LedgerError("这期还款已记账，不能再修改金额；请刷新后核对。") from exc
             database.connection.execute(
                 "UPDATE credit_repayment_rules SET last_status='本期金额已填写，等待还款日' WHERE id=?",
                 (schedule_id,),
@@ -235,18 +281,50 @@ def save_credit_repayment_schedule(
 
 
 def set_credit_repayment_schedule_enabled(
-    database: Database, *, card_name: str, enabled: bool
+    database: Database, *, card_name: str, enabled: bool, today_value: str | date | None = None
 ) -> None:
     card = database.account(card_name)
     if card["account_type"] != "credit":
         raise LedgerError(f"账户“{card_name}”不是信用卡账户")
+    local_today = parse_date(today_value, getattr(database, "time_zone", DEFAULT_TIME_ZONE)) if isinstance(today_value, str) else today_value
+    if local_today is None:
+        local_today = regional_now(getattr(database, "time_zone", DEFAULT_TIME_ZONE)).date()
     cursor = database.connection.execute(
         "UPDATE credit_repayment_rules SET enabled=?,last_status=?,updated_at=? WHERE card_account_id=?",
-        (int(enabled), "等待本期金额或还款日" if enabled else "已暂停", date.today().isoformat(), card["id"]),
+        (int(enabled), "等待本期金额或还款日" if enabled else "已暂停", local_today.isoformat(), card["id"]),
     )
     if cursor.rowcount == 0:
         raise LedgerError(f"“{card_name}”还没有每月应还计划")
     database.connection.commit()
+
+
+def delete_credit_repayment_schedule(database: Database, *, card_name: str) -> None:
+    """Stop future scheduled ledger entries while retaining repayment history."""
+    card = database.account(card_name)
+    if card["account_type"] != "credit":
+        raise LedgerError(f"账户“{card_name}”不是信用卡账户")
+    schedule = database.connection.execute(
+        "SELECT id FROM credit_repayment_rules WHERE card_account_id=?",
+        (card["id"],),
+    ).fetchone()
+    if not schedule:
+        raise LedgerError(f"“{card_name}”还没有每月应还计划")
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+    with database.connection:
+        # Pending rows have not been posted. Cancel them, but leave posted and
+        # missed periods intact so the repayment history remains auditable.
+        database.connection.execute(
+            """UPDATE credit_repayment_periods
+               SET status='cancelled',updated_at=?
+               WHERE rule_id=? AND status='pending'""",
+            (now, schedule["id"]),
+        )
+        database.connection.execute(
+            """UPDATE credit_repayment_rules
+               SET enabled=0,last_status='计划已删除',updated_at=? WHERE id=?""",
+            (now, schedule["id"]),
+        )
 
 
 def credit_repayment_schedules(database: Database) -> list[dict[str, Any]]:
@@ -265,9 +343,19 @@ def credit_repayment_schedules(database: Database) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def process_due_credit_repayments(database: Database, today: str) -> list[dict[str, Any]]:
+def process_due_credit_repayments(
+    database: Database, today: str, current_time: str | None = None,
+) -> list[dict[str, Any]]:
     """Post only the entered amount for the current due date; never reuse it next month."""
-    today_date = parse_date(today)
+    today_date = parse_date(today, getattr(database, "time_zone", DEFAULT_TIME_ZONE))
+    if current_time is None:
+        current_time = regional_now(getattr(database, "time_zone", DEFAULT_TIME_ZONE)).strftime("%H:%M")
+    try:
+        parsed_current_time = datetime.strptime(current_time, "%H:%M")
+    except ValueError as exc:
+        raise LedgerError("当前时间格式无效，暂不能处理自动还款。") from exc
+    if parsed_current_time.strftime("%H:%M") != current_time:
+        raise LedgerError("当前时间格式无效，暂不能处理自动还款。")
     due_schedules = database.connection.execute(
         """SELECT r.*,card.name AS card_name FROM credit_repayment_rules r
            JOIN accounts card ON card.id=r.card_account_id
@@ -277,7 +365,7 @@ def process_due_credit_repayments(database: Database, today: str) -> list[dict[s
     events: list[dict[str, Any]] = []
     for schedule in due_schedules:
         schedule_id = int(schedule["id"])
-        due_date = parse_date(schedule["next_due_date"])
+        due_date = parse_date(schedule["next_due_date"], getattr(database, "time_zone", DEFAULT_TIME_ZONE))
         if due_date < today_date:
             status = "到期日已过，未自动记账；请核对实际扣款"
             following_due_date = next_month_due_date(due_date.isoformat(), int(schedule["due_day"]))
@@ -300,6 +388,10 @@ def process_due_credit_repayments(database: Database, today: str) -> list[dict[s
                         (following_due_date, today_date.isoformat(), schedule_id),
                     )
             events.append({"status": "missed", "card_name": schedule["card_name"], "due_date": due_date.isoformat()})
+            continue
+
+        due_time = str(schedule["due_time"] or "09:00")
+        if due_date == today_date and current_time < due_time:
             continue
 
         if database.connection.in_transaction:

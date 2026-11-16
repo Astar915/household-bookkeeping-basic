@@ -6,7 +6,7 @@ import hmac
 import json
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from workers import fetch
@@ -38,6 +38,7 @@ from ledger_runtime import (
     restore_bundle,
     first_run_setup_required,
     workspace_snapshot,
+    workspace_revision,
 )
 
 
@@ -104,10 +105,29 @@ async def _job(database, user_id: str, operation_id: str):
     if not OPERATION_ID_RE.fullmatch(operation_id):
         raise ValueError("操作编号无效。")
     row = await database.prepare(
-        "SELECT operation_id,state,message,result_json FROM app_jobs WHERE user_id=? AND operation_id=?"
+        "SELECT operation_id,action,state,message,result_json,updated_at FROM app_jobs "
+        "WHERE user_id=? AND operation_id=?"
     ).bind(user_id, operation_id).first()
     if row is None:
         raise FileNotFoundError("找不到此操作。")
+    if (str(_field(row, "state")) == "queued"
+            and str(_field(row, "action")) in {"cloud_upload", "cloud_auto_sync", "startup_pull"}):
+        try:
+            updated_at = datetime.fromisoformat(str(_field(row, "updated_at")))
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            stale = datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc) > timedelta(minutes=20)
+        except (TypeError, ValueError):
+            stale = False
+        if stale:
+            from model_jobs import expire_stale_queued_cloud_jobs
+            await expire_stale_queued_cloud_jobs(database, user_id, operation_id)
+            row = await database.prepare(
+                "SELECT operation_id,action,state,message,result_json,updated_at FROM app_jobs "
+                "WHERE user_id=? AND operation_id=?"
+            ).bind(user_id, operation_id).first()
+            if row is None:
+                raise FileNotFoundError("找不到此操作。")
     try:
         result = json.loads(str(_field(row, "result_json") or "{}"))
     except (TypeError, ValueError):
@@ -121,6 +141,9 @@ async def _job(database, user_id: str, operation_id: str):
 
 async def _model_balance(database, env, user_id: str, agent: str, vision: bool):
     """Read a supported provider balance without exposing saved credentials."""
+    if agent == "ledger_query":
+        # Ledger queries use the user's configured bookkeeping text model.
+        agent = "bookkeeping"
     if agent not in {"bookkeeping", "food_health"}:
         raise ValueError("Agent 无效。")
     config = await load_mobile_config(database, env, user_id)
@@ -402,6 +425,8 @@ async def dispatch(request, env):
 
             if path == "/api/bootstrap":
                 return json_response(await bootstrap(database, user, language, env))
+            if path == "/api/workspace/revision":
+                return json_response(await workspace_revision(database, user_id, env))
             if path == "/api/workspace":
                 report_date = query.get("asOf", [None])[0]
                 return json_response(await workspace_snapshot(
@@ -569,6 +594,7 @@ async def dispatch(request, env):
                 and setup_step in {"base", "api", "agents", "skills"}
                 and "baseCurrency" in setup_data
                 and "billingCycleStartDay" in setup_data
+                and "timeZone" in setup_data
             )
             setup_settings = setup_data.get("settings") if isinstance(setup_data, dict) else None
             setup_confirmations = setup_data.get("setupConfirmations") if isinstance(setup_data, dict) else None
@@ -580,9 +606,11 @@ async def dispatch(request, env):
                 and setup_settings.get("completeOnboarding") is True
                 and "baseCurrency" in setup_settings
                 and "billingCycleStartDay" in setup_settings
+                and "timeZone" in setup_settings
                 and isinstance(setup_confirmations, dict)
                 and setup_confirmations.get("baseCurrency") is True
                 and setup_confirmations.get("billingCycleStartDay") is True
+                and setup_confirmations.get("timeZone") is True
             )
             is_account_setup = path == "/api/accounts" and body.get("onboardingStep") == "accounts"
             if not (is_setup_submission or is_tutorial_completion or is_account_setup):

@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
 from workers import fetch
 
@@ -23,6 +23,11 @@ from model_jobs import (
 
 MAX_MODEL_CALLS_PER_JOB = 32
 MAX_RATE_LOOKUPS_PER_JOB = 128
+MAX_PRODUCT_SEARCH_RESPONSE_BYTES = 128 * 1024
+PRODUCT_SEARCH_HOSTS = {
+    "zh.wikipedia.org", "ja.wikipedia.org", "en.wikipedia.org",
+    "html.duckduckgo.com", "world.openfoodfacts.org",
+}
 
 
 def _field(row, key):
@@ -72,7 +77,91 @@ async def _ensure_active(database, user_id: str, operation_id: str):
 
 async def _provider_fetch(envelope: dict, *, max_bytes=MAX_MODEL_RESPONSE_BYTES):
     """Call the configured model via Workers fetch; persist only bounded bytes."""
-    source_host = (urlsplit(envelope["url"]).hostname or "").lower()
+    source_parts = urlsplit(envelope["url"])
+    source_host = (source_parts.hostname or "").lower()
+    request_method = str(envelope.get("method", "GET")).upper()
+    try:
+        standard_https = (
+            source_parts.scheme == "https"
+            and source_parts.port in (None, 443)
+            and source_parts.username is None
+            and source_parts.password is None
+        )
+    except ValueError:
+        standard_https = False
+    wikipedia_search = (
+        standard_https
+        and source_host in {"zh.wikipedia.org", "ja.wikipedia.org", "en.wikipedia.org"}
+        and source_parts.path == "/w/api.php"
+        and request_method == "GET"
+    )
+    duckduckgo_search = (
+        standard_https
+        and source_host == "html.duckduckgo.com"
+        and source_parts.path == "/html/"
+        and request_method == "GET"
+    )
+    open_food_facts_search = (
+        standard_https
+        and source_host == "world.openfoodfacts.org"
+        and source_parts.path == "/cgi/search.pl"
+        and request_method == "GET"
+    )
+    is_product_search = wikipedia_search or duckduckgo_search or open_food_facts_search
+    if source_host in PRODUCT_SEARCH_HOSTS and not is_product_search:
+        raise ValueError("商品查询只能访问受限的公开搜索接口。")
+    if is_product_search:
+        query = parse_qs(source_parts.query, keep_blank_values=True)
+        if wikipedia_search:
+            try:
+                search_limit = int((query.get("srlimit") or ["0"])[0] or "0")
+            except (TypeError, ValueError):
+                search_limit = 0
+            valid_query = (
+                query.get("action") == ["query"]
+                and query.get("list") == ["search"]
+                and query.get("srprop") == ["snippet"]
+                and query.get("srwhat") == ["text"]
+                and query.get("format") == ["json"]
+                and query.get("utf8") == ["1"]
+                and bool((query.get("srsearch") or [""])[0].strip())
+                and 1 <= search_limit <= 3
+                and set(query) == {"action", "list", "srsearch", "srwhat", "srprop", "srlimit", "format", "utf8"}
+            )
+        elif duckduckgo_search:
+            search_term = (query.get("q") or [""])[0].strip()
+            valid_query = (
+                set(query) == {"q"}
+                and bool(search_term)
+                and len(query.get("q", [])) == 1
+                and len(search_term) <= 96
+                and not any(ord(character) < 32 for character in search_term)
+            )
+        else:
+            search_term = (query.get("search_terms") or [""])[0].strip()
+            try:
+                product_limit = int((query.get("page_size") or ["0"])[0] or "0")
+            except (TypeError, ValueError):
+                product_limit = 0
+            valid_query = (
+                set(query) == {"search_terms", "search_simple", "action", "json", "page_size", "fields"}
+                and bool(search_term)
+                and len(search_term) <= 96
+                and query.get("search_simple") == ["1"]
+                and query.get("action") == ["process"]
+                and query.get("json") == ["1"]
+                and 1 <= product_limit <= 4
+                and query.get("fields") == ["product_name,brands,categories,categories_tags,labels"]
+            )
+        if not valid_query:
+            raise ValueError("商品查询参数超出允许范围。")
+        request_headers = envelope.get("headers") or {}
+        if not isinstance(request_headers, dict):
+            raise ValueError("商品查询请求头无效。")
+        headers = {str(key).lower(): str(value) for key, value in request_headers.items()}
+        if set(headers) - {"accept", "user-agent"} or envelope.get("body"):
+            raise ValueError("商品查询请求不允许携带账户或 API 凭据。")
+        max_bytes = min(max_bytes, MAX_PRODUCT_SEARCH_RESPONSE_BYTES)
     # Workers does not support redirect="error": it throws before sending.
     # Follow GitHub's API redirects, but keep other providers manual so an
     # Authorization header is never forwarded to an arbitrary redirect host.
@@ -86,16 +175,31 @@ async def _provider_fetch(envelope: dict, *, max_bytes=MAX_MODEL_RESPONSE_BYTES)
         options["body"] = envelope["body"].decode("utf-8")
     try:
         response = await fetch(envelope["url"], **options)
-    except Exception as exc:
+    except BaseException as exc:
+        # Cloudflare's Pyodide bridge can surface fetch transport failures as
+        # JsException (which is not consistently caught by ``Exception`` on
+        # every deployed runtime). Let cancellations and process-control
+        # exceptions propagate, but keep provider connection failures inside
+        # the durable request flow instead of exposing a Python socket stack.
+        import asyncio
+        if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
         # Keep diagnostics useful without logging the request path, headers,
         # credentials, or user-provided prompt/body.
         safe_host = "".join(char for char in source_host if char.isalnum() or char in ".-")[:253]
         safe_host = safe_host or "unknown host"
         error_type = type(exc).__name__
         print(f"External service fetch failed (host={safe_host}, error={error_type}).")
+        # GET requests here are safe to replay. A synthetic HTTP failure lets
+        # the currency resolver try its next independent source (and lets
+        # optional product lookup fall back locally). Never retry a POST:
+        # the provider may have processed it already, which could incur a
+        # duplicate model charge.
+        if request_method == "GET" and not envelope.get("body"):
+            return 503, b"", {}
         raise RuntimeError(
-            f"连接外部服务（{safe_host}）失败；请检查网络、接口地址和服务状态。本次操作尚未写入账本。"
-        ) from exc
+            f"连接外部服务（{safe_host}）失败；请稍后重试。本次操作尚未写入账本。"
+        ) from None
     if source_host == "api.github.com":
         final_host = (urlsplit(str(getattr(response, "url", envelope["url"]))).hostname or "").lower()
         if final_host not in {"api.github.com", "raw.githubusercontent.com"}:
@@ -131,9 +235,10 @@ async def advance_job(database, env, user_id: str, operation_id: str):
 
         action = str(_field(job, "action"))
         fingerprint = str(_field(job, "fingerprint"))
-        request_now = datetime.fromisoformat(
-            str(_field(job, "created_at"))
-        ).astimezone(timezone(timedelta(hours=9)))
+        request_now = datetime.fromisoformat(str(_field(job, "created_at")))
+        if request_now.tzinfo is None:
+            request_now = request_now.replace(tzinfo=timezone.utc)
+        request_now = request_now.astimezone(timezone.utc)
         action, data = await load_job_payload(
             database, env, user_id, operation_id, fingerprint, action,
         )
@@ -201,6 +306,12 @@ async def advance_job(database, env, user_id: str, operation_id: str):
             return {"state": "continue"}
 
         latest = await _read_job(database, user_id, operation_id)
+        if str(_field(latest, "state")) == "done":
+            # The ledger commit and its outbox row are already durable. Start
+            # GitHub/Gitee backup as a separate persistent Workflow now; never
+            # make the foreground operation wait for the provider upload.
+            from scheduled import dispatch_queued_backup
+            await dispatch_queued_backup(database, env, user_id)
         await cleanup_job_private_state(database, user_id, operation_id)
         return {"state": str(_field(latest, "state")), "result": _json_result(latest)}
     except Exception as exc:
@@ -212,7 +323,8 @@ async def advance_job(database, env, user_id: str, operation_id: str):
             f"{frame.filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.lineno}"
             for frame in frames[-5:]
         )
-        print(f"App job failed ({type(exc).__name__}) at {locations}.")
+        safe_detail = f"; {str(exc)[:180]}" if type(exc).__name__ == "IntegrityError" else ""
+        print(f"App job failed ({type(exc).__name__}) at {locations}{safe_detail}.")
         if isinstance(exc, (ValueError, RuntimeError)):
             message = str(exc)
         else:
@@ -262,6 +374,8 @@ async def advance_job(database, env, user_id: str, operation_id: str):
                     "UPDATE auto_sync_queue SET state='failed',operation_id=NULL,updated_at=? "
                     "WHERE user_id=? AND operation_id=?"
                 ).bind(_now(), user_id, operation_id).run()
+            from scheduled import dispatch_queued_backup
+            await dispatch_queued_backup(database, env, user_id)
         except Exception:
             raise
         return {"state": terminal_state, "result": {"error": message}}

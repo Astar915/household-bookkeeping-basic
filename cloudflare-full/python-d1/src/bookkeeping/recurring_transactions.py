@@ -64,7 +64,7 @@ def save_recurring_schedule(
     clean_name = name.strip()
     if not clean_name:
         raise LedgerError("项目名称不能为空")
-    due = parse_date(first_date)
+    due = parse_date(first_date, getattr(database, "time_zone", "Asia/Tokyo"))
     account = database.account(account_name)
     category = database.category(category_name, kind)
     if account["currency"] == "PTS" or account["account_type"] == "points":
@@ -157,7 +157,7 @@ def _next_due_date(due: date, frequency: str, interval: int, anchor_day: int, an
 
 
 def process_due_recurring_transactions(database: Database, today: str) -> list[dict[str, Any]]:
-    today_date = parse_date(today)
+    today_date = parse_date(today, getattr(database, "time_zone", "Asia/Tokyo"))
     schedules = database.connection.execute(
         """SELECT s.*,a.name AS account_name,a.currency AS account_currency,
                   c.name AS category_name
@@ -184,7 +184,7 @@ def process_due_recurring_transactions(database: Database, today: str) -> list[d
             ).fetchone()
             if schedule is None:
                 break
-            due = parse_date(str(schedule["next_due_date"]))
+            due = parse_date(str(schedule["next_due_date"]), getattr(database, "time_zone", "Asia/Tokyo"))
             if due > today_date:
                 break
             if posted_for_schedule >= 100:

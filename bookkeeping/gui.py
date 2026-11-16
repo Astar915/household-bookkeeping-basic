@@ -58,6 +58,15 @@ from .natural_language import (
     is_deepseek_api,
     load_image_attachment,
 )
+from .region_time import (
+    DEFAULT_TIME_ZONE,
+    SUPPORTED_TIME_ZONES,
+    TIME_ZONE_CHOICES,
+    normalize_time_zone,
+    region_label,
+    regional_now,
+    regional_today,
+)
 from .request_worker import (RequestMergeError, merge_isolated_database, run_isolated_request,
                              receive_request_result, commit_request_result)
 from .cloud_pull import PullState, automatic_pull, local_revision
@@ -83,7 +92,7 @@ from .credit_management import (
     process_due_credit_repayments,
     record_credit_card_repayment,
     save_credit_repayment_schedule,
-    set_credit_repayment_schedule_enabled,
+    delete_credit_repayment_schedule,
 )
 from .financial_statements import build_balance_sheet, build_profit_statement
 from .github_sync import (
@@ -206,6 +215,18 @@ class BookkeepingWindow:
         install_tk_localization(root, self.language)
         self.ui_font_family = configure_global_fonts(root)
         self.database_path = database_path
+        self.time_zone = DEFAULT_TIME_ZONE
+        try:
+            if self.database_path.exists():
+                with sqlite3.connect(self.database_path) as timezone_connection:
+                    row = timezone_connection.execute(
+                        "SELECT value FROM settings WHERE key='time_zone'"
+                    ).fetchone()
+                if row:
+                    self.time_zone = normalize_time_zone(row[0])
+        except sqlite3.Error:
+            # Older or not-yet-initialized ledgers use the original Japan default.
+            pass
         self.desktop_tutorial_store = DesktopTutorialStore()
         self._desktop_tutorial_window: tk.Toplevel | None = None
         self.root.report_callback_exception = self._report_ui_exception
@@ -234,6 +255,7 @@ class BookkeepingWindow:
         self._github_upload_lock = threading.Lock()
         self._cloud_sync_state_lock = threading.Lock()
         self._cloud_sync_states = {"github": "idle", "gitee": "idle"}
+        self._startup_cloud_providers: tuple[str, ...] = ()
         self.receipt_image_settings_store = ReceiptImageSettingsStore()
         self.receipt_image_settings_error = ""
         try:
@@ -244,9 +266,10 @@ class BookkeepingWindow:
         self.clients: dict[tuple[str, bool, str], OpenAICompatibleClient] = {}
         self.history: list[dict[str, Any]] = []
         self.pending_state: dict[str, Any] | None = None
-        self.agent_mode = "bookkeeping"
+        self.agent_mode = "smart"
         self.agent_states: dict[str, dict[str, Any]] = {
-            "bookkeeping": {"history": self.history, "pending_state": None, "messages": [], "workflow_profile_id": None},
+            "smart": {"history": self.history, "pending_state": None, "messages": [], "workflow_profile_id": None},
+            "bookkeeping": {"history": [], "pending_state": None, "messages": [], "workflow_profile_id": None},
             "food_health": {"history": [], "pending_state": None, "messages": [], "workflow_profile_id": None},
         }
         self.recurring_results: queue.Queue[tuple[list[dict[str, Any]], str | None]] = queue.Queue()
@@ -412,7 +435,7 @@ class BookkeepingWindow:
         self._install_mousewheel_support()
         self._append_message(
             "助手",
-            "你好，直接告诉我一笔收入、消费、转账或还款。信息不够时我会先追问，确认后才写入本地账本。",
+            "你好，可以直接聊天、查账、记账或咨询饮食。涉及账本的回答会读取本机账本；只有确认后的记账操作才会写入。",
         )
         self.root.after(200, lambda: self.transcript.yview_moveto(0))
         self.input_box.focus_set()
@@ -1306,6 +1329,11 @@ class BookkeepingWindow:
         self._copy_to_clipboard(self._treeview_selection_text(widget))
         return "break"
 
+    def _today_local(self) -> str:
+        # Several lightweight GUI tests instantiate the window without running
+        # Tk initialization. Keep their date behavior aligned with new ledgers.
+        return regional_today(getattr(self, "time_zone", DEFAULT_TIME_ZONE))
+
     def _check_due_scheduled_entries(self) -> None:
         """Process both local schedules with one database open, even offline."""
         if self.busy or self._github_restore_in_progress:
@@ -1333,11 +1361,11 @@ class BookkeepingWindow:
                     try:
                         database.initialize()
                         try:
-                            credit_events = process_due_credit_repayments(database, _today_japan())
+                            credit_events = process_due_credit_repayments(database, regional_today(database.get_time_zone()))
                         except Exception as exc:
                             credit_error = str(exc)
                         try:
-                            recurring_events = process_due_recurring_transactions(database, _today_japan())
+                            recurring_events = process_due_recurring_transactions(database, regional_today(database.get_time_zone()))
                         except Exception as exc:
                             recurring_error = str(exc)
                     finally:
@@ -1534,10 +1562,8 @@ class BookkeepingWindow:
         dialog = self._startup_cloud_progress_dialog
         label = self._startup_cloud_progress_label
         try:
-            if dialog is None or not dialog.winfo_exists():
-                return
             self.status.configure(text=translated)
-            if label is not None:
+            if label is not None and dialog is not None and dialog.winfo_exists():
                 label.configure(text=translated)
         except tk.TclError:
             pass
@@ -1563,27 +1589,149 @@ class BookkeepingWindow:
             return
         if self._github_restore_in_progress:
             return
-        connected = False
-        for provider, settings_store, token_store in (
-            ("github", GitHubSyncSettingsStore(), GitHubTokenStore()),
-            ("gitee", GiteeSyncSettingsStore(), GiteeTokenStore()),
-        ):
-            try:
-                has_repository = bool(settings_store.load().get("repository"))
-                has_token = bool(
-                    token_store.load_credentials().get("access_token")
-                    if provider == "github" else token_store.load()
-                )
-                if has_repository and has_token:
-                    connected = True
-                    break
-            except Exception:
-                continue
-        if connected:
-            self._queue_github_auto_sync()
-        else:
+        self._github_restore_in_progress = True
+        try:
+            candidates = self._build_startup_cloud_candidates()
+        except Exception as exc:
+            self._github_restore_in_progress = False
+            self._set_cloud_sync_indicator("github", "error")
+            self._set_cloud_sync_indicator("gitee", "error")
+            message = translate("云端备份检查失败", self.language) + "：" + translate(str(exc), self.language)
+            self.status.configure(text=message)
+            return
+        if not candidates:
+            self._github_restore_in_progress = False
+            self._startup_cloud_providers = ()
             self._set_cloud_sync_indicator("github", "idle")
             self._set_cloud_sync_indicator("gitee", "idle")
+            return
+
+        providers = tuple(dict.fromkeys(item[0] for item in candidates))
+        self._startup_cloud_providers = providers
+        for provider in providers:
+            self._set_cloud_sync_indicator(provider, "checking")
+
+        try:
+            # Startup sync is automatic. A prior "keep local" choice no longer
+            # leaves cloud downloads permanently paused after the user enabled
+            # background synchronization.
+            self._pull_state().resume_downloads()
+        except Exception as exc:
+            self._github_restore_in_progress = False
+            message = translate("自动下载未完成：{error}", self.language).format(
+                error=translate(str(exc), self.language)
+            )
+            self.status.configure(text=message)
+            for provider in providers:
+                self._set_cloud_sync_indicator(provider, "error")
+            return
+
+        with self._github_auto_sync_state_lock:
+            self._github_auto_sync_pending = False
+        for provider in providers:
+            self._set_cloud_sync_indicator(provider, "checking")
+        self.send_button.configure(state="disabled")
+        self.input_box.configure(state="disabled")
+        self._startup_cancelled.clear()
+
+        def report_progress(message: str) -> None:
+            phase = "downloading" if "下载" in message or "恢复" in message else "checking"
+            for provider in providers:
+                self._set_cloud_sync_indicator(provider, phase)
+            self.post_to_ui(lambda: self._update_startup_cloud_progress(message))
+
+        def restore_cloud_bundle(bundle: bytes, provider: str) -> Path:
+            return restore_sync_bundle(
+                bundle,
+                self.database_path,
+                receipt_image_directory=self.database_path.parent / "receipt_images",
+                backup_provider=provider,
+                **self._cloud_stores(),
+            )
+
+        def download_worker() -> None:
+            try:
+                result = automatic_pull(
+                    self.database_path,
+                    candidates,
+                    self._pull_state(),
+                    restore_cloud_bundle,
+                    stores=self._cloud_stores(),
+                    lock=self._scheduled_db_work_lock,
+                    cancelled=self._startup_cancelled.is_set,
+                    progress=report_progress,
+                )
+                self._startup_results.put((result, None))
+            except Exception as exc:
+                self._startup_results.put((None, str(exc)))
+
+        try:
+            threading.Thread(
+                target=download_worker,
+                name="startup-cloud-download",
+                daemon=True,
+            ).start()
+            self.root.after(100, self._poll_startup_cloud_pull)
+        except RuntimeError as exc:
+            self._close_startup_cloud_progress()
+            self._github_restore_in_progress = False
+            self.send_button.configure(state="normal")
+            self.input_box.configure(state="normal")
+            for provider in providers:
+                self._set_cloud_sync_indicator(provider, "error")
+            message = translate("自动下载未完成：{error}", self.language).format(
+                error=translate(str(exc), self.language)
+            )
+            self.status.configure(text=message)
+
+    def _build_startup_cloud_candidates(self):
+        """Build read/download clients for connected providers; never upload here."""
+        candidates = []
+
+        github_settings_store = GitHubSyncSettingsStore()
+        github_settings = github_settings_store.load()
+        github_repository = github_settings.get("repository", "")
+        if github_repository:
+            github_token_store = GitHubTokenStore()
+            credentials = github_token_store.load_credentials()
+            if credentials.get("access_token"):
+                github_client = GitHubClient(
+                    credentials["access_token"],
+                    refresh_token=credentials.get("refresh_token", ""),
+                    client_id=GITHUB_APP_CLIENT_ID,
+                    token_store=github_token_store,
+                )
+
+                def save_github_checkpoint(sha: str) -> None:
+                    current = github_settings_store.load()
+                    github_settings_store.save(
+                        repository_name=current.get("repository_name", DEFAULT_BACKUP_REPOSITORY_NAME),
+                        repository=github_repository,
+                        last_sync_sha=sha,
+                    )
+
+                candidates.append(("github", github_repository, github_client, save_github_checkpoint))
+
+        gitee_settings_store = GiteeSyncSettingsStore()
+        gitee_settings = gitee_settings_store.load()
+        gitee_repository = gitee_settings.get("repository", "")
+        if gitee_repository:
+            gitee_token = GiteeTokenStore().load()
+            if gitee_token:
+                gitee_client = GiteeClient(gitee_token)
+
+                def save_gitee_checkpoint(sha: str) -> None:
+                    current = gitee_settings_store.load()
+                    gitee_settings_store.save(
+                        repository_name=current.get(
+                            "repository_name", DEFAULT_GITEE_BACKUP_REPOSITORY_NAME
+                        ),
+                        repository=gitee_repository,
+                        last_sync_sha=sha,
+                    )
+
+                candidates.append(("gitee", gitee_repository, gitee_client, save_gitee_checkpoint))
+        return candidates
 
     def _poll_startup_cloud_pull(self):
         try:
@@ -1592,8 +1740,13 @@ class BookkeepingWindow:
             self.root.after(100, self._poll_startup_cloud_pull)
             return
         try:
-            self._close_startup_cloud_progress()
+            result = result or {}
             if result.get('restored'):
+                restored_provider = result.get("provider")
+                for provider in self._startup_cloud_providers:
+                    self._set_cloud_sync_indicator(
+                        provider, "success" if provider == restored_provider else "connected"
+                    )
                 self._clear_conversation_context()
                 self._reload_payment_profiles()
                 self.loaded_skill = self.skill_store.load()
@@ -1604,28 +1757,36 @@ class BookkeepingWindow:
                     path=backup
                 )
                 self.status.configure(text=message)
-                messagebox.showinfo(translate("云端检查完成", self.language), message, parent=self.root)
             elif error:
+                for provider in self._startup_cloud_providers:
+                    self._set_cloud_sync_indicator(provider, "error")
                 message = translate('自动下载未完成：{error}', self.language).format(
                     error=translate(error, self.language)
                 )
                 self.status.configure(text=message)
-                messagebox.showerror(translate("云端备份检查失败", self.language), message, parent=self.root)
             elif result.get('status') == 'current':
+                for provider in self._startup_cloud_providers:
+                    self._set_cloud_sync_indicator(provider, "success")
                 message = translate("云端账本已是最新，本机账本没有变化。", self.language)
                 self.status.configure(text=message)
-                messagebox.showinfo(translate("云端检查完成", self.language), message, parent=self.root)
             elif result.get('status') == 'unconnected':
+                for provider in self._startup_cloud_providers:
+                    self._set_cloud_sync_indicator(provider, "connected")
                 message = translate(
                     "没有可用的 GitHub/Gitee 授权，本次没有下载；本机账本保持不变。",
                     self.language,
                 )
                 self.status.configure(text=message)
-                messagebox.showwarning(translate("云端检查未完成", self.language), message, parent=self.root)
+            elif result.get('status') in {'local_kept', 'choice_required', 'choice_changed'}:
+                for provider in self._startup_cloud_providers:
+                    self._set_cloud_sync_indicator(provider, "connected")
+                message = translate("本机账本保持不变；本次未应用云端数据。", self.language)
+                self.status.configure(text=message)
             else:
+                for provider in self._startup_cloud_providers:
+                    self._set_cloud_sync_indicator(provider, "connected")
                 message = translate("本次没有应用云端账本；本机账本保持不变。", self.language)
                 self.status.configure(text=message)
-                messagebox.showinfo(translate("云端检查完成", self.language), message, parent=self.root)
         finally:
             self._github_restore_in_progress = False
             self.send_button.configure(state='normal')
@@ -1844,17 +2005,25 @@ class BookkeepingWindow:
         self.post_to_ui(update_status)
 
     def _set_cloud_sync_indicator(self, provider: str, state: str) -> None:
-        if provider not in self._cloud_sync_states or state not in {"idle", "uploading", "success", "error"}:
+        if provider not in self._cloud_sync_states or state not in {
+            "idle", "connected", "checking", "downloading", "uploading", "success", "error"
+        }:
             return
         with self._cloud_sync_state_lock:
             self._cloud_sync_states[provider] = state
             states = tuple(self._cloud_sync_states.values())
         if "uploading" in states:
             message, foreground = "● 云端上传中…", color("#b54708")
+        elif "downloading" in states:
+            message, foreground = "● 云端下载中…", color("#b54708")
+        elif "checking" in states:
+            message, foreground = "● 正在检查云端…", color("#b54708")
         elif "error" in states:
             message, foreground = "● 云端同步失败", color("#d92d20")
         elif "success" in states:
-            message, foreground = "● 已上传到云端", color("#039855")
+            message, foreground = "● 云端已同步", color("#039855")
+        elif "connected" in states:
+            message, foreground = "● 云端已连接", color("#039855")
         else:
             message, foreground = "● 云端未连接", color("#667085")
 
@@ -1912,7 +2081,7 @@ class BookkeepingWindow:
         agent_sidebar.grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Label(agent_sidebar, text="记录", style="Title.TLabel").pack(side="left", padx=(0, 24))
         self.agent_buttons: dict[str, ttk.Button] = {}
-        for mode, label in (("bookkeeping", "记账"), ("food_health", "饮食健康")):
+        for mode, label in (("smart", "智能助手"),):
             button = ttk.Button(agent_sidebar, text=label, style="Selected.Agent.TButton" if mode == self.agent_mode else "Agent.TButton",
                                 command=lambda selected=mode: self._select_agent(selected))
             button.pack(side="left", padx=(0, 8))
@@ -2092,6 +2261,11 @@ class BookkeepingWindow:
                 "助手",
                 "我会先检索本地近期饮食记录，再交给饮食健康 Agent 单独配置的模型和 Skill 给出均衡饮食建议。记录不足时会说明限制；此模式不会修改记录。",
             ))
+        elif not selected["messages"] and mode == "smart":
+            selected["messages"].append((
+                "助手",
+                "你好，可以直接聊天、查账、记账或咨询饮食。涉及账本的回答会读取本机账本；只有确认后的记账操作才会写入。",
+            ))
         self.history = selected["history"]
         self.pending_state = selected["pending_state"]
         self._update_skill_summary()
@@ -2102,6 +2276,7 @@ class BookkeepingWindow:
         if not hasattr(self, "agent_buttons"):
             return
         is_food = self.agent_mode == "food_health"
+        is_smart = self.agent_mode == "smart"
         workflow_pending = self.pending_state is not None
         for mode, button in self.agent_buttons.items():
             active = mode == self.agent_mode
@@ -2109,8 +2284,11 @@ class BookkeepingWindow:
                 style="Selected.Agent.TButton" if active else "Agent.TButton",
                 state="disabled" if self.busy or (workflow_pending and not active) else "normal",
             )
-        self.heading_hint.configure(text="饮食回顾与健康建议" if is_food else "记录日常，安心管理。")
-        self.send_button.configure(text="发送饮食咨询" if is_food else "发送记账")
+        self.heading_hint.configure(
+            text=("随便聊天、查询账本、记账或咨询饮食" if is_smart else
+                  "饮食回顾与健康建议" if is_food else "记录日常，安心管理。")
+        )
+        self.send_button.configure(text="发送饮食咨询" if is_food else "发送")
         self.reset_conversation_button.configure(
             text=translate("重置对话", self.language),
             state="disabled" if self.busy else "normal",
@@ -2129,6 +2307,10 @@ class BookkeepingWindow:
             self.hint.configure(
                 text="饮食健康 Agent 会检索本地饮食回顾，并将记录摘要、此 Agent 单独选择的 Skill 正文和本轮问题发送给当前消息对应的服务；附图消息使用含图片服务，纯文字消息使用纯文字服务。本机 Ollama 留在本机，远程服务会收到这些内容。此模式只提供饮食建议，不会写入记录。Enter 换行，Ctrl+Enter 发送。"
             )
+        elif is_smart:
+            self.payment_hint_summary.grid()
+            self.skill_summary.grid()
+            self.hint.grid_remove()
         else:
             self.payment_hint_summary.grid()
             self.skill_summary.grid()
@@ -2142,6 +2324,7 @@ class BookkeepingWindow:
             display_speaker = translate(speaker)
             separator = ": " if current_language() == "en-US" else "："
             if body in {
+                "你好，可以直接聊天、查账、记账或咨询饮食。涉及账本的回答会读取本机账本；只有确认后的记账操作才会写入。",
                 "你好，直接告诉我一笔收入、消费、转账或还款。信息不够时我会先追问，确认后才写入本地账本。",
                 "我会先检索本地近期饮食记录，再交给饮食健康 Agent 单独配置的模型和 Skill 给出均衡饮食建议。记录不足时会说明限制；此模式不会修改记录。",
             }:
@@ -2465,7 +2648,7 @@ class BookkeepingWindow:
             filters, text="最近几天", variable=mode_var, value="recent"
         ).pack(side="left", padx=(0, 16))
         ttk.Label(filters, text="日期 / 截止日期（支持202608、8月）", style="Hint.TLabel").pack(side="left")
-        selected_date_var = tk.StringVar(value=_today_japan())
+        selected_date_var = tk.StringVar(value=self._today_local())
 
         def date_spinner_values(selected_date: date) -> tuple[str, ...]:
             values: list[str] = []
@@ -2548,7 +2731,7 @@ class BookkeepingWindow:
         update_mode()
 
         def set_today_and_refresh() -> None:
-            selected_date_var.set(_today_japan())
+            selected_date_var.set(self._today_local())
             date_spinbox.configure(values=date_spinner_values(parse_date(selected_date_var.get())))
             mode_var.set("day")
             refresh()
@@ -2589,7 +2772,7 @@ class BookkeepingWindow:
             try:
                 selected_date = parse_date(selected_date_var.get().strip())
             except (LedgerError, ValueError):
-                selected_date = parse_date(_today_japan())
+                selected_date = parse_date(self._today_local())
 
             picker = tk.Toplevel(dialog)
             picker.title(translate("选择日期", self.language))
@@ -3617,7 +3800,7 @@ class BookkeepingWindow:
                 ),
                 "date": tk.StringVar(
                     value=str(existing_schedule["next_due_date"])
-                    if existing_schedule is not None else _today_japan()
+                    if existing_schedule is not None else self._today_local()
                 ),
             }
             labels = (
@@ -4036,7 +4219,7 @@ class BookkeepingWindow:
                     database = Database(self.database_path)
                     try:
                         database.initialize()
-                        today = _today_japan()
+                        today = self._today_local()
                         balance = build_balance_sheet(database, today)
                         profit = build_profit_statement(database, today)
                         currency_digits = {
@@ -4800,7 +4983,7 @@ class BookkeepingWindow:
             type_var = tk.StringVar(value="银行")
             currency_var = tk.StringVar(value="JPY")
             amount_var = tk.StringVar()
-            date_var = tk.StringVar(value=_today_japan())
+            date_var = tk.StringVar(value=self._today_local())
             completeness_var = tk.StringVar(value="已确认")
             note_var = tk.StringVar()
 
@@ -4919,7 +5102,7 @@ class BookkeepingWindow:
                 results = reconcile_account_balances(
                     database,
                     counts,
-                    _today_japan(),
+                    self._today_local(),
                     post_differences=record_difference_var.get(),
                 )
             except LedgerError as exc:
@@ -5411,7 +5594,7 @@ class BookkeepingWindow:
             name_var = tk.StringVar()
             currency_var = tk.StringVar(value="JPY")
             balance_var = tk.StringVar(value="0")
-            date_var = tk.StringVar(value=_today_japan())
+            date_var = tk.StringVar(value=self._today_local())
             completeness_var = tk.StringVar(value="记录不完整")
             note_var = tk.StringVar(value="真实历史卡债未核实；期初值仅为本账本记录起点")
             fields = (
@@ -5490,7 +5673,7 @@ class BookkeepingWindow:
             names = [row["name"] for row in card_rows]
             currency_by_name = {row["name"]: row["currency"] for row in card_rows}
             card_var = tk.StringVar()
-            date_var = tk.StringVar(value=_today_japan())
+            date_var = tk.StringVar(value=self._today_local())
             limit_var = tk.StringVar()
             available_var = tk.StringVar()
             note_var = tk.StringVar()
@@ -5583,8 +5766,8 @@ class BookkeepingWindow:
         def open_repayment_schedule_dialog() -> None:
             add_dialog = tk.Toplevel(dialog)
             add_dialog.title("每月应还计划")
-            add_dialog.geometry("650x540")
-            add_dialog.minsize(590, 500)
+            add_dialog.geometry("650x590")
+            add_dialog.minsize(590, 540)
             add_dialog.transient(dialog)
             add_dialog.grab_set()
             form = ttk.Frame(add_dialog, style="App.TFrame", padding=12)
@@ -5622,8 +5805,10 @@ class BookkeepingWindow:
             card_var = tk.StringVar()
             source_var = tk.StringVar()
             amount_var = tk.StringVar()
+            due_time_var = tk.StringVar(value="09:00")
             amount_month_var = tk.StringVar()
-            due_var = tk.StringVar(value=next_month_due_date(_today_japan()))
+            delete_button: ttk.Button | None = None
+            due_var = tk.StringVar(value=next_month_due_date(self._today_local()))
             updating_schedule_fields = False
             card_box = ttk.Combobox(form, textvariable=card_var, values=tuple(card_currency), state="readonly")
             source_box = ttk.Combobox(form, textvariable=source_var, values=(), state="readonly")
@@ -5632,6 +5817,7 @@ class BookkeepingWindow:
                 ("扣款账户", source_box),
                 ("本期应还金额（每月重新填写）", ttk.Entry(form, textvariable=amount_var)),
                 ("下次还款日（以后每月同日）", ttk.Entry(form, textvariable=due_var)),
+                ("自动记账时间（所在地区当地时间）", ttk.Entry(form, textvariable=due_time_var)),
             )
             for index, (label, widget) in enumerate(fields, start=2):
                 ttk.Label(form, text=label, style="Hint.TLabel").grid(
@@ -5640,7 +5826,7 @@ class BookkeepingWindow:
                 widget.grid(row=index, column=1, sticky="ew", pady=6)
             unit_var = tk.StringVar(value="请先选择信用卡与扣款账户")
             ttk.Label(form, textvariable=unit_var, style="Hint.TLabel").grid(
-                row=6, column=1, sticky="w", pady=(2, 4)
+                row=7, column=1, sticky="w", pady=(2, 4)
             )
 
             def update_schedule_fields(*_args: Any) -> None:
@@ -5651,8 +5837,9 @@ class BookkeepingWindow:
                 compatible = [name for name, source_code in source_currency.items() if source_code == code]
                 source_box.configure(values=compatible)
                 schedule = schedules_by_card.get(card_name)
-                if schedule:
+                if schedule and bool(schedule.get("enabled")):
                     source_var.set(schedule["source_name"] if schedule["source_name"] in compatible else "")
+                    due_time_var.set(str(schedule.get("due_time") or "09:00"))
                     if schedule["amount_minor"] is not None:
                         amount_text = minor_to_text(schedule["amount_minor"], 2 if code in {"CNY", "USD"} else 0, code)
                         amount_var.set(amount_text.removesuffix(f" {code}").replace(",", ""))
@@ -5660,13 +5847,15 @@ class BookkeepingWindow:
                         amount_var.set("")
                     saved_due_date = schedule["next_due_date"]
                     due_var.set(
-                        saved_due_date if saved_due_date >= _today_japan()
-                        else next_month_due_date(_today_japan(), int(schedule["due_day"]))
+                        saved_due_date if saved_due_date >= self._today_local()
+                        else next_month_due_date(self._today_local(), int(schedule["due_day"]))
                     )
                 else:
+                    schedule = None
                     source_var.set("")
                     amount_var.set("")
-                    due_var.set(next_month_due_date(_today_japan()))
+                    due_time_var.set("09:00")
+                    due_var.set(next_month_due_date(self._today_local()))
                 unit_var.set(
                     f"金额单位：{code}。本期金额只用于当前显示的下次还款日，不会复制到下个月。"
                     if code else "请先选择信用卡与扣款账户"
@@ -5675,6 +5864,9 @@ class BookkeepingWindow:
                     amount_month_var.set(parse_date(due_var.get().strip()).strftime("%Y-%m"))
                 except (LedgerError, ValueError):
                     amount_month_var.set("")
+                if delete_button is not None:
+                    active = bool(schedule and schedule.get("enabled"))
+                    delete_button.configure(state="normal" if active else "disabled")
                 updating_schedule_fields = False
 
             def clear_amount_when_due_month_changes(*_args: Any) -> None:
@@ -5705,7 +5897,9 @@ class BookkeepingWindow:
                         card_name=card_var.get(),
                         source_account_name=source_var.get(),
                         first_due_date=due_var.get().strip(),
+                        due_time=due_time_var.get().strip(),
                         amount=amount_var.get().strip() or None,
+                        today_value=self._today_local(),
                     )
                 except LedgerError as exc:
                     messagebox.showerror("无法保存每月应还计划", str(exc), parent=add_dialog)
@@ -5719,31 +5913,40 @@ class BookkeepingWindow:
                 )
                 self._queue_github_auto_sync()
 
-            def toggle_schedule() -> None:
+            def delete_schedule() -> None:
                 card_name = card_var.get()
                 schedule = schedules_by_card.get(card_name)
-                if not schedule:
+                if not schedule or not bool(schedule.get("enabled")):
                     messagebox.showinfo("尚无还款计划", "该卡尚未保存每月应还计划。", parent=add_dialog)
                     return
-                enabled = not bool(schedule["enabled"])
+                if not confirm_delete_once(
+                    add_dialog,
+                    title="删除还款计划",
+                    target=f"{card_name}的每月应还计划",
+                    impact="已记入账本的流水和历史会保留；尚未记账的本期金额会取消。之后可点击“还款”重新设置。",
+                    translate_text=lambda value: translate(value, self.language),
+                ):
+                    return
                 database = Database(self.database_path)
                 try:
                     database.initialize()
-                    set_credit_repayment_schedule_enabled(database, card_name=card_name, enabled=enabled)
+                    delete_credit_repayment_schedule(database, card_name=card_name)
                 except LedgerError as exc:
-                    messagebox.showerror("无法更新计划", str(exc), parent=add_dialog)
+                    messagebox.showerror("无法删除计划", str(exc), parent=add_dialog)
                     return
                 finally:
                     database.close()
                 add_dialog.destroy()
                 refresh_cards()
-                set_status(f"“{card_name}”每月应还计划已{'恢复' if enabled else '暂停'}。")
+                set_status(f"“{card_name}”的每月应还计划已删除；需要时可点击“还款”重新创建。")
                 self._queue_github_auto_sync()
 
             actions = ttk.Frame(form, style="App.TFrame")
-            actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+            actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(18, 0))
             ttk.Button(actions, text="取消", command=add_dialog.destroy).pack(side="right", padx=(8, 0))
-            ttk.Button(actions, text="暂停/恢复计划", command=toggle_schedule).pack(side="right", padx=(8, 0))
+            if schedules_by_card:
+                delete_button = ttk.Button(actions, text="删除计划", command=delete_schedule)
+                delete_button.pack(side="right", padx=(8, 0))
             ttk.Button(actions, text="保存计划", style="Send.TButton", command=save_schedule).pack(side="right")
             selected = card_tree.selection()
             selected_name = card_names_by_id.get(int(selected[0]), "") if selected else ""
@@ -5789,7 +5992,7 @@ class BookkeepingWindow:
             source_currency = {row["name"]: row["currency"] for row in source_rows}
             card_var = tk.StringVar()
             source_var = tk.StringVar()
-            date_var = tk.StringVar(value=_today_japan())
+            date_var = tk.StringVar(value=self._today_local())
             amount_var = tk.StringVar()
             description_var = tk.StringVar(value="信用卡还款")
             card_box = ttk.Combobox(
@@ -5931,6 +6134,7 @@ class BookkeepingWindow:
         tag = "user" if speaker == "你" else "assistant"
         display_speaker = translate(speaker)
         display_body = translate(body) if body in {
+            "你好，可以直接聊天、查账、记账或咨询饮食。涉及账本的回答会读取本机账本；只有确认后的记账操作才会写入。",
             "你好，直接告诉我一笔收入、消费、转账或还款。信息不够时我会先追问，确认后才写入本地账本。",
             "我会先检索本地近期饮食记录，再交给饮食健康 Agent 单独配置的模型和 Skill 给出均衡饮食建议。记录不足时会说明限制；此模式不会修改记录。",
         } else body
@@ -6136,6 +6340,8 @@ class BookkeepingWindow:
         has_images: bool = False,
     ) -> dict[str, Any]:
         agent = mode or self.agent_mode
+        if agent == "smart":
+            agent = "bookkeeping"
         workflow_profile_id = self.agent_states.get(agent, {}).get("workflow_profile_id")
         if workflow_profile_id:
             for profile in self.api_profiles:
@@ -6171,6 +6377,9 @@ class BookkeepingWindow:
                 del self.clients[cache_key]
 
     def _maybe_start_desktop_tutorial(self) -> None:
+        if self._github_restore_in_progress:
+            self.root.after(500, self._maybe_start_desktop_tutorial)
+            return
         if self.desktop_tutorial_store.is_complete(self.database_path):
             return
         database = Database(self.database_path)
@@ -6202,9 +6411,9 @@ class BookkeepingWindow:
 
         steps = (
             {
-                "title": translate("选好主要记账货币", self.language),
-                "description": translate("选择你平时最常用的货币。其他币种会单独显示，不会被改写。", self.language),
-                "detail": translate("点“打开本项”进入通用设置。设置会在你点“应用”或“确认”时保存。", self.language),
+                "title": translate("选择主要记账货币和所在地区", self.language),
+                "description": translate("选择最常用的主要记账货币和所在地区。其他币种仍会单独显示。", self.language),
+                "detail": translate("所在地区会决定日期、定期项目和信用卡还款使用的当地时间。", self.language),
                 "target": "general",
             },
             {
@@ -7228,6 +7437,22 @@ class BookkeepingWindow:
             finally:
                 database.close()
 
+        def read_time_zone() -> str:
+            database = Database(self.database_path)
+            try:
+                database.initialize()
+                return database.get_time_zone()
+            finally:
+                database.close()
+
+        def save_time_zone(value: str) -> None:
+            database = Database(self.database_path)
+            try:
+                database.initialize()
+                database.set_time_zone(value)
+            finally:
+                database.close()
+
         def save_base_currency(code: str) -> None:
             database = Database(self.database_path)
             try:
@@ -7243,6 +7468,49 @@ class BookkeepingWindow:
                 database.set_billing_cycle_start_day(day)
             finally:
                 database.close()
+
+        time_zone_panel = ttk.Frame(billing_page, style="SettingsPanel.TFrame", padding=18)
+        time_zone_panel.pack(fill="x", pady=(0, 12))
+        time_zone_panel.columnconfigure(0, weight=1)
+        ttk.Label(
+            time_zone_panel,
+            text=translate("所在地区", self.language),
+            style="SettingsTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            time_zone_panel,
+            text=translate(
+                "用于确定今天的日期和自动还款时间。选择你实际所在的时区；已记账日期不会改变。",
+                self.language,
+            ),
+            style="SettingsHint.TLabel",
+            wraplength=680,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(5, 12))
+        time_zone_values = [region_label(zone, self.language) for zone in TIME_ZONE_CHOICES]
+        time_zone_by_label = dict(zip(time_zone_values, TIME_ZONE_CHOICES))
+        time_zone_var = tk.StringVar(value=region_label(read_time_zone(), self.language))
+        time_zone_combo = ttk.Combobox(
+            time_zone_panel,
+            textvariable=time_zone_var,
+            values=time_zone_values,
+            state="readonly",
+            width=28,
+        )
+        time_zone_combo.grid(row=2, column=0, sticky="w")
+        time_zone_status = ttk.Label(
+            time_zone_panel,
+            text=translate("更改会在点击应用或确认后保存。", self.language),
+            style="SettingsHint.TLabel",
+        )
+        time_zone_status.grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        def mark_time_zone_pending(_event: Any = None) -> None:
+            time_zone_status.configure(
+                text=translate("所在地区尚未保存；点击应用或确认后生效。", self.language)
+            )
+
+        time_zone_combo.bind("<<ComboboxSelected>>", mark_time_zone_pending)
 
         base_currency_panel = ttk.Frame(billing_page, style="SettingsPanel.TFrame", padding=18)
         base_currency_panel.pack(fill="x", pady=(0, 12))
@@ -8926,6 +9194,7 @@ class BookkeepingWindow:
                 "appearance": self.appearance_mode,
                 "billing_cycle_start_day": read_billing_cycle_start_day(),
                 "base_currency": read_base_currency(),
+                "time_zone": read_time_zone(),
             }
 
         settings_baseline = capture_settings_baseline()
@@ -8958,6 +9227,7 @@ class BookkeepingWindow:
                 ("语言", lambda: save_language(value["language"])),
                 ("外观", lambda: save_appearance(value["appearance"])),
                 ("主要记账货币", lambda: save_base_currency(value["base_currency"])),
+                ("所在地区", lambda: save_time_zone(value["time_zone"])),
             )
             for label, operation in operations:
                 try:
@@ -9038,6 +9308,10 @@ class BookkeepingWindow:
                     return
 
             selected_appearance = APPEARANCE_CHOICES[max(0, appearance_combo.current())][0]
+            selected_time_zone = time_zone_by_label.get(time_zone_var.get().strip())
+            if selected_time_zone not in SUPPORTED_TIME_ZONES:
+                time_zone_status.configure(text=translate("请选择有效的所在地区。", self.language))
+                return
             selected_base_currency = base_currency_var.get().strip().upper()
             if selected_base_currency not in {"JPY", "CNY", "USD"}:
                 base_currency_status.configure(
@@ -9098,6 +9372,8 @@ class BookkeepingWindow:
                 save_appearance(selected_appearance)
                 if selected_base_currency != old_state["base_currency"]:
                     save_base_currency(selected_base_currency)
+                if selected_time_zone != old_state["time_zone"]:
+                    save_time_zone(selected_time_zone)
                 if selected_billing_cycle_start_day != old_state["billing_cycle_start_day"]:
                     save_billing_cycle_start_day(selected_billing_cycle_start_day)
             except Exception as exc:
@@ -9139,6 +9415,7 @@ class BookkeepingWindow:
             self.gitee_auto_sync_settings_error = ""
             self.loaded_skill = deepcopy(agent_skill_drafts["bookkeeping"])
             self.loaded_food_health_skill = deepcopy(agent_skill_drafts["food_health"])
+            self.time_zone = selected_time_zone
             self.skill_settings_error = ""
             self.food_health_skill_settings_error = ""
             for mode in affected_modes:
@@ -9170,6 +9447,7 @@ class BookkeepingWindow:
             base_currency_status.configure(
                 text=translate("主要记账货币已保存。", self.language)
             )
+            time_zone_status.configure(text=translate("所在地区已保存。", self.language))
             status_message = translate("设置已保存并应用。", self.language)
             footer_status.configure(text=status_message)
             self.status.configure(text=status_message)
@@ -9177,6 +9455,7 @@ class BookkeepingWindow:
             if (
                 selected_billing_cycle_start_day != old_state["billing_cycle_start_day"]
                 or selected_base_currency != old_state["base_currency"]
+                or selected_time_zone != old_state["time_zone"]
                 or any(
                     agent_skill_drafts[mode]
                     != old_state[
@@ -9192,6 +9471,7 @@ class BookkeepingWindow:
                 if (
                     selected_billing_cycle_start_day != old_state["billing_cycle_start_day"]
                     or selected_base_currency != old_state["base_currency"]
+                    or selected_time_zone != old_state["time_zone"]
                 ):
                     self.desktop_shell.refresh()
                 self._queue_github_auto_sync()
@@ -9247,6 +9527,17 @@ class BookkeepingWindow:
         name_entry.focus_set()
 
     def _update_skill_summary(self) -> None:
+        if self.agent_mode == "smart":
+            skill_names = [
+                f"记账：{self.loaded_skill['name']}" if self.loaded_skill else "记账：未加载",
+                f"饮食：{self.loaded_food_health_skill['name']}" if self.loaded_food_health_skill else "饮食：未加载",
+            ]
+            errors = [error for error in (self.skill_settings_error, self.food_health_skill_settings_error) if error]
+            text = "智能助手 Skill：" + "；".join(skill_names)
+            if errors:
+                text += "；设置问题：" + "；".join(errors)
+            self.skill_summary.configure(text=text)
+            return
         if self.agent_mode == "food_health":
             skill = self.loaded_food_health_skill
             error = self.food_health_skill_settings_error
@@ -9928,12 +10219,14 @@ class BookkeepingWindow:
             else "请把附件中状态明确为已完成的购买解析成一笔消费，提取可确认的日期、含税实付总额、商品类别和支付账户；状态、账户或金额不确定时先追问，不要猜测。"
         )
         images_snapshot = list(self.image_attachments)
-        client = self._get_client(has_images=bool(images_snapshot))
+        agent_mode = self.agent_mode
+        router_uses_images = bool(images_snapshot) and agent_mode != "smart"
+        client = self._get_client(has_images=router_uses_images)
         if client is None:
             return
         skill_content = ""
         payment_hints: list[dict[str, str]] = []
-        if self.agent_mode == "bookkeeping":
+        if agent_mode in {"bookkeeping", "smart"}:
             try:
                 self.loaded_skill = self.skill_store.load()
                 self.skill_settings_error = ""
@@ -9950,7 +10243,16 @@ class BookkeepingWindow:
                 )
                 return
             payment_hints = self._payment_hints()
-        else:
+            if agent_mode == "smart":
+                try:
+                    self.loaded_food_health_skill = self.food_health_skill_store.load()
+                    self.food_health_skill_settings_error = ""
+                except BookkeepingSkillError as exc:
+                    self.food_health_skill_settings_error = str(exc)
+                    self._update_skill_summary()
+                    self.status.configure(text=f"饮食健康 Skill 无法读取：{exc}")
+                    return
+        elif agent_mode == "food_health":
             try:
                 self.loaded_food_health_skill = self.food_health_skill_store.load()
                 self.food_health_skill_settings_error = ""
@@ -9973,8 +10275,10 @@ class BookkeepingWindow:
 
         history_snapshot = [dict(message) for message in self.history]
         pending_snapshot = deepcopy(self.pending_state)
-        agent_mode = self.agent_mode
-        profile = self._agent_api_profile(has_images=bool(images_snapshot))
+        profile = self._agent_api_profile(
+            "bookkeeping" if agent_mode == "smart" else agent_mode,
+            has_images=router_uses_images,
+        )
         client_config = {
             "api_key": client.api_key,
             "api_url": client.api_url,
@@ -9983,6 +10287,26 @@ class BookkeepingWindow:
             "reasoning_effort": client.reasoning_effort,
             "timeout": client.timeout,
         }
+        if agent_mode == "smart":
+            def profile_payload(mode: str) -> dict[str, Any]:
+                selected = self._agent_api_profile(mode, has_images=bool(images_snapshot))
+                url = str(selected.get("api_url") or "")
+                return {
+                    "api_key": str(selected.get("api_key") or ""),
+                    "api_url": url,
+                    "model": str(selected.get("model") or ""),
+                    "thinking_enabled": bool(selected.get("thinking_enabled", False)),
+                    "reasoning_effort": str(selected.get("reasoning_effort") or "low"),
+                    "timeout": LOCAL_OLLAMA_REQUEST_TIMEOUT_SECONDS if is_local_http_api(url) else REQUEST_TIMEOUT_SECONDS,
+                }
+            client_config["specialist_profiles"] = {
+                "bookkeeping": profile_payload("bookkeeping"),
+                "food_health": profile_payload("food_health"),
+            }
+            client_config["food_health_skill_content"] = (
+                self.loaded_food_health_skill["content"]
+                if self.loaded_food_health_skill else ""
+            )
         workspace: Path | None = None
         parent_connection: Any = None
         child_connection: Any = None
@@ -10220,7 +10544,7 @@ class BookkeepingWindow:
         balance_line = self._model_balance_lines.get(key)
         if not usage_line:
             usage_line = translate(
-                "发送记账内容后显示本轮命中、未命中和输出费用。",
+                "发送内容后显示本轮命中、未命中和输出费用。",
                 self.language,
             )
         text = translate("模型费用 · 人民币估算", self.language) + "\n" + usage_line
@@ -10240,11 +10564,29 @@ class BookkeepingWindow:
         self._model_usage_profile_by_agent[str(profile.get("agent", self.agent_mode))] = str(
             profile.get("profile_id", "")
         )
-        cost = estimate_deepseek_cost_cny(
-            usage,
-            profile.get("api_url", ""),
-            profile.get("model", ""),
-        )
+        breakdown = usage.get("_cost_breakdown") if isinstance(usage, dict) else None
+        if isinstance(breakdown, list):
+            totals = {"hit_cny": Decimal(0), "miss_cny": Decimal(0), "output_cny": Decimal(0)}
+            all_supported = bool(breakdown)
+            for part in breakdown:
+                if not isinstance(part, dict):
+                    all_supported = False
+                    continue
+                part_cost = estimate_deepseek_cost_cny(
+                    part.get("usage"), part.get("api_url", ""), part.get("model", "")
+                )
+                if part_cost is None:
+                    all_supported = False
+                    continue
+                for field in totals:
+                    totals[field] += Decimal(str(part_cost[field]))
+            cost = totals if all_supported else None
+        else:
+            cost = estimate_deepseek_cost_cny(
+                usage,
+                profile.get("api_url", ""),
+                profile.get("model", ""),
+            )
         if cost is None:
             usage_line = translate(
                 "当前服务暂不支持人民币费用估算。",
@@ -10556,6 +10898,8 @@ class BookkeepingWindow:
         welcome = (
             "我会先检索本地近期饮食记录，再交给饮食健康 Agent 单独配置的模型和 Skill 给出均衡饮食建议。记录不足时会说明限制；此模式不会修改记录。"
             if mode == "food_health"
+            else "你好，可以直接聊天、查账、记账或咨询饮食。涉及账本的回答会读取本机账本；只有确认后的记账操作才会写入。"
+            if mode == "smart"
             else "你好，直接告诉我一笔收入、消费、转账或还款。信息不够时我会先追问，确认后才写入本地账本。"
         )
         state["messages"].append(("助手", welcome))
@@ -10577,6 +10921,8 @@ class BookkeepingWindow:
             welcome = (
                 "我会先检索本地近期饮食记录，再交给饮食健康 Agent 单独配置的模型和 Skill 给出均衡饮食建议。记录不足时会说明限制；此模式不会修改记录。"
                 if mode == "food_health"
+                else "你好，可以直接聊天、查账、记账或咨询饮食。涉及账本的回答会读取本机账本；只有确认后的记账操作才会写入。"
+                if mode == "smart"
                 else "你好，直接告诉我一笔收入、消费、转账或还款。信息不够时我会先追问，确认后才写入本地账本。"
             )
             state["messages"].append(("助手", welcome))

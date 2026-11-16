@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from datetime import datetime
@@ -17,6 +18,37 @@ from .storage import Database
 
 class RequestMergeError(RuntimeError):
     """Raised when a finished isolated request cannot be safely committed."""
+
+
+_AGENT_PRODUCT_MEMORY_KEY = "agent_product_category_memory_v1"
+
+
+def _validate_agent_product_memory(columns: list[str], row: tuple[Any, ...]) -> None:
+    """Allow only the small, structured RAG setting changed by a normal expense."""
+    if "key" not in columns or "value" not in columns or len(row) != len(columns):
+        raise RequestMergeError("Agent 商品记忆格式无效，本次结果没有写入。")
+    if row[columns.index("key")] != _AGENT_PRODUCT_MEMORY_KEY:
+        raise RequestMergeError("请求结果包含不支持的账本设置变更，本次结果没有写入。")
+    raw_value = row[columns.index("value")]
+    if not isinstance(raw_value, str) or len(raw_value.encode("utf-8")) > 1_500_000:
+        raise RequestMergeError("Agent 商品记忆超过安全范围，本次结果没有写入。")
+    try:
+        records = json.loads(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise RequestMergeError("Agent 商品记忆内容无效，本次结果没有写入。") from exc
+    if not isinstance(records, list) or len(records) > 400:
+        raise RequestMergeError("Agent 商品记忆内容无效，本次结果没有写入。")
+    for record in records:
+        if not isinstance(record, dict):
+            raise RequestMergeError("Agent 商品记忆内容无效，本次结果没有写入。")
+        aliases = record.get("aliases")
+        category = record.get("category")
+        if (record.get("kind") not in {"expense", "expense_history"}
+                or not isinstance(category, str) or not category.strip() or len(category) > 120
+                or not isinstance(aliases, list) or not 1 <= len(aliases) <= 12
+                or any(not isinstance(alias, str) or not alias.strip() or len(alias) > 240
+                       for alias in aliases)):
+            raise RequestMergeError("Agent 商品记忆内容无效，本次结果没有写入。")
 
 
 def receive_request_result(connection, worker, results, fallback):
@@ -107,6 +139,7 @@ def run_isolated_request_result(
     *,
     opener: Any = None,
     request_now: datetime | None = None,
+    time_zone: str = "Asia/Tokyo",
 ) -> tuple[str, Any, Any, Any, Any]:
     """Run one turn and return its result instead of crossing a process pipe.
 
@@ -133,7 +166,18 @@ def run_isolated_request_result(
         shutil.copyfile(baseline, candidate)
 
         database = Database(candidate)
-        database.initialize()
+        database.time_zone = time_zone
+        # This database is a disposable transaction candidate. Do not seed
+        # application preference defaults here: that would look like an Agent
+        # settings edit to the strict baseline/candidate merge and reject an
+        # otherwise valid ledger operation. Preference reads already supply
+        # their defaults when a key is absent.
+        database.initialize(seed_default_settings=False)
+        # Currency conversion runs inside the same isolated candidate as the
+        # Agent. In Workers it must use the replayable async opener too, so the
+        # Workflow can fetch and replay reference rates instead of letting
+        # urllib attempt an unsupported direct network call.
+        database.external_opener = opener
         client = OpenAICompatibleClient(
             str(client_config.get("api_key", "")),
             api_url=str(client_config["api_url"]),
@@ -226,6 +270,7 @@ def merge_isolated_database(
     baseline_path: str | Path,
     candidate_path: str | Path,
     *,
+    allow_agent_product_memory: bool = False,
     prepare_live_connection: Callable[[sqlite3.Connection], None] | None = None,
     after_live_commit: Callable[[sqlite3.Connection], None] | None = None,
 ) -> list[int]:
@@ -258,7 +303,10 @@ def merge_isolated_database(
         additions: dict[str, list[tuple[Any, ...]]] = {}
         deletions: dict[str, list[tuple[Any, ...]]] = {}
         updates: dict[str, list[tuple[tuple[Any, ...], tuple[Any, ...]]]] = {}
-        allowed_tables = {"fx_rates", "transactions", "food_purchase_items", "credit_limit_recovery_points"}
+        allowed_tables = {
+            "fx_rates", "transactions", "food_purchase_items",
+            "credit_limit_recovery_points",
+        }
         for table, (columns, primary_key, baseline_rows) in baseline_state.items():
             candidate_columns, candidate_key, candidate_rows = candidate_state[table]
             live_columns, live_key, live_rows = live_state[table]
@@ -273,6 +321,24 @@ def merge_isolated_database(
                 if candidate_rows[key] != original_row
             ]
             new_keys = set(candidate_rows) - set(baseline_rows)
+            if table == "settings" and (deleted_keys or changed_rows or new_keys):
+                if not allow_agent_product_memory:
+                    raise RequestMergeError(
+                        "请求结果包含不支持的账本变更（settings），本次结果没有写入。"
+                    )
+                if primary_key != ["key"] or "key" not in columns:
+                    raise RequestMergeError("设置表结构无效，本次结果没有写入。")
+                touched_keys = [key[0] for key, _row in changed_rows]
+                touched_keys.extend(key[0] for key in new_keys)
+                if deleted_keys or any(key != _AGENT_PRODUCT_MEMORY_KEY for key in touched_keys):
+                    raise RequestMergeError(
+                        "请求结果包含不支持的账本变更（settings），本次结果没有写入。"
+                    )
+                value_rows = [row for _key, row in changed_rows]
+                value_rows.extend(candidate_rows[key] for key in new_keys)
+                for row in value_rows:
+                    _validate_agent_product_memory(columns, row)
+                allowed_tables.add("settings")
             if (deleted_keys or changed_rows or new_keys) and table not in allowed_tables:
                 raise RequestMergeError(f"请求结果包含不支持的账本变更（{table}），本次结果没有写入。")
             if deleted_keys:
@@ -301,7 +367,7 @@ def merge_isolated_database(
                     f'DELETE FROM "{escaped_table}" WHERE {where}', key
                 )
 
-        for table in ("fx_rates", "transactions", "credit_limit_recovery_points", "food_purchase_items"):
+        for table in ("fx_rates", "transactions", "credit_limit_recovery_points", "food_purchase_items", "settings"):
             for key, row in updates.get(table, []):
                 columns, primary_key, _ = baseline_state[table]
                 key_columns = set(primary_key)
@@ -319,7 +385,7 @@ def merge_isolated_database(
                     (*values, *key),
                 )
 
-        for table in ("fx_rates", "transactions", "credit_limit_recovery_points", "food_purchase_items"):
+        for table in ("fx_rates", "transactions", "credit_limit_recovery_points", "food_purchase_items", "settings"):
             rows = additions.get(table, [])
             if not rows:
                 continue

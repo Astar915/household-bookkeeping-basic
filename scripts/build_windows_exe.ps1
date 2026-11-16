@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$BuildEnvironment = Join-Path ([System.IO.Path]::GetTempPath()) "household-bookkeeping-pyinstaller"
+$BuildEnvironment = Join-Path ([System.IO.Path]::GetTempPath()) "household-bookkeeping-pyinstaller-0.2.3"
 $BuildPython = Join-Path $BuildEnvironment "Scripts\python.exe"
 $DistPath = Join-Path $Root "dist"
 $ExecutablePath = Join-Path $DistPath "HouseholdBookkeeping-Windows-x64.exe"
@@ -14,8 +14,19 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
 if (-not (Test-Path -LiteralPath $BuildPython)) {
-    $PythonCommand = Get-Command python -ErrorAction Stop
-    & $PythonCommand.Source -m venv $BuildEnvironment
+    $RepositoryPython = Join-Path $Root ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $RepositoryPython) {
+        $PythonForVenv = $RepositoryPython
+    }
+    else {
+        $PythonCommand = Get-Command python -ErrorAction Stop
+        $PythonForVenv = $PythonCommand.Source
+        & $PythonForVenv -c "import sys; sys.exit(0)" *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "A working Python installation is required to build the Windows app."
+        }
+    }
+    & $PythonForVenv -m venv $BuildEnvironment
     if ($LASTEXITCODE -ne 0) {
         throw "Could not create the temporary Python build environment."
     }
@@ -48,6 +59,8 @@ $Arguments = @(
     "tkinterdnd2"
     "--collect-all"
     "PIL"
+    "--collect-all"
+    "tzdata"
     "--distpath"
     $DistPath
     "--workpath"

@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Sequence
 
+from .region_time import DEFAULT_TIME_ZONE, normalize_time_zone, regional_now
 from .food_categories import (
     FOOD_GROUPS,
     FOOD_GROUP_TO_CLASSIFICATION,
@@ -178,6 +179,7 @@ CREATE TABLE IF NOT EXISTS credit_repayment_rules (
     currency TEXT NOT NULL REFERENCES currencies(code),
     due_day INTEGER NOT NULL CHECK (due_day BETWEEN 1 AND 31),
     next_due_date TEXT NOT NULL,
+    due_time TEXT NOT NULL DEFAULT '09:00',
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     last_status TEXT NOT NULL DEFAULT '等待本期金额',
     created_at TEXT NOT NULL,
@@ -291,11 +293,11 @@ DEFAULT_CATEGORY_TRANSLATIONS = (
 )
 
 
-def parse_date(value: str) -> date:
+def parse_date(value: str, time_zone: str = DEFAULT_TIME_ZONE) -> date:
     """Parse common full-date and month-only inputs into a calendar date.
 
     Month-only inputs resolve to the first day of that month. A month without
-    a year uses the current Japan-local year. Compact year/month input is
+    a year uses the current year in the selected region. Compact year/month input is
     deliberately limited to exactly six digits, so values such as ``20268``
     remain invalid rather than being guessed.
     """
@@ -326,7 +328,7 @@ def parse_date(value: str) -> date:
         match = re.fullmatch(r"(\d{1,2})月(?:\s*(\d{1,2})日?)?", text)
         if match:
             parsed = (
-                _current_japan_year(),
+                _current_local_year(time_zone),
                 int(match.group(1)),
                 int(match.group(2) or 1),
             )
@@ -341,15 +343,15 @@ def parse_date(value: str) -> date:
 
 _DATE_INPUT_ERROR = (
     "日期无效或格式不支持。支持 YYYY-MM-DD、YYYY/M/D、YYYYMMDD、YYYYMM 和 M月；"
-    "仅写月份时按当前日本年份的1日处理。"
+    "仅写月份时按所在地区当前年份的1日处理。"
 )
 
 
-def _current_japan_year() -> int:
-    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).year
+def _current_local_year(time_zone: str = DEFAULT_TIME_ZONE) -> int:
+    return regional_now(time_zone).year
 
 
-def billing_cycle(value: str | date, start_day: int = 15) -> tuple[date, date]:
+def billing_cycle(value: str | date, start_day: int = 15, time_zone: str = DEFAULT_TIME_ZONE) -> tuple[date, date]:
     """Return the billing period containing ``value`` for a monthly start day.
 
     Months without the selected day use their last calendar day. This keeps
@@ -357,7 +359,7 @@ def billing_cycle(value: str | date, start_day: int = 15) -> tuple[date, date]:
     """
     if isinstance(start_day, bool) or not isinstance(start_day, int) or not 1 <= start_day <= 31:
         raise LedgerError("账期起始日必须是1到31之间的整数")
-    day = parse_date(value) if isinstance(value, str) else value
+    day = parse_date(value, time_zone) if isinstance(value, str) else value
 
     def month_start(year: int, month: int) -> date:
         effective_day = min(start_day, calendar.monthrange(year, month)[1])
@@ -443,6 +445,7 @@ class Database:
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.time_zone = DEFAULT_TIME_ZONE
 
     def close(self) -> None:
         self.connection.close()
@@ -521,6 +524,8 @@ class Database:
             )
         self._migrate_points_to_jpy()
         self._migrate_credit_repayment_schedules()
+        self._migrate_credit_repayment_due_time()
+        self.time_zone = self.get_time_zone()
 
     def _migrate_category_translation_languages(self) -> None:
         schema = self.connection.execute(
@@ -592,7 +597,7 @@ class Database:
 
         def validate_month(value: str, field: str) -> str:
             try:
-                parsed_month = parse_date(str(value).strip())
+                parsed_month = parse_date(str(value).strip(), self.time_zone)
             except LedgerError as exc:
                 raise LedgerError(f"{field}格式无效。支持 YYYY-MM、YYYYMM、M月或完整日期。") from exc
             return parsed_month.strftime("%Y-%m")
@@ -721,6 +726,16 @@ class Database:
         except LedgerError:
             return "JPY"
         return code if bool(currency["is_monetary"]) else "JPY"
+
+    def get_time_zone(self) -> str:
+        return normalize_time_zone(self.get_setting("time_zone", DEFAULT_TIME_ZONE))
+
+    def set_time_zone(self, value: str) -> None:
+        normalized = normalize_time_zone(value)
+        if normalized != value:
+            raise LedgerError("请选择有效的所在地区。")
+        self.set_setting("time_zone", normalized, "Region used for local dates and scheduled operations.")
+        self.time_zone = normalized
 
     def set_base_currency(self, code: str) -> None:
         normalized = str(code).strip().upper()
@@ -934,6 +949,32 @@ class Database:
                      "旧版计划已迁移；请重新填写本期金额",
                      row["created_at"], row["updated_at"]),
                 )
+
+    def _migrate_credit_repayment_due_time(self) -> None:
+        """Add the local-time execution setting without changing existing schedules."""
+        columns = {
+            row["name"] for row in self.connection.execute(
+                "PRAGMA table_info(credit_repayment_rules)"
+            )
+        }
+        if "due_time" in columns:
+            return
+        backup_root = (
+            self.path.parent.parent / "backups"
+            if self.path.parent.name.lower() == "data"
+            else self.path.parent / "backups"
+        )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        target = backup_root / f"{self.path.stem}-before-repayment-time-{stamp}.sqlite3"
+        suffix = 1
+        while target.exists():
+            target = backup_root / f"{self.path.stem}-before-repayment-time-{stamp}-{suffix}.sqlite3"
+            suffix += 1
+        self.backup(target)
+        with self.connection:
+            self.connection.execute(
+                "ALTER TABLE credit_repayment_rules ADD COLUMN due_time TEXT NOT NULL DEFAULT '09:00'"
+            )
 
     def _migrate_points_to_jpy(self) -> None:
         """Normalize legacy point accounts and postings to the 1 point = 1 JPY basis."""
@@ -1314,7 +1355,7 @@ class Database:
         currency_row = self.currency(currency_code)
         if completeness not in {"known", "inferred", "partial"}:
             raise LedgerError(f"不支持的余额完整度：{completeness}")
-        date_text = parse_date(opening_date).isoformat()
+        date_text = parse_date(opening_date, self.time_zone).isoformat()
         if not name.strip():
             raise LedgerError("账户名称不能为空")
         amount_minor = to_minor_allow_zero(opening_balance, currency_code, currency_row["minor_digits"])
@@ -1356,7 +1397,7 @@ class Database:
         purchase_items: Sequence[str] = (),
         purchase_item_source: str = "parsed",
     ) -> int:
-        date_text = parse_date(occurred_on).isoformat()
+        date_text = parse_date(occurred_on, self.time_zone).isoformat()
         account_row = self.account(account_name) if account_name else None
         destination_row = self.account(to_account_name) if to_account_name else None
         currency_code = currency.upper()
@@ -1417,7 +1458,7 @@ class Database:
                         raise LedgerError("跨币种收支必须提供按交易日汇率换算的账户扣款金额")
                     from .fx_rates import convert_minor_at_rate
 
-                    account_rate_date = parse_date(str(account_fx_rate_date))
+                    account_rate_date = parse_date(str(account_fx_rate_date), self.time_zone)
                     if account_rate_date.isoformat() > date_text:
                         raise LedgerError("账户换算汇率有效日期不能晚于交易日期")
                     expected_account_amount = convert_minor_at_rate(
@@ -1517,7 +1558,7 @@ class Database:
         purchase_item_source: str = "parsed",
     ) -> list[int]:
         """Atomically post one expense across ordered accounts in one currency."""
-        date_text = parse_date(occurred_on).isoformat()
+        date_text = parse_date(occurred_on, self.time_zone).isoformat()
         currency_code = "JPY" if currency.upper() == "PTS" else currency.upper()
         currency_row = self.currency(currency_code)
         total_minor = to_minor(amount, currency_row["code"], currency_row["minor_digits"])
@@ -1703,7 +1744,7 @@ class Database:
         items: Sequence[tuple[str, str]],
     ) -> list[int]:
         """Save a manually confirmed food purchase without creating a financial transaction."""
-        date_text = parse_date(purchase_date).isoformat()
+        date_text = parse_date(purchase_date, self.time_zone).isoformat()
         if not isinstance(items, (list, tuple)) or not items:
             raise LedgerError("请至少填写一种食材")
         names: list[str] = []
@@ -1736,7 +1777,7 @@ class Database:
         note: str = "",
     ) -> list[int]:
         """Save explicitly reported foods eaten; this does not infer inventory balances."""
-        date_text = parse_date(consumed_on).isoformat()
+        date_text = parse_date(consumed_on, self.time_zone).isoformat()
         if not isinstance(items, (list, tuple)) or not items:
             raise LedgerError("请至少填写一种食物")
         normalized: list[tuple[str, str]] = []
@@ -1913,7 +1954,7 @@ class Database:
         available_minor = to_minor_allow_zero(available, currency["code"], currency["minor_digits"])
         if available_minor > limit_minor:
             raise LedgerError("可用额度不能高于总额度")
-        date_text = parse_date(snapshot_date).isoformat()
+        date_text = parse_date(snapshot_date, self.time_zone).isoformat()
         try:
             cursor = self.connection.execute(
                 "INSERT INTO credit_limit_snapshots(account_id,snapshot_date,limit_minor,available_minor,note,created_at) VALUES (?,?,?,?,?,?)",
@@ -2126,7 +2167,7 @@ class Database:
         account = self.connection.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
         if account is None:
             raise LedgerError(f"找不到账户ID：{account_id}")
-        as_of_text = parse_date(as_of).isoformat() if isinstance(as_of, str) else (as_of.isoformat() if as_of else None)
+        as_of_text = parse_date(as_of, self.time_zone).isoformat() if isinstance(as_of, str) else (as_of.isoformat() if as_of else None)
         if as_of_text and as_of_text < account["opening_date"]:
             return 0
         if as_of_text:
@@ -2177,8 +2218,8 @@ class Database:
         return balance
 
     def report_rows(self, start: str, end: str, currency_code: str | None = None) -> list[sqlite3.Row]:
-        parse_date(start)
-        parse_date(end)
+        parse_date(start, self.time_zone)
+        parse_date(end, self.time_zone)
         if start > end:
             raise LedgerError("报表开始日期不能晚于结束日期")
         query = """SELECT t.*, c.name AS category_name FROM transactions t
@@ -2194,8 +2235,8 @@ class Database:
 
     def transactions_between(self, start: str, end: str) -> list[sqlite3.Row]:
         """Return all ledger entries in a date range, newest first."""
-        start_date = parse_date(start).isoformat()
-        end_date = parse_date(end).isoformat()
+        start_date = parse_date(start, self.time_zone).isoformat()
+        end_date = parse_date(end, self.time_zone).isoformat()
         if start_date > end_date:
             raise LedgerError("开始日期不能晚于结束日期")
         return self.connection.execute(
@@ -2259,7 +2300,7 @@ class Database:
         account = self.account(account_name)
         if account["account_type"] == "points":
             raise LedgerError("请选择银行、钱包、券/预付、交通卡或信用卡账户。")
-        occurred_on = parse_date(str(row["occurred_on"])).isoformat()
+        occurred_on = parse_date(str(row["occurred_on"]), self.time_zone).isoformat()
         if occurred_on < account["opening_date"]:
             raise LedgerError(f"交易日期早于账户期初日期：{account['opening_date']}")
 
@@ -2342,8 +2383,21 @@ class Database:
             "SELECT 1 FROM food_purchase_items WHERE transaction_id=? LIMIT 1",
             (transaction_id,),
         ).fetchone() is not None
+        old_category = (
+            self.connection.execute(
+                "SELECT name FROM categories WHERE id=?", (old["category_id"],)
+            ).fetchone()
+            if old["category_id"] is not None else None
+        )
+        old_item_names = [
+            str(item["item_name"])
+            for item in self.connection.execute(
+                "SELECT item_name FROM food_purchase_items WHERE transaction_id=? ORDER BY id",
+                (transaction_id,),
+            ).fetchall()
+        ]
 
-        date_text = parse_date(occurred_on).isoformat()
+        date_text = parse_date(occurred_on, self.time_zone).isoformat()
         currency_code = str(currency).upper()
         currency_row = self.currency(currency_code)
         if not bool(currency_row["is_monetary"]):
@@ -2550,6 +2604,27 @@ class Database:
         except Exception:
             self.connection.rollback()
             raise
+        if (
+            kind == "expense"
+            and old["kind"] == "expense"
+            and old_category is not None
+            and category_row is not None
+            and int(old["category_id"] or 0) != int(category_row["id"])
+        ):
+            # An explicit category correction is useful retrieval data for later
+            # entries. Its failure must never undo the already committed edit.
+            try:
+                from .product_learning import remember_category_correction
+
+                remember_category_correction(
+                    self,
+                    old_description=str(old["description"] or ""),
+                    new_description=clean_description,
+                    category_name=str(category_row["name"]),
+                    item_names=old_item_names,
+                )
+            except Exception:
+                pass
         return target
 
     def _rebuild_credit_recovery_points(self, account_ids: Sequence[int]) -> None:
@@ -2760,7 +2835,7 @@ class Database:
                         errors.append(f"交易#{row['id']}的账户换算信息不完整")
                     else:
                         try:
-                            rate_date = parse_date(str(row["account_fx_rate_date"]))
+                            rate_date = parse_date(str(row["account_fx_rate_date"]), self.time_zone)
                             account_rate = Decimal(str(row["account_fx_rate"]))
                             if not account_rate.is_finite() or account_rate <= 0 or rate_date.isoformat() > row["occurred_on"]:
                                 errors.append(f"交易#{row['id']}的账户换算汇率或有效日期无效")
@@ -2787,7 +2862,7 @@ class Database:
                     warnings.append(f"{row['currency']}交易#{row['id']}尚无交易日JPY折算；利润表日元合计不含该笔")
                 else:
                     try:
-                        parse_date(row["fx_rate_date"])
+                        parse_date(row["fx_rate_date"], self.time_zone)
                         if Decimal(str(row["fx_rate"])) <= 0 or int(row["jpy_equiv_minor"]) < 0:
                             errors.append(f"{row['currency']}交易#{row['id']}的交易日汇率或JPY折算金额无效")
                     except (LedgerError, InvalidOperation, TypeError, ValueError):
@@ -2812,7 +2887,7 @@ class Database:
             if row["card_currency"] != row["source_currency"] or row["currency"] != row["card_currency"]:
                 errors.append(f"每月还款计划“{row['card_name']}”币种不一致")
             try:
-                parse_date(row["next_due_date"])
+                parse_date(row["next_due_date"], self.time_zone)
             except LedgerError:
                 errors.append(f"每月还款计划“{row['card_name']}”日期无效")
         for row in self.connection.execute(
@@ -2824,7 +2899,7 @@ class Database:
                LEFT JOIN transactions t ON t.id=p.transaction_id"""
         ):
             try:
-                parse_date(row["due_date"])
+                parse_date(row["due_date"], self.time_zone)
             except LedgerError:
                 errors.append(f"信用卡“{row['card_name']}”本期还款日期无效")
             if row["transaction_id"] is not None and (
@@ -2841,14 +2916,14 @@ class Database:
                 warnings.append(f"{row['name']}余额为负数，请核对")
         for row in self.connection.execute("SELECT id,purchase_date,item_name FROM food_purchase_items"):
             try:
-                parse_date(row["purchase_date"])
+                parse_date(row["purchase_date"], self.time_zone)
             except LedgerError:
                 errors.append(f"采购商品记录#{row['id']}的日期无效")
             if not str(row["item_name"]).strip():
                 errors.append(f"采购商品记录#{row['id']}的商品名称为空")
         for row in self.connection.execute("SELECT id,consumed_on,item_name FROM food_consumption_records"):
             try:
-                parse_date(row["consumed_on"])
+                parse_date(row["consumed_on"], self.time_zone)
             except LedgerError:
                 errors.append(f"食用记录#{row['id']}的日期无效")
             if not str(row["item_name"]).strip():

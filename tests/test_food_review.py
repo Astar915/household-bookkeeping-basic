@@ -112,7 +112,7 @@ class FoodReviewTests(unittest.TestCase):
         self.database.add_food_consumptions("2026-10-18", [("苹果", "1个")])
         session = NaturalLanguageSession(self.database, _UnexpectedClient())
         fixed_now = datetime(2026, 10, 18, 12, 0, tzinfo=timezone(timedelta(hours=9)))
-        with patch("bookkeeping.natural_language._now_japan", return_value=fixed_now):
+        with patch.object(session, "_now_local", return_value=fixed_now):
             answer = session.handle("这段时间我都吃了什么，有什么食材建议？")
 
         self.assertIn("苹果（1个）", answer)

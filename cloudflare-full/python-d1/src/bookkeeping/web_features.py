@@ -28,7 +28,8 @@ from .balance_reconciliation import record_credit_snapshot
 from .cash_management import managed_balances, reconcile_account_balances
 from .credit_management import (
     credit_card_overview, credit_repayment_schedules, record_credit_card_repayment,
-    save_credit_repayment_schedule, set_credit_repayment_schedule_enabled,
+    delete_credit_repayment_schedule, save_credit_repayment_schedule,
+    set_credit_repayment_schedule_enabled,
     process_due_credit_repayments,
 )
 from .financial_statements import build_balance_sheet, build_profit_statement
@@ -43,6 +44,11 @@ from .github_sync import (
 from .github_app_config import GITHUB_APP_INSTALL_URL
 from .gitee_sync import GiteeClient, GiteeSyncError, MAX_GITEE_SYNC_BUNDLE_BYTES
 from .natural_language import load_image_attachment
+from .product_learning import remember_category_correction
+from .region_time import (
+    DEFAULT_TIME_ZONE, is_supported_time_zone, normalize_time_zone,
+    regional_now, regional_today,
+)
 from .payment_preferences import PaymentPromptStore
 from .recurring_transactions import (
     list_recurring_schedules, save_recurring_schedule, delete_recurring_schedule,
@@ -50,14 +56,14 @@ from .recurring_transactions import (
 )
 from .request_worker import run_isolated_request, merge_isolated_database
 from .skill_settings import BookkeepingSkillStore, FoodHealthSkillStore, BookkeepingSkillError
-from .storage import Database, LedgerError, to_minor_allow_zero, parse_date, billing_cycle
+from .storage import Database, LedgerError, to_minor_allow_zero, parse_date, billing_cycle, format_account_amount
 
 WEB_DEFAULTS = Path(__file__).with_name("web_defaults")
 JST = timezone(timedelta(hours=9))
 
 
-def today() -> str:
-    return datetime.now(JST).date().isoformat()
+def today(time_zone: str | None = None) -> str:
+    return regional_today(time_zone or DEFAULT_TIME_ZONE)
 
 
 def serial(value):
@@ -149,6 +155,8 @@ class MobileWorkspace:
         value.setdefault("agents", {"bookkeeping": "", "food_health": ""})
         value.setdefault("visionAgents", dict(value["agents"]))
         value.setdefault("scope", dict(DEFAULT_BACKUP_SCOPE))
+        value["timeZoneConfigured"] = bool(value.get("timeZoneConfigured", "timeZone" in value))
+        value["timeZone"] = normalize_time_zone(value.get("timeZone"))
         try:
             cycle_start_day = int(value.get("billingCycleStartDay", 15))
         except (TypeError, ValueError):
@@ -160,6 +168,12 @@ class MobileWorkspace:
             value["saveImages"] = False
         value.setdefault("cloud", {})
         return value
+
+    def local_now(self, uid):
+        return regional_now(self.config(uid).get("timeZone", DEFAULT_TIME_ZONE))
+
+    def local_today(self, uid):
+        return self.local_now(uid).date().isoformat()
 
     def save_config(self, uid, value):
         atomic(self.folder(uid) / "settings.enc",
@@ -185,6 +199,7 @@ class MobileWorkspace:
         for cloud in cfg["cloud"].values():
             cloud["connected"] = bool(cloud.pop("token", ""))
             cloud.pop("refresh_token", None)
+            cloud.pop("snapshotCheckpoint", None)
         cfg["githubInstallUrl"] = GITHUB_APP_INSTALL_URL
         stores = self.stores(uid)
         payment, revision = stores["payment_store"].load_snapshot()
@@ -243,11 +258,15 @@ class MobileWorkspace:
         return cfg
 
     def snapshot(self, uid, language="zh-CN", report_date=None):
-        report_date = parse_date(report_date).isoformat() if report_date else today()
+        time_zone = self.config(uid).get("timeZone", DEFAULT_TIME_ZONE)
+        local_now = regional_now(time_zone)
+        current_date = local_now.date().isoformat()
+        report_date = parse_date(report_date, time_zone).isoformat() if report_date else current_date
         with self.lock(uid):
             db = Database(self.db_path(uid))
             try:
                 db.initialize()
+                db.time_zone = time_zone
                 cycle_start_day = int(self.config(uid).get("billingCycleStartDay", 15))
                 setting_rows = db.connection.execute(
                     "SELECT key,value FROM settings WHERE key NOT LIKE 'web_%'"
@@ -259,7 +278,7 @@ class MobileWorkspace:
                 eaten = db.connection.execute(
                     "SELECT * FROM food_consumption_records ORDER BY consumed_on DESC,id DESC LIMIT 500"
                 ).fetchall()
-                cards = credit_card_overview(db, today())
+                cards = credit_card_overview(db, current_date)
                 history = {
                     str(card["account_id"]): {
                         "snapshots": db.credit_snapshot_history(card["account_id"]),
@@ -268,19 +287,19 @@ class MobileWorkspace:
                 }
                 errors, reviews = db.validate()
                 value = {
-                    "date": today(), "cash": managed_balances(db),
+                    "date": current_date, "cash": managed_balances(db),
                     "cards": cards, "creditHistory": history,
                     "repaymentPlans": credit_repayment_schedules(db),
                     "recurring": list_recurring_schedules(db),
                     "assets": db.list_fixed_assets(),
-                    "balanceSheet": build_balance_sheet(db, today()),
-                    "profit": build_profit_statement(db, today(), cycle_start_day),
+                    "balanceSheet": build_balance_sheet(db, current_date),
+                    "profit": build_profit_statement(db, current_date, cycle_start_day),
                     "reports": {"date": report_date,
                         "balanceSheet": build_balance_sheet(db, report_date),
                         "profit": build_profit_statement(db, report_date, cycle_start_day)},
                     "settings": {row["key"]: row["value"] for row in setting_rows},
                     "food": food, "eaten": eaten, "foodGroups": FOOD_GROUP_LABELS,
-                    "foodReview": build_food_review_answer(db, "最近20天吃了什么", datetime.now(JST).date()),
+                    "foodReview": build_food_review_answer(db, "最近20天吃了什么", local_now.date()),
                     "transactions": bills[:2000],
                     "validation": {"errors": errors, "reviews": reviews},
                 }
@@ -306,13 +325,13 @@ class MobileWorkspace:
             return []
         return [
             {"name": p.name, "size": str(p.stat().st_size),
-             "date": datetime.fromtimestamp(p.stat().st_mtime, JST).isoformat()}
+             "date": datetime.fromtimestamp(p.stat().st_mtime, regional_now(self.config(uid).get("timeZone")).tzinfo).isoformat()}
             for p in sorted(folder.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)[:100]
         ]
 
     def backup(self, uid, prefix="manual", full=False):
         folder = self.folder(uid) / "backups"
-        name = f"{prefix}-{datetime.now(JST):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.zip"
+        name = f"{prefix}-{self.local_now(uid):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.zip"
         with self.lock(uid):
             cfg = self.config(uid)
             body = create_sync_bundle(
@@ -488,8 +507,9 @@ class MobileWorkspace:
                 not isinstance(setup_confirmations, dict)
                 or setup_confirmations.get("baseCurrency") is not True
                 or setup_confirmations.get("billingCycleStartDay") is not True
+                or setup_confirmations.get("timeZone") is not True
             ):
-                raise LedgerError("首次设置必须先在实际设置页面确认本位币和账期起始日。")
+                raise LedgerError("首次设置必须先在实际设置页面确认主要记账货币、所在地区和每月统计起始日。")
             if adjustments and post_differences and data.get("confirmBalanceAdjustments") is not True:
                 raise LedgerError("请先确认余额差额将记入调整流水。")
 
@@ -572,7 +592,14 @@ class MobileWorkspace:
             self.after_write(uid)
             return {"message": "付款规则已保存。"}
         if action == "agent_reset":
-            self.conversations.pop((uid, data.get("agent", "bookkeeping")), None)
+            agent = str(data.get("agent", "bookkeeping"))
+            if agent == "ledger_query":
+                for specialist in ("bookkeeping", "food_health"):
+                    self.conversations.pop((uid, specialist), None)
+            elif agent in {"bookkeeping", "food_health"}:
+                self.conversations.pop((uid, agent), None)
+            else:
+                raise LedgerError("Agent 无效。")
             return {"ok": True}
         if action == "cloud_disconnect":
             self._confirmed(data)
@@ -583,6 +610,7 @@ class MobileWorkspace:
         db = Database(self.db_path(uid))
         try:
             db.initialize()
+            db.time_zone = self.config(uid).get("timeZone", DEFAULT_TIME_ZONE)
             result = {"message": "已保存。"}
             if action in {"delete_transaction", "delete_account", "delete_asset", "delete_recurring",
                           "delete_food", "restore_credit", "delete_category"}:
@@ -590,7 +618,7 @@ class MobileWorkspace:
                 self.backup(uid, "before-change", full=True)
             if action == "reconcile":
                 result["adjustments"] = serial(reconcile_account_balances(
-                    db, data["amounts"], data.get("date") or today(),
+                    db, data["amounts"], data.get("date") or self.local_today(uid),
                     post_differences=bool(data.get("postDifferences", True))))
             elif action == "rename_account":
                 account_id = int(data.get("accountId") or 0)
@@ -619,26 +647,52 @@ class MobileWorkspace:
             elif action == "credit_snapshot":
                 result["snapshot"] = record_credit_snapshot(
                     db, data["account"], str(data["limit"]), str(data["available"]),
-                    data.get("date") or today(), data.get("note", ""),
+                    data.get("date") or self.local_today(uid), data.get("note", ""),
                     include_difference=bool(data.get("includeDifference", False)),
                 )
                 adjustment = result["snapshot"]
-                result["message"] = (
-                    f"额度快照已保存，并已将差额记入{adjustment['category_name']}。"
-                    if adjustment["transaction_id"] else
-                    "额度快照已保存，账面与快照欠款估算一致，未生成调整流水。"
-                    if data.get("includeDifference") else
-                    "额度快照已保存，未计入账本。"
-                )
+                if adjustment["transaction_id"]:
+                    amount_text = format_account_amount(
+                        abs(int(adjustment["difference_minor"])),
+                        int(adjustment["minor_digits"]), adjustment["currency"], "credit",
+                    )
+                    basis_text = str(adjustment.get("comparison_basis") or "账面信用卡欠款")
+                    previous_available = adjustment.get("previous_available_minor")
+                    if previous_available is not None:
+                        previous_available_text = format_account_amount(
+                            int(previous_available), int(adjustment["minor_digits"]),
+                            adjustment["currency"], "credit",
+                        )
+                        current_available_text = format_account_amount(
+                            int(adjustment["available_minor"]), int(adjustment["minor_digits"]),
+                            adjustment["currency"], "credit",
+                        )
+                        available_change = f"可用额度 {previous_available_text} → {current_available_text}；"
+                    else:
+                        available_change = ""
+                    result["message"] = (
+                        f"{available_change}额度快照已保存，与{basis_text}相比，"
+                        f"已记入{adjustment['category_name']} {amount_text}。"
+                    )
+                elif data.get("includeDifference"):
+                    result["message"] = "额度快照已保存，本次欠款估算与对比基准一致，未生成调整流水。"
+                else:
+                    result["message"] = "额度快照已保存，未计入账本。"
             elif action == "credit_repay":
-                record_credit_card_repayment(db, card_name=data["card"], source_account_name=data["source"],
-                                             amount=str(data["amount"]), occurred_on=data.get("date") or today(),
-                                             description=data.get("description", "信用卡还款"))
+                result["transaction_id"] = record_credit_card_repayment(
+                    db, card_name=data["card"], source_account_name=data["source"],
+                    amount=str(data["amount"]), occurred_on=data.get("date") or self.local_today(uid),
+                    description=data.get("description", "信用卡还款"),
+                )
             elif action == "credit_plan":
                 save_credit_repayment_schedule(db, card_name=data["card"], source_account_name=data["source"],
-                                               first_due_date=data["date"], amount=data.get("amount") or None)
+                                               first_due_date=data["date"], due_time=data.get("time") or "09:00",
+                                               amount=data.get("amount") or None, today_value=self.local_today(uid))
             elif action == "credit_plan_toggle":
-                set_credit_repayment_schedule_enabled(db, card_name=data["card"], enabled=bool(data["enabled"]))
+                set_credit_repayment_schedule_enabled(db, card_name=data["card"], enabled=bool(data["enabled"]),
+                                                      today_value=self.local_today(uid))
+            elif action == "credit_plan_delete":
+                delete_credit_repayment_schedule(db, card_name=data["card"])
             elif action == "restore_credit":
                 db.restore_credit_snapshot_history(int(data["accountId"]), data["snapshotType"], int(data["snapshotId"]))
             elif action == "recurring":
@@ -653,8 +707,10 @@ class MobileWorkspace:
             elif action == "delete_recurring":
                 delete_recurring_schedule(db, int(data["id"]))
             elif action == "run_due":
-                result["credit"] = serial(process_due_credit_repayments(db, today()))
-                result["recurring"] = serial(process_due_recurring_transactions(db, today()))
+                local_now = self.local_now(uid)
+                current_date = local_now.date().isoformat()
+                result["credit"] = serial(process_due_credit_repayments(db, current_date, local_now.strftime("%H:%M")))
+                result["recurring"] = serial(process_due_recurring_transactions(db, current_date))
             elif action == "asset":
                 code = data["currency"]
                 digits = db.currency(code)["minor_digits"]
@@ -670,9 +726,9 @@ class MobileWorkspace:
             elif action == "asset_toggle":
                 db.set_fixed_asset_inclusion(int(data["id"]), bool(data["included"]))
             elif action == "food_purchase":
-                db.add_food_purchases(data.get("date") or today(), data["items"])
+                db.add_food_purchases(data.get("date") or self.local_today(uid), data["items"])
             elif action == "food_eaten":
-                db.add_food_consumptions(data.get("date") or today(), data["items"],
+                db.add_food_consumptions(data.get("date") or self.local_today(uid), data["items"],
                                          meal=data.get("meal", ""), note=data.get("note", ""))
             elif action == "food_group":
                 db.set_food_purchase_group(int(data["id"]), data["group"])
@@ -684,8 +740,18 @@ class MobileWorkspace:
             elif action == "delete_transaction":
                 db.delete_transaction_with_backup(int(data["id"]))
             elif action == "edit_transaction":
+                transaction_id = int(data["id"])
+                before = db.connection.execute(
+                    "SELECT t.kind,t.description,c.name AS category_name "
+                    "FROM transactions t LEFT JOIN categories c ON c.id=t.category_id WHERE t.id=?",
+                    (transaction_id,),
+                ).fetchone()
+                item_names = [str(row["item_name"]) for row in db.connection.execute(
+                    "SELECT item_name FROM food_purchase_items WHERE transaction_id=? ORDER BY line_number",
+                    (transaction_id,),
+                ).fetchall()]
                 backup_path = db.update_transaction_with_backup(
-                    int(data["id"]),
+                    transaction_id,
                     occurred_on=str(data.get("date", "")),
                     kind=str(data.get("kind", "")),
                     amount=str(data.get("amount", "")),
@@ -698,6 +764,23 @@ class MobileWorkspace:
                     memo_only=bool(data.get("memo_only", False)),
                     needs_review=bool(data.get("needs_review", False)),
                 )
+                after = db.connection.execute(
+                    "SELECT t.kind,t.description,c.name AS category_name "
+                    "FROM transactions t LEFT JOIN categories c ON c.id=t.category_id WHERE t.id=?",
+                    (transaction_id,),
+                ).fetchone()
+                if (
+                    before is not None and after is not None
+                    and before["kind"] == "expense" and after["kind"] == "expense"
+                    and before["category_name"] != after["category_name"]
+                ):
+                    remember_category_correction(
+                        db,
+                        old_description=str(before["description"] or ""),
+                        new_description=str(after["description"] or ""),
+                        category_name=str(after["category_name"] or ""),
+                        item_names=item_names,
+                    )
                 result["backup"] = backup_path.name
             elif action == "review_transaction":
                 db.confirm_transaction_review(int(data["id"]), account_name=data.get("account") or None)
@@ -717,11 +800,14 @@ class MobileWorkspace:
                 db.connection.execute("UPDATE categories SET is_active=0 WHERE id=?", (int(data["id"]),))
                 db.connection.commit()
             elif action == "budget":
-                amount = to_minor_allow_zero(str(data["total"]), "JPY", 0)
+                raw_items = data.get("items", {})
+                if not isinstance(raw_items, dict):
+                    raise LedgerError("预算分类格式无效，请重新填写。")
+                items = {name: to_minor_allow_zero(str(value), "JPY", 0) for name, value in raw_items.items()}
+                amount = sum(items.values())
                 db.set_setting("monthly_jpy_budget_minor", str(amount), "Web budget")
-                items = {name: to_minor_allow_zero(str(value), "JPY", 0) for name, value in data.get("items", {}).items()}
                 cycle_start_day = int(self.config(uid).get("billingCycleStartDay", 15))
-                start, _ = billing_cycle(datetime.now(JST).date(), cycle_start_day)
+                start, _ = billing_cycle(self.local_now(uid).date(), cycle_start_day)
                 for key in (f"savings_plan:{start.isoformat()}", "savings_plan:monthly_template"):
                     db.set_setting(key, json.dumps({"items": items}, ensure_ascii=False))
                 if data.get("goal") is not None:
@@ -749,10 +835,15 @@ class MobileWorkspace:
         if not bool(cfg.get("onboardingCompleted", True)):
             if onboarding_step not in {"base", "api", "agents", "skills"}:
                 raise LedgerError("请按步骤完成新手引导。")
-            if "baseCurrency" not in data or "billingCycleStartDay" not in data:
-                raise LedgerError("请先设置本位币和会计期间起始日。")
+            if "baseCurrency" not in data or "billingCycleStartDay" not in data or "timeZone" not in data:
+                raise LedgerError("请先设置主要记账货币、所在地区和每月统计起始日。")
             if completing_onboarding and onboarding_step != "skills":
                 raise LedgerError("请先完成 API、Agent 和 Skill 设置。")
+        requested_time_zone = data.get("timeZone", cfg.get("timeZone", DEFAULT_TIME_ZONE))
+        if not is_supported_time_zone(requested_time_zone):
+            raise LedgerError("请选择有效的所在地区。")
+        if not bool(cfg.get("onboardingCompleted", True)) and "timeZone" not in data:
+            raise LedgerError("请先设置所在地区。")
         previous_cycle_start_day = int(cfg.get("billingCycleStartDay", 15))
         requested_cycle_day = data.get("billingCycleStartDay", previous_cycle_start_day)
         if (
@@ -831,10 +922,13 @@ class MobileWorkspace:
                     store.save_path(target)
                 else:
                     store.clear()
+        cfg["timeZone"] = requested_time_zone
+        cfg["timeZoneConfigured"] = True
         cfg["billingCycleStartDay"] = cycle_start_day
         db = Database(self.db_path(uid))
         try:
             db.initialize()
+            db.time_zone = requested_time_zone
             if completing_onboarding:
                 account_count = int(db.connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0])
                 if account_count < 1:
@@ -851,7 +945,7 @@ class MobileWorkspace:
                 if base_currency not in {"JPY", "CNY", "USD"}:
                     raise LedgerError("本位币仅支持 JPY、CNY 或 USD。")
                 db.set_setting("base_currency", base_currency, "Web ledger base currency")
-            now = datetime.now(JST).date()
+            now = regional_now(requested_time_zone).date()
             previous_start, _ = billing_cycle(now, previous_cycle_start_day)
             current_start, _ = billing_cycle(now, cycle_start_day)
             previous_plan_key = f"savings_plan:{previous_start.isoformat()}"
@@ -1221,8 +1315,13 @@ class MobileWorkspace:
                         db = Database(file)
                         try:
                             db.initialize()
-                            credit = process_due_credit_repayments(db, today())
-                            recurring = process_due_recurring_transactions(db, today())
+                            config = self.config(uid)
+                            time_zone = config.get("timeZone", DEFAULT_TIME_ZONE)
+                            current_time = regional_now(time_zone)
+                            db.time_zone = time_zone
+                            local_date = current_time.date().isoformat()
+                            credit = process_due_credit_repayments(db, local_date, current_time.strftime("%H:%M"))
+                            recurring = process_due_recurring_transactions(db, local_date)
                         finally:
                             db.close()
                     if any(row.get("transaction_id") for row in credit + recurring):

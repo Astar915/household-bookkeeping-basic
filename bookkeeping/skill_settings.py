@@ -60,6 +60,10 @@ class BookkeepingSkillStore:
                 candidate = (root / relative).resolve()
                 if not candidate.is_relative_to(root):
                     raise ValueError("relative skill path escapes settings directory")
+                if not candidate.is_file():
+                    fallback = self._relocated_default_path(value)
+                    if fallback is not None:
+                        return fallback
                 return candidate
             # Legacy mobile backups stored another computer's absolute path.
             # Rebase only an explicitly managed suffix in this account's own
@@ -75,11 +79,37 @@ class BookkeepingSkillStore:
                     suffix = (root.name, *suffix)
                 if tuple(p.casefold() for p in old_parts[-len(suffix):]) == tuple(p.casefold() for p in suffix) and candidate.is_file():
                     return candidate
-            if self._managed_paths and not Path(value).resolve().is_relative_to(root):
+            saved_path = Path(value)
+            if not saved_path.is_file():
+                fallback = self._relocated_default_path(value)
+                if fallback is not None:
+                    return fallback
+            if self._managed_paths and not saved_path.resolve().is_relative_to(root):
                 raise ValueError("managed skill path escapes account directory")
-            return Path(value)
+            return saved_path
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise BookkeepingSkillError("记账 Skill 设置无法读取；请在软件中重新加载或卸载 Skill。") from exc
+
+    def _relocated_default_path(self, saved_value: str) -> Path | None:
+        """Rebase this app's built-in Skill when a project folder was moved.
+
+        Only an exact built-in folder suffix is eligible. Missing user-selected
+        Skills continue to raise the normal missing-file error instead of being
+        silently replaced with another Skill.
+        """
+        default = self._default_path
+        if not default.is_file():
+            return None
+        saved_parts = PureWindowsPath(saved_value).parts
+        default_parts = PureWindowsPath(str(default)).parts
+        suffix = default_parts[-4:]
+        if len(saved_parts) < len(suffix):
+            return None
+        if tuple(part.casefold() for part in saved_parts[-len(suffix):]) != tuple(
+            part.casefold() for part in suffix
+        ):
+            return None
+        return default
 
     def load(self) -> dict[str, str] | None:
         path = self.current_path()

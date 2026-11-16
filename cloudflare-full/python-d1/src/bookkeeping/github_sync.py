@@ -50,6 +50,13 @@ def _app_data_dir() -> Path:
     return app_data_directory()
 
 
+def _snapshot_api():
+    # Imported lazily to keep the legacy ZIP restore module independent from
+    # the new repository layout during startup and older-backup recovery.
+    from .sync_snapshot import SNAPSHOT_ROOT
+    return SNAPSHOT_ROOT
+
+
 def _remove_local_settings_from_database(database_path: Path) -> None:
     """Remove device-specific preferences from a portable SQLite snapshot."""
     try:
@@ -741,14 +748,14 @@ class GitHubClient:
         if self.token_store is not None:
             self.token_store.save(self.token, self.refresh_token)
 
-    def request_raw(self, path: str, *, _retried: bool = False) -> bytes:
+    def request_raw(self, path: str, *, _retried: bool = False, limit: int = MAX_SYNC_BUNDLE_BYTES) -> bytes:
         request = urllib.request.Request(
             GITHUB_API + path,
             headers={**self._headers("application/vnd.github.raw+json"), "User-Agent": "HouseholdBookkeeping/1.0"},
         )
         try:
             with (self.opener or urllib.request.urlopen)(request, timeout=45) as response:
-                return response.read(MAX_SYNC_BUNDLE_BYTES + 1)
+                return response.read(limit + 1)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 raise GitHubNotFound("GitHub 仓库中还没有账本备份。") from exc
@@ -838,6 +845,153 @@ class GitHubClient:
             raise GitHubSyncError("GitHub 未返回同步文件版本编号。")
         return sha
 
+    @staticmethod
+    def _snapshot_contents_path(repository: str) -> str:
+        owner, repo = repository.split("/", 1)
+        path = _snapshot_api() + "/manifest.json"
+        return "/repos/{}/{}/contents/{}".format(
+            urllib.parse.quote(owner, safe=""), urllib.parse.quote(repo, safe=""),
+            urllib.parse.quote(path, safe="/"),
+        )
+
+    def read_snapshot_manifest(self, repository: str, etag: str | None = None):
+        """Return (manifest, blob SHA, ETag, unchanged) for the folder format."""
+        from .sync_snapshot import SnapshotFormatError, parse_manifest
+
+        headers = {"If-None-Match": etag} if etag else None
+        try:
+            result, response_headers = self.request_with_headers(
+                self._snapshot_contents_path(repository), headers=headers,
+            )
+        except GitHubNotFound:
+            self.snapshot_manifest_etag = None
+            return None, None, None, False
+        current_etag = response_headers.get("etag") or etag
+        self.snapshot_manifest_etag = current_etag
+        if response_headers.get("x-household-not-modified") == "true":
+            return None, None, current_etag, True
+        sha = result.get("sha")
+        encoded = result.get("content")
+        if not isinstance(sha, str) or not sha:
+            raise GitHubSyncError("GitHub 未返回分区备份版本编号。")
+        if result.get("encoding") != "base64" or not isinstance(encoded, str) or not encoded.strip():
+            raise GitHubSyncError("GitHub 分区备份清单缺少可读取内容。")
+        try:
+            payload = base64.b64decode(encoded)
+            manifest = parse_manifest(payload)
+        except (ValueError, SnapshotFormatError) as exc:
+            raise GitHubSyncError("GitHub 分区备份清单无效。") from exc
+        actual_sha = hashlib.sha1(f"blob {len(payload)}\0".encode("ascii") + payload).hexdigest()
+        if actual_sha != sha:
+            raise GitHubSyncError("GitHub 分区备份清单校验失败。")
+        self._snapshot_manifest_cache = (sha, manifest)
+        return manifest, sha, current_etag, False
+
+    def cloud_revision(self, repository: str) -> str | None:
+        _manifest, sha, _etag, _unchanged = self.read_snapshot_manifest(repository)
+        return sha or self.bundle_sha(repository)
+
+    def bundle_snapshot_with_etag(self, repository: str, etag: str | None = None):
+        """Revision check for either the folder format or the legacy ZIP."""
+        manifest, sha, current_etag, unchanged = self.read_snapshot_manifest(repository, etag)
+        if unchanged:
+            return None, current_etag, True, None
+        if manifest is not None:
+            return sha, current_etag, False, None
+        return self._bundle_metadata(repository, etag, include_body=True)
+
+    def upload_snapshot(self, repository: str, plan, *, expected_sha: str | None = None) -> str:
+        """Commit all changed objects and the manifest with one fast-forward ref update."""
+        from .sync_snapshot import SNAPSHOT_ROOT, SnapshotFormatError, snapshot_manifest_bytes
+
+        manifest_path = SNAPSHOT_ROOT + "/manifest.json"
+        manifest_body = snapshot_manifest_bytes(plan.manifest)
+        if plan.unchanged:
+            current_revision = self.cloud_revision(repository)
+            if expected_sha != current_revision:
+                raise GitHubSyncConflict(
+                    "GitHub 云端备份在本机准备期间发生变化，本次没有覆盖云端数据；请刷新后重试。"
+                )
+            return current_revision or hashlib.sha1(f"blob {len(manifest_body)}\0".encode("ascii") + manifest_body).hexdigest()
+
+        owner, repo = repository.split("/", 1)
+        repo_path = f"/repos/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo, safe='')}"
+        info = self.request(repo_path)
+        branch = str(info.get("default_branch") or "")
+        if not branch:
+            raise GitHubSyncError("GitHub 仓库没有可用的默认分支。")
+        encoded_ref = urllib.parse.quote("heads/" + branch, safe="")
+        ref = self.request(f"{repo_path}/git/ref/{encoded_ref}")
+        current_commit = ref.get("object", {}).get("sha") if isinstance(ref.get("object"), dict) else None
+        if not isinstance(current_commit, str) or not current_commit:
+            raise GitHubSyncError("GitHub 未返回仓库当前版本。")
+        commit = self.request(f"{repo_path}/git/commits/{urllib.parse.quote(current_commit, safe='')}")
+        base_tree = commit.get("tree", {}).get("sha") if isinstance(commit.get("tree"), dict) else None
+        if not isinstance(base_tree, str) or not base_tree:
+            raise GitHubSyncError("GitHub 未返回仓库目录版本。")
+        # Recheck after obtaining the base commit. A competing sync between the
+        # first read and this point must stop before creating the new tree.
+        if self.cloud_revision(repository) != expected_sha:
+            raise GitHubSyncConflict("GitHub 云端备份已被其他设备更新；本次上传已取消。")
+
+        entries = []
+        changed_items = dict(plan.changed)
+        changed_items["manifest.json"] = manifest_body
+        # GitHub's tree endpoint accepts inline text content. Keep its request
+        # comfortably below the REST body limit; unusually large deltas fall
+        # back to individual Git blobs.
+        inline_delta = sum(len(body) for body in changed_items.values())
+        for relative, body in sorted(changed_items.items()):
+            actual_path = manifest_path if relative == "manifest.json" else f"{SNAPSHOT_ROOT}/{relative}"
+            inline_content = None
+            try:
+                if inline_delta <= 15_000_000:
+                    inline_content = body.decode("utf-8")
+            except UnicodeDecodeError:
+                inline_content = None
+            if inline_content is None:
+                blob = self.request(
+                    f"{repo_path}/git/blobs", method="POST",
+                    payload={"content": base64.b64encode(body).decode("ascii"), "encoding": "base64"},
+                    timeout=180,
+                )
+                blob_sha = blob.get("sha")
+                if not isinstance(blob_sha, str) or not blob_sha:
+                    raise GitHubSyncError("GitHub 未确认分区文件内容。")
+                entries.append({"path": actual_path, "mode": "100644", "type": "blob", "sha": blob_sha})
+            else:
+                entries.append({"path": actual_path, "mode": "100644", "type": "blob", "content": inline_content})
+        for relative in plan.deleted:
+            entries.append({"path": f"{SNAPSHOT_ROOT}/{relative}", "mode": "100644", "type": "blob", "sha": None})
+        tree = self.request(
+            f"{repo_path}/git/trees", method="POST",
+            payload={"base_tree": base_tree, "tree": entries}, timeout=180,
+        )
+        tree_sha = tree.get("sha")
+        if not isinstance(tree_sha, str) or not tree_sha:
+            raise GitHubSyncError("GitHub 未确认分区目录。")
+        created = self.request(
+            f"{repo_path}/git/commits", method="POST",
+            payload={"message": "Update household bookkeeping snapshot", "tree": tree_sha,
+                     "parents": [current_commit]}, timeout=180,
+        )
+        new_commit = created.get("sha")
+        if not isinstance(new_commit, str) or not new_commit:
+            raise GitHubSyncError("GitHub 未确认分区备份提交。")
+        try:
+            self.request(
+                f"{repo_path}/git/refs/heads/{urllib.parse.quote(branch, safe='')}",
+                method="PATCH", payload={"sha": new_commit, "force": False}, timeout=90,
+            )
+        except GitHubSyncConflict:
+            raise
+        except GitHubSyncError as exc:
+            raise GitHubSyncConflict("GitHub 云端目录在提交期间发生变化；本次上传没有覆盖它。") from exc
+        revision = hashlib.sha1(f"blob {len(manifest_body)}\0".encode("ascii") + manifest_body).hexdigest()
+        if self.cloud_revision(repository) != revision:
+            raise GitHubSyncError("GitHub 未确认完整分区提交；请重新检查云端版本。")
+        return revision
+
     def bundle_sha_with_etag(
         self,
         repository: str,
@@ -921,6 +1075,29 @@ class GitHubClient:
         initial_data: bytes | None = None,
     ) -> tuple[bytes, str]:
         """Download one stable cloud version and return its blob SHA checkpoint."""
+        from .sync_snapshot import (
+            MAX_ARCHIVE_BYTES, SnapshotFormatError, materialize_snapshot_bundle,
+            snapshot_from_repository_archive,
+        )
+        manifest, manifest_sha, _manifest_etag, _unchanged = self.read_snapshot_manifest(repository)
+        if manifest is not None:
+            if initial_sha and initial_sha != manifest_sha:
+                raise GitHubSyncConflict("GitHub 分区备份已变化，请重新恢复。")
+            if initial_data is not None:
+                raise GitHubSyncError("GitHub 分区备份下载状态无效，请重新检查云端。")
+            owner, repo = repository.split("/", 1)
+            archive_path = f"/repos/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo, safe='')}/zipball"
+            archive_body = self.request_raw(archive_path, limit=MAX_ARCHIVE_BYTES)
+            if len(archive_body) > MAX_ARCHIVE_BYTES:
+                raise GitHubSyncError("GitHub 目录备份压缩包超过安全大小限制。")
+            try:
+                parsed_manifest, blobs = snapshot_from_repository_archive(archive_body, manifest_sha or "")
+                bundle = materialize_snapshot_bundle(parsed_manifest, blobs)
+            except SnapshotFormatError as exc:
+                raise GitHubSyncError(str(exc)) from exc
+            if self.cloud_revision(repository) != manifest_sha:
+                raise GitHubSyncConflict("下载期间 GitHub 云端目录发生变化，请重新恢复。")
+            return bundle, str(manifest_sha)
         for _attempt in range(3):
             if initial_sha:
                 before_sha, before_etag, data = initial_sha, initial_etag, initial_data
@@ -946,6 +1123,46 @@ class GitHubClient:
             if unchanged or before_sha == after_sha:
                 return data, before_sha
         raise GitHubSyncConflict("下载期间 GitHub 云端同步文件发生变化，请重新恢复。")
+
+    def download_snapshot_delta_with_revision(
+        self, repository: str, local_files: dict[str, bytes], *, expected_sha: str,
+        manifest: dict[str, Any] | None = None,
+    ) -> tuple[bytes, str]:
+        """Restore a folder snapshot while downloading only changed file objects."""
+        from .sync_snapshot import (
+            SNAPSHOT_ROOT, SnapshotFormatError, materialize_snapshot_delta, snapshot_manifest_bytes,
+        )
+
+        revision = None
+        if manifest is None:
+            manifest, revision, _etag, _unchanged = self.read_snapshot_manifest(repository)
+        else:
+            payload = snapshot_manifest_bytes(manifest)
+            revision = hashlib.sha1(f"blob {len(payload)}\0".encode("ascii") + payload).hexdigest()
+        if manifest is None or revision != expected_sha:
+            raise GitHubSyncConflict("GitHub 分区备份已变化，请重新检查后再恢复。")
+
+        def fetch_file(relative: str, descriptor: dict[str, Any]) -> bytes:
+            owner, repo = repository.split("/", 1)
+            path = "/repos/{}/{}/contents/{}".format(
+                urllib.parse.quote(owner, safe=""), urllib.parse.quote(repo, safe=""),
+                urllib.parse.quote(f"{SNAPSHOT_ROOT}/{relative}", safe="/"),
+            )
+            try:
+                body = self.request_raw(path, limit=int(descriptor["size"]))
+            except (TypeError, ValueError) as exc:
+                raise GitHubSyncError("GitHub 分区文件大小无效。") from exc
+            if len(body) != descriptor["size"]:
+                raise GitHubSyncError("GitHub 分区文件长度不匹配；本机数据保持不变。")
+            return body
+
+        try:
+            bundle = materialize_snapshot_delta(manifest, local_files, fetch_file)
+        except SnapshotFormatError as exc:
+            raise GitHubSyncError(str(exc)) from exc
+        if self.cloud_revision(repository) != revision:
+            raise GitHubSyncConflict("下载期间 GitHub 云端目录发生变化，请重新恢复。")
+        return bundle, str(revision)
 
 
 def sync_bundle_created_at(bundle: bytes) -> str:

@@ -9,16 +9,16 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="家庭记账">
   <title>家庭记账</title>
-  <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-  <script src="/appearance.js"></script>
-  <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="/mobile.css">
-  <script defer src="/app.js"></script>
-  <script defer src="/mobile.js"></script>
-  <script defer src="/github-login.js"></script>
-  <script defer src="/gitee-login.js"></script>
+  <link rel="manifest" href="/manifest.webmanifest?v=101">
+  <link rel="icon" href="/icon.svg?v=101" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=101">
+  <script src="/appearance.js?v=101"></script>
+  <link rel="stylesheet" href="/style.css?v=101">
+  <link rel="stylesheet" href="/mobile.css?v=101">
+  <script defer src="/app.js?v=101"></script>
+  <script defer src="/mobile.js?v=101"></script>
+  <script defer src="/github-login.js?v=101"></script>
+  <script defer src="/gitee-login.js?v=101"></script>
 </head>
 <body>
   <header class="topbar">
@@ -99,11 +99,11 @@
       <section class="panel accounts-panel">
         <div class="section-heading"><div><h2 data-i18n="accounts">账户</h2><p data-i18n="accountsHint">余额按已入账流水计算，离线暂存记录单独显示。</p></div><button id="showAccountForm" class="button secondary" data-i18n="addAccount">＋ 添加账户</button></div>
         <div id="accountGrid" class="account-grid"></div>
-        <form id="accountForm" class="inline-form hidden">
+        <form id="accountForm" class="inline-form hidden" autocomplete="off">
           <label><span data-i18n="accountName">账户名称</span><input name="name" required maxlength="80"></label>
           <label><span data-i18n="accountType">类型</span><select name="type" required></select></label>
           <label><span data-i18n="currency">币种</span><select name="currency"><option>JPY</option><option>CNY</option><option>USD</option></select></label>
-          <label><span data-i18n="openingBalance">期初余额</span><input name="openingBalance" required inputmode="decimal" value="0"></label>
+          <label><span data-i18n="openingBalance">期初余额</span><input name="openingBalance" required inputmode="decimal" autocomplete="off" value="0"></label>
           <label><span data-i18n="openingDate">期初日期</span><input name="openingDate" type="date" required></label>
           <label><span data-i18n="completeness">余额状态</span><select name="completeness"><option value="known" data-i18n="known">完整</option><option value="partial" data-i18n="partial">部分核实</option><option value="inferred" data-i18n="inferred">包含推算</option></select></label>
           <div class="form-actions"><button type="submit" class="button primary" data-i18n="saveToQueue">保存并同步</button><button id="cancelAccount" class="button text-button" type="button" data-i18n="cancel">取消</button></div>
@@ -113,7 +113,7 @@
       <div class="content-columns">
         <section class="panel entry-panel">
           <div class="section-heading"><div><h2 data-i18n="quickEntry">快速记账</h2><p data-i18n="entryHint">提交后先进入同步队列；网络中断时保留在此设备。</p></div></div>
-          <form id="transactionForm" class="entry-form">
+          <form id="transactionForm" class="entry-form" autocomplete="off">
             <div class="segmented" role="group" aria-label="Transaction type">
               <button type="button" data-kind="expense" class="selected" data-i18n="expense">支出</button>
               <button type="button" data-kind="income" data-i18n="income">收入</button>
@@ -121,11 +121,11 @@
             </div>
             <input name="kind" type="hidden" value="expense">
             <label><span data-i18n="date">日期</span><input name="date" type="date" required></label>
-            <label><span data-i18n="amount">金额</span><div class="amount-wrap"><input name="amount" required inputmode="decimal" placeholder="0"><span id="amountCurrency">JPY</span></div></label>
+            <label><span data-i18n="amount">金额</span><div class="amount-wrap"><input name="amount" required inputmode="decimal" autocomplete="off" placeholder="0"><span id="amountCurrency">JPY</span></div></label>
             <label id="categoryRow"><span data-i18n="category">消费类别</span><div class="control-with-action"><select name="categoryName" required></select><button id="showCategoryForm" class="button compact" type="button" aria-label="Add category">＋</button></div></label>
             <label><span data-i18n="fromAccount">付款/转出账户</span><select name="accountName" required></select></label>
             <label id="toAccountRow" class="hidden"><span data-i18n="toAccount">转入账户</span><select name="toAccountName"></select></label>
-            <label id="toAmountRow" class="hidden"><span data-i18n="toAmount">实际转入金额（跨币种时填写）</span><div class="amount-wrap"><input name="toAmount" inputmode="decimal" placeholder=""><span id="toCurrency">CNY</span></div></label>
+            <label id="toAmountRow" class="hidden"><span data-i18n="toAmount">实际转入金额（跨币种时填写）</span><div class="amount-wrap"><input name="toAmount" inputmode="decimal" autocomplete="off" placeholder=""><span id="toCurrency">CNY</span></div></label>
             <label class="span-two"><span data-i18n="description">说明</span><input name="description" required maxlength="240" placeholder=""></label>
             <button type="submit" class="button primary wide" data-i18n="saveEntry">保存记账</button>
           </form>

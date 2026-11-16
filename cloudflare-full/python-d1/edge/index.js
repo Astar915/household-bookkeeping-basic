@@ -1,7 +1,6 @@
 // Keep Python initialization failures outside the browser-facing runtime.
-// Engines are private service bindings sharing the same D1 database. Public
-// mutations stay single-engine; verified durable Agent preparation steps may
-// fail over because their job IDs and commits are replay-safe.
+// Engines are private service bindings sharing the same D1 database.
+// Only reads may fail over: a failed mutation may already have committed.
 const unhealthyUntil = new Map();
 let sequence = 0;
 
@@ -28,11 +27,7 @@ async function dispatchEngine(request, env) {
   const order=[preferred,1-preferred].sort((a,b)=>
     Number((unhealthyUntil.get(a)||0)>Date.now())-Number((unhealthyUntil.get(b)||0)>Date.now()));
   const safeRead=["GET","HEAD"].includes(request.method);
-  const replaySafeAgentAdvance=request.method==="POST"
-    &&path==="/__internal/job/advance"
-    &&request.headers.get("X-App-Job-Secret")===String(env.APP_JOB_SHARED_SECRET)
-    &&request.headers.get("X-App-Job-Action")==="agent_prepare";
-  const attempts=(safeRead||replaySafeAgentAdvance)?order:[order[0]];
+  const attempts=safeRead?order:[order[0]];
   let lastDiagnostic=null;
   for(const index of attempts){
     try{

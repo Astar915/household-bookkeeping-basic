@@ -6,7 +6,7 @@ import hashlib
 import io
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from typing import Any
 from urllib.error import HTTPError
@@ -386,14 +386,17 @@ async def save_model_response(database, env, user_id: str, operation_id: str,
             "INSERT INTO app_job_model_call_chunks(user_id,operation_id,call_index,generation_id,chunk_index,ciphertext) "
             "VALUES(?,?,?,?,?,?)"
         ).bind(user_id, operation_id, index, generation, chunk_index, ciphertext))
-    # The chunks have a foreign key to this parent row, so commit the response
-    # descriptor before inserting them in bounded D1 batches.
-    await database.prepare(
+    # Commit the descriptor and the first chunk batch atomically. Most provider
+    # responses fit in one batch; separating these writes left a descriptor
+    # behind when a Workflow was interrupted between the two D1 requests.
+    descriptor = database.prepare(
         "INSERT INTO app_job_model_calls(user_id,operation_id,call_index,request_hash,ledger_revision,generation_id,"
         "response_status,response_bytes,chunk_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)"
     ).bind(user_id, operation_id, index, request_hash, revision, generation,
-          int(status), len(body), len(chunks), _now()).run()
-    for offset in range(0, len(statements), JOB_BATCH_CHUNKS):
+          int(status), len(body), len(chunks), _now())
+    first_batch_end = min(JOB_BATCH_CHUNKS, len(statements))
+    await database.batch([descriptor, *statements[:first_batch_end]])
+    for offset in range(first_batch_end, len(statements), JOB_BATCH_CHUNKS):
         await database.batch(statements[offset:offset + JOB_BATCH_CHUNKS])
     chosen = await database.prepare(
         "SELECT request_hash,ledger_revision FROM app_job_model_calls "
@@ -415,3 +418,56 @@ async def cleanup_job_private_state(database, user_id: str, operation_id: str) -
         database.prepare("DELETE FROM app_job_payloads WHERE user_id=? AND operation_id=?")
         .bind(user_id, operation_id),
     ])
+
+
+STALE_QUEUED_CLOUD_JOB_AGE = timedelta(minutes=20)
+STALE_QUEUED_CLOUD_JOB_ACTIONS = ("cloud_upload", "cloud_auto_sync", "startup_pull")
+
+
+async def expire_stale_queued_cloud_jobs(
+    database, user_id: str, operation_id: str | None = None,
+) -> int:
+    """Fail cloud-sync jobs that never left the durable queue.
+
+    A Workflow changes its row to ``running`` before doing any work. Therefore,
+    an old ``queued`` row has not started a ledger mutation and can be safely
+    closed without risking a late commit. Running jobs are deliberately not
+    expired here.
+    """
+    cutoff = (datetime.now(timezone.utc) - STALE_QUEUED_CLOUD_JOB_AGE).isoformat()
+    action_placeholders = ",".join("?" for _ in STALE_QUEUED_CLOUD_JOB_ACTIONS)
+    params = [user_id, *STALE_QUEUED_CLOUD_JOB_ACTIONS, cutoff]
+    query = (
+        "SELECT operation_id,action,updated_at FROM app_jobs "
+        f"WHERE user_id=? AND state='queued' AND action IN ({action_placeholders}) AND updated_at<?"
+    )
+    if operation_id:
+        query += " AND operation_id=?"
+        params.append(operation_id)
+    query += " ORDER BY updated_at LIMIT 20"
+    result = await database.prepare(query).bind(*params).run()
+    rows = result.get("results", []) if isinstance(result, dict) else getattr(result, "results", [])
+    expired = 0
+    now = _now()
+    message = "云端任务排队超时，任务没有开始执行；账本没有被此任务修改。请重新发起云端操作。"
+    result_json = json.dumps({"error": message}, ensure_ascii=False, separators=(",", ":"))
+    for row in list(rows or []):
+        job_id = str(_field(row, "operation_id"))
+        action = str(_field(row, "action"))
+        updated_at = str(_field(row, "updated_at"))
+        changed = await database.prepare(
+            "UPDATE app_jobs SET state='failed',message=?,result_json=?,updated_at=? "
+            "WHERE user_id=? AND operation_id=? AND action=? AND state='queued' AND updated_at=?"
+        ).bind(message, result_json, now, user_id, job_id, action, updated_at).run()
+        meta = changed.get("meta", {}) if isinstance(changed, dict) else getattr(changed, "meta", {})
+        count = meta.get("changes", 0) if isinstance(meta, dict) else getattr(meta, "changes", 0)
+        if int(count or 0) != 1:
+            continue
+        expired += 1
+        await cleanup_job_private_state(database, user_id, job_id)
+        if action == "cloud_auto_sync":
+            await database.prepare(
+                "UPDATE auto_sync_queue SET state='failed',operation_id=NULL,attempts=attempts+1,updated_at=? "
+                "WHERE user_id=? AND operation_id=? AND state='queued'"
+            ).bind(now, user_id, job_id).run()
+    return expired

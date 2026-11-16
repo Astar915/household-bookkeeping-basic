@@ -21,7 +21,7 @@ ACCOUNT_TYPE_LABELS = {
 
 def build_balance_sheet(database: Database, as_of: str | date) -> dict[str, Any]:
     """Build currency-separated assets and liabilities, with points reported separately."""
-    as_of_date = parse_date(as_of) if isinstance(as_of, str) else as_of
+    as_of_date = parse_date(as_of, getattr(database, "time_zone", "Asia/Tokyo")) if isinstance(as_of, str) else as_of
     monetary_codes = {
         row["code"] for row in database.connection.execute(
             "SELECT code FROM currencies WHERE is_monetary=1 ORDER BY code"
@@ -209,7 +209,9 @@ def build_balance_sheet(database: Database, as_of: str | date) -> dict[str, Any]
                 rate = None
             else:
                 try:
-                    rate = resolve_exchange_rate(database, code, base_currency, as_of_date.isoformat()).rate
+                    rate = resolve_exchange_rate(
+                        database, code, base_currency, as_of_date.isoformat(), fetch_if_missing=False
+                    ).rate
                 except (ValueError, RuntimeError):
                     base_totals["missing_conversion_count"] += 1
                     continue
@@ -273,7 +275,7 @@ def build_profit_statement(
     period_start_day: int = 15,
 ) -> dict[str, Any]:
     """Summarize native-currency activity and transaction-date totals in the ledger base currency."""
-    as_of_date = parse_date(as_of) if isinstance(as_of, str) else as_of
+    as_of_date = parse_date(as_of, getattr(database, "time_zone", "Asia/Tokyo")) if isinstance(as_of, str) else as_of
     start, end = billing_cycle(as_of_date, period_start_day)
     through = min(end, as_of_date)
     rows = database.report_rows(start.isoformat(), through.isoformat())
@@ -366,7 +368,8 @@ def build_profit_statement(
                     from .fx_rates import resolve_exchange_rate
 
                     exchange_cache[cache_key] = resolve_exchange_rate(
-                        database, code, base_currency, str(row["occurred_on"])
+                        database, code, base_currency, str(row["occurred_on"]),
+                        fetch_if_missing=False,
                     )
                 from .fx_rates import convert_minor_at_rate
 

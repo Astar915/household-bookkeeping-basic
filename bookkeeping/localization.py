@@ -1615,6 +1615,11 @@ _ROWS += (
     ("账户称呼已更改：{old} → {new}。", "口座名を変更しました：{old} → {new}。", "Account renamed: {old} → {new}."),
     ("云端未连接", "クラウド未接続", "Cloud not connected"),
     ("云端上传中…", "クラウドへアップロード中…", "Uploading to cloud…"),
+    ("云端下载中…", "クラウドからダウンロード中…", "Downloading from cloud…"),
+    ("正在检查云端…", "クラウドを確認中…", "Checking cloud…"),
+    ("云端已连接", "クラウドに接続済み", "Cloud connected"),
+    ("云端已同步", "クラウドと同期済み", "Cloud synced"),
+    ("本机账本保持不变；本次未应用云端数据。", "ローカル台帳はそのままです。今回はクラウドデータを適用していません。", "The local ledger is unchanged; cloud data was not applied this time."),
     ("已上传到云端", "クラウドへアップロードしました", "Uploaded to cloud"),
     ("云端同步失败", "クラウド同期に失敗しました", "Cloud sync failed"),
 )
@@ -1675,6 +1680,19 @@ _ROWS += (
     ("更多功能", "その他の機能", "More"),
     ("报表、预算、定期收支、备份和设置都能从这里打开。", "レポート、予算、定期取引、バックアップ、設定はこちらから開けます。", "Open reports, budgets, recurring entries, backups, and settings here."),
     ("以后可以从左侧“新手教程”再次查看这份指南。", "左側の「使い方ガイド」からいつでも見直せます。", "Reopen this guide anytime from Getting started on the left."),
+    ("智能助手", "スマートアシスタント", "Smart assistant"),
+    ("随便聊天、查询账本、记账或咨询饮食", "自由に会話、台帳検索、記帳、食事相談", "Chat, ask about your ledger, record entries, or discuss food"),
+    ("你好，可以直接聊天、查账、记账或咨询饮食。涉及账本的回答会读取本机账本；只有确认后的记账操作才会写入。", "こんにちは。自由に会話し、台帳の確認、記帳、食事相談ができます。台帳に関する回答はこのPCの台帳を参照し、記帳は確認後にのみ保存します。", "Hi. Chat freely, ask about your ledger, record entries, or discuss food. Ledger answers use this PC's ledger, and entries are saved only after confirmation."),
+    ("选择主要记账货币和所在地区", "メイン通貨と地域を選択", "Choose your main currency and region"),
+    ("选择最常用的主要记账货币和所在地区。其他币种仍会单独显示。", "よく使うメイン通貨と地域を選択してください。他の通貨は別々に表示されます。", "Choose your main currency and region. Other currencies remain separate."),
+    ("所在地区会决定日期、定期项目和信用卡还款使用的当地时间。", "地域設定は日付、定期項目、カード返済に使う現地時間を決めます。", "Your region sets the local time used for dates, recurring items, and credit card repayments."),
+    ("所在地区", "地域", "Region"),
+    ("按所在地区处理日期和自动还款时间。", "日付と自動返済時刻は選択した地域に合わせます。", "Dates and automatic repayment times follow the selected region."),
+    ("请选择有效的所在地区。", "有効な地域を選択してください。", "Choose a valid region."),
+    ("所在地区已保存。", "地域を保存しました。", "Region saved."),
+    ("自动记账时间（所在地区当地时间）", "自動記帳時刻（選択地域の現地時間）", "Automatic posting time (local time in selected region)"),
+    ("删除计划", "予定を削除", "Delete plan"),
+    ("发送内容后显示本轮命中、未命中和输出费用。", "送信後、この回の入力・未入力・出力の費用を表示します。", "After sending, view this request's input, uncached input, and output cost."),
 )
 
 _CATALOGS = {

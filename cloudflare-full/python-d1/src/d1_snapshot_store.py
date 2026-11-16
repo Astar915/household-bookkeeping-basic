@@ -18,8 +18,11 @@ from typing import Any
 
 CHUNK_BYTES = 96 * 1024
 MAX_USER_STATE_BYTES = 450 * 1024 * 1024
+LOAD_CHUNKS_PER_QUERY = 16
+LOAD_QUERIES_PER_BATCH = 16
 GENESIS_REVISION = "0"
 LEDGER_ROWS_META_KEY = "__ledger_rows_v1__"
+BACKUP_CONTENT_REVISION_KEY = "__backup_content_revision_v1__"
 
 
 class SnapshotError(RuntimeError):
@@ -74,6 +77,9 @@ class D1SnapshotStore:
         self.ledger_rows_enabled = False
         self.ledger_schema_hash = ""
         self.ledger_row_deltas: list[dict[str, Any]] = []
+        self.backup_content_revision = ""
+        self.manifest: dict[str, Any] = {}
+        self.deferred_backup_entries: dict[str, dict[str, Any]] = {}
 
     async def ensure_user(self, user_id: str) -> None:
         """Create an empty manifest root after a user is provisioned."""
@@ -82,7 +88,52 @@ class D1SnapshotStore:
             "VALUES(?,?,?,?)"
         ).bind(user_id, GENESIS_REVISION, "{}", _now()).run()
 
-    async def load(self, user_id: str) -> tuple[str, dict[str, bytes]]:
+    async def read_revision(self, user_id: str) -> tuple[str, str]:
+        """Read the workspace version without loading file chunks."""
+        root = await self.database.prepare(
+            "SELECT revision,updated_at FROM user_state_roots WHERE user_id=?"
+        ).bind(user_id).first()
+        if root is None:
+            raise SnapshotError("云端账本索引不存在；请重新登录以初始化账号。")
+        try:
+            raw_revision = _field(root, "revision")
+            raw_updated_at = _field(root, "updated_at")
+            if raw_revision is None or raw_updated_at is None:
+                raise ValueError("missing revision metadata")
+            revision = str(raw_revision).strip()
+            updated_at = str(raw_updated_at).strip()
+        except (TypeError, ValueError, KeyError, IndexError, AttributeError) as exc:
+            raise SnapshotError("云端账本版本信息无效；为保护数据，本次操作已停止。") from exc
+        if not revision or not updated_at:
+            raise SnapshotError("云端账本版本信息不完整；为保护数据，本次操作已停止。")
+        return revision, updated_at
+
+    async def read_backup_content_revision(self, user_id: str) -> tuple[str, str]:
+        """Read the root row and its backup-only marker without loading chunks."""
+        root = await self.database.prepare(
+            "SELECT revision,manifest_json FROM user_state_roots WHERE user_id=?"
+        ).bind(user_id).first()
+        if root is None:
+            raise SnapshotError("云端账本索引不存在；请重新登录以初始化账号。")
+        try:
+            revision = str(_field(root, "revision") or "").strip()
+            manifest = json.loads(str(_field(root, "manifest_json") or "{}"))
+            if not revision or not isinstance(manifest, dict):
+                raise ValueError("invalid root metadata")
+            backup_revision = manifest.get(BACKUP_CONTENT_REVISION_KEY, revision)
+            if (not isinstance(backup_revision, str) or not backup_revision.strip()
+                    or len(backup_revision) > 128):
+                raise ValueError("invalid backup revision")
+            return revision, backup_revision
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            raise SnapshotError("云端备份内容版本无效；为保护数据，本次操作已停止。") from exc
+
+    async def load(
+        self,
+        user_id: str,
+        *,
+        include_backup_name: str | None = None,
+    ) -> tuple[str, dict[str, bytes]]:
         root = await self.database.prepare(
             "SELECT revision,manifest_json FROM user_state_roots WHERE user_id=?"
         ).bind(user_id).first()
@@ -91,33 +142,81 @@ class D1SnapshotStore:
 
         try:
             revision = str(_field(root, "revision"))
-            manifest = json.loads(str(_field(root, "manifest_json")))
+            manifest_json = str(_field(root, "manifest_json"))
+            manifest = json.loads(manifest_json)
             if not isinstance(manifest, dict):
                 raise ValueError("manifest is not an object")
         except (TypeError, ValueError, KeyError) as exc:
             raise SnapshotError("云端账本索引损坏；为保护数据，本次操作已停止。") from exc
 
-        query = await self.database.prepare(
-            "SELECT c.file_path,c.file_revision,c.chunk_index,c.payload_base64 "
-            "FROM user_state_chunks AS c "
-            "JOIN json_each((SELECT manifest_json FROM user_state_roots WHERE user_id=?)) AS m "
-            "  ON m.key=c.file_path AND json_extract(m.value,'$.revision')=c.file_revision "
-            "WHERE c.user_id=? ORDER BY c.file_path,c.chunk_index"
-        ).bind(user_id, user_id).run()
-
+        self.manifest = manifest
+        self.deferred_backup_entries = {}
+        requested_backup_path = (
+            f"mobile/{user_id}/backups/{include_backup_name}"
+            if include_backup_name else None
+        )
         pieces: dict[str, list[tuple[int, bytes]]] = {}
-        for row in _results(query):
-            path = _safe_path(str(_field(row, "file_path")))
-            encoded = str(_field(row, "payload_base64"))
+        page_queries = []
+        manifest_total_size = 0
+        for raw_path, entry in manifest.items():
+            if raw_path in {LEDGER_ROWS_META_KEY, BACKUP_CONTENT_REVISION_KEY}:
+                continue
+            path = _safe_path(raw_path)
+            if not isinstance(entry, dict):
+                raise SnapshotError("云端账本文件索引格式无效。")
             try:
-                payload = base64.b64decode(encoded, validate=True)
-                index = int(_field(row, "chunk_index"))
-            except (ValueError, TypeError) as exc:
-                raise SnapshotError("云端账本分块损坏；为保护数据，本次操作已停止。") from exc
-            pieces.setdefault(path, []).append((index, payload))
+                expected_count = int(entry.get("chunks", 0))
+                expected_size = int(entry.get("size", -1))
+            except (TypeError, ValueError) as exc:
+                raise SnapshotError("云端账本文件索引格式无效。") from exc
+            file_revision = entry.get("revision")
+            if (not isinstance(file_revision, str) or not file_revision
+                    or expected_count < 0 or expected_size < 0
+                    or expected_size > MAX_USER_STATE_BYTES
+                    or expected_count > (MAX_USER_STATE_BYTES + CHUNK_BYTES - 1) // CHUNK_BYTES
+                    or ((expected_count == 0) != (expected_size == 0))):
+                raise SnapshotError("云端账本文件分块索引无效；为保护数据，本次操作已停止。")
+            manifest_total_size += expected_size
+            if self._is_backup_archive(user_id, path) and path != requested_backup_path:
+                self.deferred_backup_entries[path] = entry
+                continue
+            for start in range(0, expected_count, LOAD_CHUNKS_PER_QUERY):
+                end = min(start + LOAD_CHUNKS_PER_QUERY, expected_count)
+                statement = self.database.prepare(
+                    "SELECT file_path,file_revision,chunk_index,payload_base64 "
+                    "FROM user_state_chunks INDEXED BY idx_user_state_chunks_current "
+                    "WHERE user_id=? AND file_path=? AND file_revision=? "
+                    "AND chunk_index>=? AND chunk_index<? ORDER BY chunk_index"
+                ).bind(user_id, path, file_revision, start, end)
+                page_queries.append((path, file_revision, start, end, statement))
 
+        # A single all-file SELECT can exceed D1's 50 MB result-size limit
+        # because each 96 KiB binary chunk is stored and returned as base64.
+        # Sixteen queries of sixteen chunks stay well below that cap while
+        # batching keeps the number of D1 subrequests bounded.
+        for offset in range(0, len(page_queries), LOAD_QUERIES_PER_BATCH):
+            pages = page_queries[offset:offset + LOAD_QUERIES_PER_BATCH]
+            results = await self.database.batch([page[4] for page in pages])
+            if not isinstance(results, (list, tuple)) or len(results) != len(pages):
+                raise SnapshotError("云端账本分块读取结果不完整；本次操作已停止。")
+            for (path, file_revision, start, end, _statement), result in zip(pages, results):
+                for row in _results(result):
+                    row_path = _safe_path(str(_field(row, "file_path")))
+                    row_revision = str(_field(row, "file_revision"))
+                    encoded = str(_field(row, "payload_base64"))
+                    try:
+                        payload = base64.b64decode(encoded, validate=True)
+                        index = int(_field(row, "chunk_index"))
+                    except (ValueError, TypeError) as exc:
+                        raise SnapshotError("云端账本分块损坏；为保护数据，本次操作已停止。") from exc
+                    if (row_path != path or row_revision != file_revision
+                            or index < start or index >= end):
+                        raise SnapshotError("云端账本分块与当前版本不匹配；本次操作已停止。")
+                    pieces.setdefault(path, []).append((index, payload))
+
+        if manifest_total_size > MAX_USER_STATE_BYTES:
+            raise SnapshotError("该账号的云端数据超过当前安全恢复上限。")
         files: dict[str, bytes] = {}
-        aggregate_size = 0
         meta = manifest.get(LEDGER_ROWS_META_KEY)
         if meta is not None:
             if not isinstance(meta, dict):
@@ -133,10 +232,19 @@ class D1SnapshotStore:
                 raise SnapshotError("云端账本结构校验信息无效；本次操作已停止。")
             self.ledger_rows_enabled = True
             self.ledger_schema_hash = schema_hash
+        backup_revision = manifest.get(BACKUP_CONTENT_REVISION_KEY)
+        if backup_revision is not None and (
+            not isinstance(backup_revision, str) or not backup_revision.strip()
+            or len(backup_revision) > 128
+        ):
+            raise SnapshotError("云端备份内容版本无效；为保护数据，本次操作已停止。")
+        self.backup_content_revision = str(backup_revision or revision)
         for raw_path, entry in manifest.items():
-            if raw_path == LEDGER_ROWS_META_KEY:
+            if raw_path in {LEDGER_ROWS_META_KEY, BACKUP_CONTENT_REVISION_KEY}:
                 continue
             path = _safe_path(raw_path)
+            if path in self.deferred_backup_entries:
+                continue
             if not isinstance(entry, dict):
                 raise SnapshotError("云端账本文件索引格式无效。")
             chunks = sorted(pieces.get(path, []), key=lambda item: item[0])
@@ -148,10 +256,7 @@ class D1SnapshotStore:
                 raise SnapshotError(f"云端账本文件 {path} 大小校验失败。")
             if hashlib.sha256(body).hexdigest() != str(entry.get("sha256", "")):
                 raise SnapshotError(f"云端账本文件 {path} 校验失败。")
-            aggregate_size += len(body)
             files[path] = body
-        if aggregate_size > MAX_USER_STATE_BYTES:
-            raise SnapshotError("该账号的云端数据超过当前安全恢复上限。")
         if self.ledger_rows_enabled:
             deltas = await self.database.prepare(
                 "SELECT table_name,row_key,operation,row_json FROM user_ledger_row_deltas "
@@ -178,6 +283,73 @@ class D1SnapshotStore:
                 self.ledger_row_deltas.append(item)
         return revision, files
 
+    async def read_file(self, user_id: str, raw_path: str) -> bytes:
+        """Read one indexed file without loading the user's other D1 files."""
+        path = _safe_path(raw_path)
+        root = await self.database.prepare(
+            "SELECT manifest_json FROM user_state_roots WHERE user_id=?"
+        ).bind(user_id).first()
+        if root is None:
+            raise SnapshotError("云端账本索引不存在；请重新登录以初始化账号。")
+        try:
+            manifest = json.loads(str(_field(root, "manifest_json")))
+            entry = manifest.get(path) if isinstance(manifest, dict) else None
+            if not isinstance(entry, dict):
+                raise KeyError(path)
+            file_revision = str(entry["revision"])
+            expected_count = int(entry["chunks"])
+            expected_size = int(entry["size"])
+            expected_sha256 = str(entry["sha256"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise SnapshotError("找不到这份云端备份，或备份索引无效。") from exc
+        if (not file_revision or expected_count < 0 or expected_size < 0
+                or expected_size > MAX_USER_STATE_BYTES
+                or expected_count != (expected_size + CHUNK_BYTES - 1) // CHUNK_BYTES
+                or len(expected_sha256) != 64):
+            raise SnapshotError("云端备份分块索引无效；本次操作已停止。")
+
+        pages = []
+        for start in range(0, expected_count, LOAD_CHUNKS_PER_QUERY):
+            end = min(start + LOAD_CHUNKS_PER_QUERY, expected_count)
+            pages.append((start, end, self.database.prepare(
+                "SELECT file_path,file_revision,chunk_index,payload_base64 "
+                "FROM user_state_chunks INDEXED BY idx_user_state_chunks_current "
+                "WHERE user_id=? AND file_path=? AND file_revision=? "
+                "AND chunk_index>=? AND chunk_index<? ORDER BY chunk_index"
+            ).bind(user_id, path, file_revision, start, end)))
+
+        chunks: list[tuple[int, bytes]] = []
+        for offset in range(0, len(pages), LOAD_QUERIES_PER_BATCH):
+            batch = pages[offset:offset + LOAD_QUERIES_PER_BATCH]
+            results = await self.database.batch([page[2] for page in batch])
+            if not isinstance(results, (list, tuple)) or len(results) != len(batch):
+                raise SnapshotError("云端备份分块读取结果不完整；本次操作已停止。")
+            for (start, end, _statement), result in zip(batch, results):
+                for row in _results(result):
+                    try:
+                        row_path = _safe_path(str(_field(row, "file_path")))
+                        row_revision = str(_field(row, "file_revision"))
+                        index = int(_field(row, "chunk_index"))
+                        payload = base64.b64decode(str(_field(row, "payload_base64")), validate=True)
+                    except (TypeError, ValueError) as exc:
+                        raise SnapshotError("云端备份分块损坏；为保护数据，本次操作已停止。") from exc
+                    if (row_path != path or row_revision != file_revision
+                            or index < start or index >= end):
+                        raise SnapshotError("云端备份分块与当前版本不匹配；本次操作已停止。")
+                    chunks.append((index, payload))
+        chunks.sort(key=lambda item: item[0])
+        if len(chunks) != expected_count or [index for index, _ in chunks] != list(range(expected_count)):
+            raise SnapshotError("云端备份文件不完整；本次操作已停止。")
+        body = b"".join(payload for _, payload in chunks)
+        if len(body) != expected_size or hashlib.sha256(body).hexdigest() != expected_sha256:
+            raise SnapshotError("云端备份校验失败；为保护数据，本次操作已停止。")
+        return body
+
+    @staticmethod
+    def _is_backup_archive(user_id: str, path: str) -> bool:
+        prefix = f"mobile/{user_id}/backups/"
+        return path.startswith(prefix) and path.lower().endswith(".zip") and "/" not in path[len(prefix):]
+
     async def commit(
         self,
         user_id: str,
@@ -191,6 +363,7 @@ class D1SnapshotStore:
         job_result_json: str = "{}",
         queue_auto_sync: bool = False,
         auto_sync_complete_operation_id: str | None = None,
+        auto_sync_failed: bool = False,
         ledger_row_changes: list[dict[str, Any]] | None = None,
         ledger_storage_meta: dict[str, Any] | None = None,
         clear_ledger_row_deltas: bool = False,
@@ -205,7 +378,11 @@ class D1SnapshotStore:
                 raise SnapshotError("内部文件状态格式无效。")
             total_size += len(body)
             normalized[path] = body
-        if total_size > MAX_USER_STATE_BYTES:
+        deferred_size = sum(
+            max(0, int(entry.get("size", 0) or 0))
+            for entry in self.deferred_backup_entries.values()
+        )
+        if total_size + deferred_size > MAX_USER_STATE_BYTES:
             raise SnapshotError("云端数据已接近 D1 安全容量，未提交本次更改。请先下载备份并清理旧备份。")
 
         root = await self.database.prepare(
@@ -227,6 +404,19 @@ class D1SnapshotStore:
             if previous == body and path in manifest:
                 continue
             changed[path] = body
+
+        # This marker represents data that belongs in the GitHub/Gitee
+        # snapshot, not every D1 commit. Conversations, job status, auth
+        # refreshes, and the pull checkpoint must not force a new full export.
+        backup_changed = any(
+            path != f"mobile/{user_id}/cloud_pull_state.json"
+            and not self._is_backup_archive(user_id, path)
+            for path in (set(changed) | removed)
+        )
+        backup_changed = bool(
+            backup_changed or ledger_row_changes or clear_ledger_row_deltas
+            or ledger_storage_meta is not None
+        )
 
         row_stage_id = None
         staged_ledger_rows = list(ledger_row_changes or [])
@@ -259,6 +449,11 @@ class D1SnapshotStore:
                 raise
 
         new_root_revision = uuid.uuid4().hex
+        backup_content_revision = (
+            new_root_revision if backup_changed
+            else self.backup_content_revision or current_revision
+        )
+        manifest[BACKUP_CONTENT_REVISION_KEY] = backup_content_revision
         if callable(final_statements):
             final_statements = final_statements(new_root_revision)
         else:
@@ -336,12 +531,19 @@ class D1SnapshotStore:
                 user_id, job_id, user_id, new_root_revision,
             ))
         if auto_sync_complete_operation_id:
-            final_batch.append(self.database.prepare(
-                "UPDATE auto_sync_queue SET state='done',operation_id=NULL,attempts=0,updated_at=? "
-                "WHERE user_id=? AND operation_id=? AND EXISTS "
-                "(SELECT 1 FROM user_state_roots WHERE user_id=? AND revision=?)"
-            ).bind(_now(), user_id, auto_sync_complete_operation_id, user_id, new_root_revision))
-        if queue_auto_sync and (changed or removed or row_stage_id or clear_ledger_row_deltas):
+            if auto_sync_failed:
+                final_batch.append(self.database.prepare(
+                    "UPDATE auto_sync_queue SET state='failed',operation_id=NULL,updated_at=? "
+                    "WHERE user_id=? AND operation_id=? AND EXISTS "
+                    "(SELECT 1 FROM user_state_roots WHERE user_id=? AND revision=?)"
+                ).bind(_now(), user_id, auto_sync_complete_operation_id, user_id, new_root_revision))
+            else:
+                final_batch.append(self.database.prepare(
+                    "UPDATE auto_sync_queue SET state='done',operation_id=NULL,attempts=0,updated_at=? "
+                    "WHERE user_id=? AND operation_id=? AND EXISTS "
+                    "(SELECT 1 FROM user_state_roots WHERE user_id=? AND revision=?)"
+                ).bind(_now(), user_id, auto_sync_complete_operation_id, user_id, new_root_revision))
+        if queue_auto_sync and backup_changed:
             final_batch.append(self.database.prepare(
                 "INSERT INTO auto_sync_queue(user_id,revision,state,operation_id,attempts,updated_at) "
                 "SELECT ?,?,'pending',NULL,0,? WHERE EXISTS "
@@ -376,13 +578,30 @@ class D1SnapshotStore:
             raise SnapshotConflict("另一设备先保存了新版本；本次更改没有覆盖它，请刷新后重试。")
 
 
-        # The root revision is the commit point. Garbage collection runs only
-        # after it advances, and removes chunks not referenced by its manifest.
-        await self.database.prepare(
-            "DELETE FROM user_state_chunks WHERE user_id=? AND NOT EXISTS ("
-            "SELECT 1 FROM json_each((SELECT manifest_json FROM user_state_roots WHERE user_id=?)) AS m "
-            "WHERE m.key=user_state_chunks.file_path "
-            "AND json_extract(m.value,'$.revision')=user_state_chunks.file_revision"
-            ")"
-        ).bind(user_id, user_id).run()
+        # The root revision is the commit point. Delete only the previous
+        # revisions replaced by this commit. A full-table anti-join here made
+        # every write scan all stored chunks even though only a few files move.
+        obsolete_revisions = set()
+        for path in set(changed) | removed:
+            previous = old_manifest.get(path)
+            if isinstance(previous, dict):
+                previous_revision = str(previous.get("revision", "")).strip()
+                if previous_revision:
+                    obsolete_revisions.add((path, previous_revision))
+        cleanup = [
+            self.database.prepare(
+                "DELETE FROM user_state_chunks "
+                "WHERE user_id=? AND file_path=? AND file_revision=?"
+            ).bind(user_id, path, file_revision)
+            for path, file_revision in sorted(obsolete_revisions)
+        ]
+        try:
+            for offset in range(0, len(cleanup), 40):
+                await self.database.batch(cleanup[offset:offset + 40])
+        except Exception:
+            # Cleanup is nonessential after the manifest commit. Leave any
+            # stale chunks for a later cleanup attempt; readers use only the
+            # revisions named by the manifest.
+            print("D1 snapshot chunk cleanup deferred after commit.")
+        self.backup_content_revision = backup_content_revision
         return new_root_revision

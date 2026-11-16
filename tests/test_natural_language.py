@@ -332,7 +332,7 @@ class NaturalLanguageTests(unittest.TestCase):
         session = NaturalLanguageSession(self.db, fake)  # type: ignore[arg-type]
         fixed_now = datetime(2026, 10, 17, 9, 0, tzinfo=timezone(timedelta(hours=9)))
 
-        with patch("bookkeeping.natural_language._now_japan", return_value=fixed_now):
+        with patch.object(session, "_now_local", return_value=fixed_now):
             answer = session.handle(
                 "请识别附件里的收据，不确定的信息先问我。",
                 images=[ImageAttachment("receipt.jpg", "image/jpeg", b"not-redecoded-by-fake")],
@@ -371,7 +371,7 @@ class NaturalLanguageTests(unittest.TestCase):
         session = NaturalLanguageSession(self.db, fake)  # type: ignore[arg-type]
         fixed_now = datetime(2026, 10, 17, 9, 0, tzinfo=timezone(timedelta(hours=9)))
 
-        with patch("bookkeeping.natural_language._now_japan", return_value=fixed_now):
+        with patch.object(session, "_now_local", return_value=fixed_now):
             answer = session.handle(
                 "请把附件中状态明确为已完成的购买记录为一笔消费；"
                 "付款账户是 Rakuten Card，如果模型读不出来小票日期就按当前日期记账。",
@@ -413,7 +413,7 @@ class NaturalLanguageTests(unittest.TestCase):
         )
 
         self.assertIn("没有识别出商品", answer)
-        self.assertIn("最终实付金额", answer)
+        self.assertIn("告诉我这张小票买了什么", answer)
         self.assertEqual(
             self.db.connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
             transactions_before,
@@ -889,7 +889,7 @@ class NaturalLanguageTests(unittest.TestCase):
             self.assertLess(cropped_summary.width * cropped_summary.height, 2400 * 1800 * 0.9)
             self.assertEqual(max(cropped_summary.size), 1280)
 
-    def test_receipt_with_unresolved_category_asks_category_before_payment_account(self) -> None:
+    def test_receipt_with_unresolved_category_uses_safe_fallback_without_blocking(self) -> None:
         fake = ReceiptAwareFakeClient(
             [expense_intent(account=None, question="这笔交易使用哪个账户？")],
             {
@@ -912,8 +912,9 @@ class NaturalLanguageTests(unittest.TestCase):
             images=[ImageAttachment("receipt.jpg", "image/jpeg", b"test-image")],
         )
 
-        self.assertIn("商品类别", answer)
-        self.assertNotIn("账户？", answer)
+        self.assertIn("图片记账草稿（尚未入账）", answer)
+        self.assertIsNotNone(session.pending_state)
+        self.assertEqual(session.pending_state["intent"].get("category"), "其他")
         self.assertEqual(
             self.db.connection.execute(
                 "SELECT COUNT(*) FROM transactions WHERE source='natural_language_api'"
@@ -935,7 +936,7 @@ class NaturalLanguageTests(unittest.TestCase):
         session = NaturalLanguageSession(self.db, fake)  # type: ignore[arg-type]
         fixed_now = datetime(2026, 10, 17, 9, 0, tzinfo=timezone(timedelta(hours=9)))
 
-        with patch("bookkeeping.natural_language._now_japan", return_value=fixed_now):
+        with patch.object(session, "_now_local", return_value=fixed_now):
             answer = session.handle(
                 "请把附件中状态明确为已完成且已付款的购买解析成一笔消费并记账；"
                 "类别是食材，支付账户是 Rakuten Card；如果模型读不出来小票日期的话，就按照当前日期记账。",
@@ -1040,14 +1041,14 @@ class NaturalLanguageTests(unittest.TestCase):
         self.assertEqual(payload["format"]["type"], "object")  # type: ignore[index]
         self.assertIn("payment_profile_index", payload["format"]["required"])  # type: ignore[index]
 
-    def test_prompt_includes_current_japan_local_time(self) -> None:
+    def test_prompt_includes_selected_region_local_time(self) -> None:
         from datetime import datetime, timezone, timedelta
 
         fixed_now = datetime(2026, 10, 16, 0, 5, 30, tzinfo=timezone(timedelta(hours=9)))
-        with patch("bookkeeping.natural_language._now_japan", return_value=fixed_now):
+        with patch("bookkeeping.natural_language.regional_now", return_value=fixed_now):
             prompt = _system_prompt(self.db)
 
-        self.assertIn("2026-10-16T00:05:30+09:00", prompt)
+        self.assertIn("当前所选地区本地时间（Asia/Tokyo）：2026-10-16T00:05:30+09:00", prompt)
         self.assertIn("date必须返回null", prompt)
         self.assertIn("大创/大創/ダイソー/DAISO", prompt)
         self.assertIn("遇到未识别的店名也不得仅凭店名推断餐饮", prompt)
@@ -1076,7 +1077,7 @@ class NaturalLanguageTests(unittest.TestCase):
         session = NaturalLanguageSession(self.db, FakeClient([intent]))  # type: ignore[arg-type]
         fixed_now = datetime(2026, 10, 17, 0, 5, 30, tzinfo=timezone(timedelta(hours=9)))
 
-        with patch("bookkeeping.natural_language._now_japan", return_value=fixed_now):
+        with patch.object(session, "_now_local", return_value=fixed_now):
             answer = session.handle(
                 "请按收据记账，用PayPay券支付",
                 images=[ImageAttachment("receipt.jpg", "image/jpeg", b"test-image")],
@@ -1098,7 +1099,7 @@ class NaturalLanguageTests(unittest.TestCase):
         session = NaturalLanguageSession(self.db, fake)  # type: ignore[arg-type]
         fixed_now = datetime(2026, 10, 16, 0, 5, 30, tzinfo=timezone(timedelta(hours=9)))
 
-        with patch("bookkeeping.natural_language._now_japan", return_value=fixed_now):
+        with patch.object(session, "_now_local", return_value=fixed_now):
             answer = session.handle("买糖1日元，用PayPay券")
 
         self.assertIn("已记录消费", answer)
@@ -1116,7 +1117,7 @@ class NaturalLanguageTests(unittest.TestCase):
         session = NaturalLanguageSession(self.db, fake)  # type: ignore[arg-type]
         fixed_now = datetime(2026, 10, 16, 0, 5, 30, tzinfo=timezone(timedelta(hours=9)))
 
-        with patch("bookkeeping.natural_language._now_japan", return_value=fixed_now):
+        with patch.object(session, "_now_local", return_value=fixed_now):
             answer = session.handle("买糖1日元，用PayPay券")
 
         self.assertIn("已记录消费", answer)
@@ -1125,7 +1126,7 @@ class NaturalLanguageTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["occurred_on"], "2026-10-16")
 
-    def test_relative_date_is_resolved_from_japan_clock(self) -> None:
+    def test_relative_date_is_resolved_from_selected_region_clock(self) -> None:
         from datetime import datetime, timezone, timedelta
 
         fixed_now = datetime(2026, 10, 16, 0, 5, 30, tzinfo=timezone(timedelta(hours=9)))
@@ -1134,7 +1135,7 @@ class NaturalLanguageTests(unittest.TestCase):
         fake = FakeClient([intent])
         session = NaturalLanguageSession(self.db, fake)  # type: ignore[arg-type]
 
-        with patch("bookkeeping.natural_language._now_japan", return_value=fixed_now):
+        with patch.object(session, "_now_local", return_value=fixed_now):
             answer = session.handle("昨天买糖1日元，用PayPay券")
 
         self.assertIn("已记录消费", answer)

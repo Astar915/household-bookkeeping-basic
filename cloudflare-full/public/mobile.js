@@ -9,6 +9,7 @@ const icons = {
   book:'<path d="M5 3h14v18H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"/><path d="M7 3v18M11 8h5M11 12h5"/>',
   wallet:'<rect x="3" y="5" width="18" height="15" rx="4"/><path d="M16 11h5v5h-5a2.5 2.5 0 0 1 0-5ZM4 6l12-3"/>',
   more:'<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
+  search:'<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/>',
   arrow:'<path d="m9 5 7 7-7 7"/>',
   plus:'<path d="M12 5v14M5 12h14"/>',
   eye:'<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',
@@ -21,16 +22,28 @@ const icons = {
   asset:'<path d="m3 10 9-7 9 7M5 9v12h14V9M9 21v-7h6v7"/>',
   check:'<path d="m5 12 4 4L19 6"/>',
   folder:'<path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 9h18"/>',
+  grid:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+  list:'<path d="M9 6h12M9 12h12M9 18h12"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/>',
 };
 const icon = name => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+(icons[name]||icons.book)+'</svg>';
 const b = (action, text, id="", cls="button secondary") => {
   const names={privacy:m("显示或隐藏金额","金額表示の切替","Show or hide amounts"),refresh:m("刷新","更新","Refresh"),"hero-mode-toggle":heroProfitMode?m("切换到主要记账货币余额","メイン通貨の残高に切替","Switch to main-currency balance"):m("切换到当期纯利润","当期純利益に切替","Switch to current net profit"),"budget-edit":m("编辑预算","予算編集","Edit budget"),"add-card":m("添加信用卡","カード追加","Add credit card"),"asset-edit":m("登记资产","資産を登録","Register asset"),"profile-add":m("添加 API 服务","APIを追加","Add API service"),backup:m("创建备份","バックアップ作成","Create backup"),"order-up":m("上移","上へ","Move up"),"order-down":m("下移","下へ","Move down"),"order-remove":m("移除扣款来源","引落元を削除","Remove funding source"),"favorites-edit":m("编辑常用功能","ショートカットを編集","Edit shortcuts"),"favorites-add":m("添加常用功能","ショートカットを追加","Add shortcut"),"favorite-remove":m("移除此常用功能","ショートカットを削除","Remove shortcut")};
   return '<button type="button" class="'+cls+'" data-action="'+action+'" data-id="'+e(id)+'"'+(names[action]?' aria-label="'+e(names[action])+'"':"")+'>'+text+'</button>';
 };
-const money = (value, currency="JPY", digits=null) => hiddenAmounts ? "••••••" : formatMinor(value || "0", currency, digits === null ? (["CNY","USD"].includes(currency) ? 2 : 0) : digits);
-const plainAmount = (minor, digits=0) => {
-  const v=BigInt(String(minor || 0)), factor=10n**BigInt(digits);
-  const a=v<0n?-v:v; return (v<0n?"-":"")+(a/factor).toString()+(digits ? "."+(a%factor).toString().padStart(digits,"0"):"");
+const money = (value, currency="JPY", digits=null, accountType="") => hiddenAmounts ? "••••••" : formatMinor(value || "0", currency, digits === null ? currencyMinorDigits(currency, 0) : digits, accountType);
+function dateAtTimeZone(instant,timeZone="Asia/Tokyo"){
+  const date=new Date(instant);
+  if(Number.isNaN(date.getTime()))return "";
+  try{
+    const parts=new Intl.DateTimeFormat("en-US",{timeZone,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(date);
+    const values=Object.fromEntries(parts.map(part=>[part.type,part.value]));
+    return values.year&&values.month&&values.day?`${values.year}-${values.month}-${values.day}`:"";
+  }catch{return "";}
+}
+const plainAmount = (minor, digits=0, currency="") => {
+  const places=currency?currencyMinorDigits(currency,digits):Number(digits||0);
+  const v=BigInt(String(minor || 0)), factor=10n**BigInt(places);
+  const a=v<0n?-v:v; return (v<0n?"-":"")+(a/factor).toString()+(places ? "."+(a%factor).toString().padStart(places,"0"):"");
 };
 function capturePreparedBaseline(preview){
   const workspaceKeys=Object.keys(workspace||{}),base={};
@@ -38,21 +51,51 @@ function capturePreparedBaseline(preview){
   return {workspace:base,workspaceKeys,accounts:deepCopy(cachedBootstrap?.accounts||[])};
 }
 let workspace = null, workspaceOwner = "", workspaceLoading = null;
+const WORKSPACE_CACHE_FORMAT = 2;
+let financePieColorNames = [];
+let financePieCategoryOrder = [];
 let workspaceEpoch = 0;
 let ledgerRangeRequest = 0;
 let workspaceError = "";
 let selectedPage = "home", assetTab = "cash", moreTab = "", reportDate = "", financialTab = "balance", settingsTab = "general", financeTrendMode = "daily", ledgerSearchTimer = null, ledgerRangeRows = null, backupDraft = null, favoritesEditing = false;
+let accountViewMode = localStorage.getItem("hh-account-view") === "list" ? "list" : "cards";
 let heroProfitMode = true;
 let hiddenAmounts = localStorage.getItem("hh-hide-amounts") === "1";
-let chatAgent = "bookkeeping", chats = {bookkeeping:[], food_health:[]}, attachments=[], currentUsageVision=false;
+let chatAgent = "ledger_query", chats = {bookkeeping:[], food_health:[], ledger_query:[]}, attachments=[], currentUsageVision=false;
 let modelBalances = {}, modelBalanceRequests = {}, modelBalanceCheckedAt = {}, modelBalanceSpend = {};
-let activeJob = "", loadingJob = false, selectedHistory = null, agentSubmitting = false;
+let activeJob = "", activeJobAgent = "", loadingJob = false, selectedHistory = null, agentSubmitting = false;
 let jobRecoveryOwner = "", settingsDraft = null, settingsInlineCapture = null, visibilityRefreshRunning = false;
 const sleepMobile = ms => new Promise(resolve => setTimeout(resolve,ms));
+const chatSessionLoads = new Map(), chatRestoreLoads = new Map();
+const chatSessionKey = owner => "hh-chat-session:"+owner;
+const validChatSessionId = value => /^[A-Za-z0-9_-]{6,80}$/.test(String(value||""));
+function createChatSessionId(){return crypto.randomUUID?crypto.randomUUID():Array.from(crypto.getRandomValues(new Uint8Array(16)),value=>value.toString(16).padStart(2,"0")).join("");}
+function chatCacheKey(owner,agent,sessionId=""){
+  if(agent!=="ledger_query")return "chat:"+owner+":"+agent;
+  const id=sessionId||localStorage.getItem(chatSessionKey(owner))||"legacy";
+  return "chat:"+owner+":"+agent+":"+id;
+}
+function ensureChatSessionId(owner=currentUser?.id){
+  if(!owner)return Promise.resolve("");
+  const key=chatSessionKey(owner),stored=localStorage.getItem(key);
+  if(validChatSessionId(stored))return Promise.resolve(stored);
+  if(chatSessionLoads.has(owner))return chatSessionLoads.get(owner);
+  const pending=(async()=>{
+    // Preserve visible legacy history only when it exists. An empty transcript
+    // means “New chat” was already chosen; old server-side intent must be isolated.
+    let legacy=[];try{legacy=await cacheGet("chat:"+owner+":ledger_query")||[];}catch{}
+    const id=Array.isArray(legacy)&&legacy.length?"legacy":createChatSessionId();
+    localStorage.setItem(key,id);
+    if(id==="legacy")try{await cacheSet(chatCacheKey(owner,"ledger_query",id),legacy);}catch{}
+    return id;
+  })();
+  chatSessionLoads.set(owner,pending);
+  return pending;
+}
 
 function numericUsage(usage,key){const value=Number(usage?.[key]||0);return Number.isFinite(value)&&value>0?Math.floor(value):0;}
 function selectedUsageProfile(agent,vision){
-  const preferences=workspace?.preferences||{},profileId=(vision?preferences.visionAgents:preferences.agents)?.[agent];
+  const preferences=workspace?.preferences||{},profileAgent=agent==="ledger_query"?"bookkeeping":agent,profileId=(vision?preferences.visionAgents:preferences.agents)?.[profileAgent];
   return (preferences.profiles||[]).find(profile=>profile.id===profileId)||null;
 }
 function deepSeekPricePeriod(at=new Date()){
@@ -144,6 +187,15 @@ function mountMobile() {
   $(".manual-entry").append(entry);
   $("#page-assets").innerHTML='<div id="assetTabs" class="mode-pills"></div><div id="creditPanel"></div><div id="fixedPanel"></div>';
   $("#page-assets").append(accounts);
+  const accountHeading=$(".accounts-panel .section-heading"),accountViewActions=document.createElement("div");
+  accountViewActions.id="accountViewActions";
+  accountViewActions.className="account-view-actions";
+  accountViewActions.setAttribute("role","group");
+  accountViewActions.setAttribute("aria-label",m("账户显示方式","口座の表示方法","Account display"));
+  accountViewActions.innerHTML='<button type="button" class="icon-button account-view-toggle" data-action="account-layout" data-id="list" aria-label="'+e(m("横向排布","横並び表示","Row layout"))+'" title="'+e(m("横向排布","横並び表示","Row layout"))+'">'+icon("list")+'</button><button type="button" class="icon-button account-view-toggle" data-action="account-layout" data-id="cards" aria-label="'+e(m("卡片排布","カード表示","Card layout"))+'" title="'+e(m("卡片排布","カード表示","Card layout"))+'">'+icon("grid")+'</button>';
+  accountViewActions.append($("#showAccountForm"));
+  accountHeading?.append(accountViewActions);
+  renderAccountViewControls();
   $("#page-ledger").append(history);
   const filters=document.createElement("div"); filters.id="historyFilters"; filters.className="history-filters";
   filters.innerHTML='<input id="historySearch" type="search" placeholder="'+m("搜索说明、账户或类别","内容・口座・カテゴリを検索","Search entries, accounts or categories")+'" aria-label="'+m("搜索账单","取引を検索","Search transactions")+'"><div class="date-range"><input id="historyStart" type="date" aria-label="'+m("开始日期","開始日","Start date")+'"><span>—</span><input id="historyEnd" type="date" aria-label="'+m("结束日期","終了日","End date")+'"></div>';
@@ -154,7 +206,7 @@ function mountMobile() {
   $("#backupPage").append(queue);
   const nav=document.createElement("nav"); nav.id="bottomNav"; nav.className="glass bottom-nav"; nav.setAttribute("aria-label",m("主导航","メインナビゲーション","Main navigation")); app.append(nav);
   const dlg=document.createElement("dialog"); dlg.id="editorDialog"; dlg.className="editor-sheet";
-  dlg.innerHTML='<form id="editorForm"><header class="sheet-heading"><button type="button" id="editorCancel" class="text-button"></button><h2 id="editorTitle"></h2><button type="submit" class="text-button accent" id="editorSave"></button></header><div id="editorBody" class="sheet-body"></div><footer id="editorFooter" class="sheet-footer"></footer></form>';
+  dlg.innerHTML='<form id="editorForm" autocomplete="off"><header class="sheet-heading"><button type="button" id="editorCancel" class="text-button"></button><h2 id="editorTitle"></h2><button type="submit" class="text-button accent" id="editorSave"></button></header><div id="editorBody" class="sheet-body"></div><footer id="editorFooter" class="sheet-footer"></footer></form>';
   document.body.append(dlg);
   $("#editorCancel").addEventListener("click",()=>dlg.close());
   dlg.addEventListener("click",event=>{if(event.target===dlg)dlg.close();});
@@ -177,6 +229,18 @@ function renderNavigation() {
   for(const page of $$(".mobile-page"))page.classList.toggle("hidden",page.dataset.page!==selectedPage);
   $(".page-heading h1").textContent=labels[selectedPage];
   $(".page-heading .eyebrow").textContent=m("生活，有迹可循","暮らしを、ていねいに","A little more clarity");
+}
+function renderAccountViewControls() {
+  const grid=$("#accountGrid");
+  grid?.classList.toggle("is-list",accountViewMode==="list");
+  const labels={cards:m("卡片排布","カード表示","Card layout"),list:m("横向排布","横並び表示","Row layout")};
+  $$("#accountViewActions [data-action='account-layout']").forEach(button=>{
+    const selected=button.dataset.id===accountViewMode;
+    button.classList.toggle("selected",selected);
+    button.setAttribute("aria-pressed",selected?"true":"false");
+    button.setAttribute("aria-label",labels[button.dataset.id]||"");
+    button.title=labels[button.dataset.id]||"";
+  });
 }
 function resetMorePageState(){settingsInlineCapture?.();settingsInlineCapture=null;moreTab="";favoritesEditing=false;settingsTab="general";}
 function navigate(page) {
@@ -259,9 +323,9 @@ function applyQueuedTransaction(item,pending=true){
     cachedBootstrap.transactions=[...bootstrapRows.values()].sort((a,b)=>String(b.occurred_on||"").localeCompare(String(a.occurred_on||""))||((a.pendingSync===b.pendingSync)?Number(b.id||0)-Number(a.id||0):a.pendingSync?-1:1)).slice(0,100);
   }
 }
-const LOCAL_FIRST_ACTIONS=new Set(["settings","onboarding_save","payment_rules","edit_transaction","review_transaction","delete_account","rename_account","reconcile","asset","asset_toggle","delete_asset","recurring","recurring_toggle","delete_recurring","budget","credit_plan","credit_plan_toggle","credit_repay","credit_snapshot","restore_credit","food_purchase","food_eaten","food_group","food_preference","delete_food","category","category_translation","run_due","agent_reset"]);
+const LOCAL_FIRST_ACTIONS=new Set(["settings","onboarding_save","payment_rules","edit_transaction","review_transaction","delete_account","rename_account","reconcile","asset","asset_toggle","delete_asset","recurring","recurring_toggle","delete_recurring","budget","credit_plan","credit_plan_toggle","credit_plan_delete","credit_repay","credit_snapshot","restore_credit","food_purchase","food_eaten","food_group","food_preference","delete_food","category","category_translation","run_due"]);
 function pendingActionLabel(action,data={}){
-  const labels={settings:m("设置更改","設定変更","Settings change"),onboarding_save:m("新手设置","初期設定","Initial setup"),payment_rules:m("支付规则","支払ルール","Payment rules"),edit_transaction:m("修改账目","取引の編集","Edit transaction"),review_transaction:m("核对账目","取引の確認","Review transaction"),delete_account:m("删除账户","口座の削除","Delete account"),rename_account:m("更改账户称呼","口座名の変更","Rename account"),reconcile:m("核对余额","残高の照合","Reconcile balance"),asset:m("固定资产更改","固定資産の変更","Asset change"),asset_toggle:m("固定资产更改","固定資産の変更","Asset change"),delete_asset:m("删除固定资产","固定資産の削除","Delete asset"),recurring:m("定期账目更改","定期取引の変更","Recurring entry change"),recurring_toggle:m("定期账目更改","定期取引の変更","Recurring entry change"),delete_recurring:m("删除定期账目","定期取引の削除","Delete recurring entry"),budget:m("预算更改","予算の変更","Budget change"),credit_plan:m("信用卡计划更改","カード返済予定の変更","Credit plan change"),credit_plan_toggle:m("信用卡计划更改","カード返済予定の変更","Credit plan change"),credit_repay:m("信用卡还款记录","カード返済記録","Credit repayment"),credit_snapshot:m("额度记录","利用枠の記録","Credit snapshot"),restore_credit:m("恢复额度记录","利用枠の復元","Restore credit snapshot"),food_purchase:m("食品采购记录","食品購入記録","Food purchase"),food_eaten:m("饮食记录","食事記録","Meal record"),food_group:m("食品分类更改","食品分類の変更","Food group change"),food_preference:m("饮食设置更改","食生活設定の変更","Food settings change"),delete_food:m("删除食品记录","食品記録の削除","Delete food record"),category_translation:m("类别名称更改","カテゴリ名の変更","Category name change"),run_due:m("处理到期项目","期日の処理","Process due entries"),agent_reset:m("新对话设置","新しい会話","New conversation")};
+  const labels={settings:m("设置更改","設定変更","Settings change"),onboarding_save:m("新手设置","初期設定","Initial setup"),payment_rules:m("支付规则","支払ルール","Payment rules"),edit_transaction:m("修改账目","取引の編集","Edit transaction"),review_transaction:m("核对账目","取引の確認","Review transaction"),delete_account:m("删除账户","口座の削除","Delete account"),rename_account:m("更改账户称呼","口座名の変更","Rename account"),reconcile:m("核对余额","残高の照合","Reconcile balance"),asset:m("固定资产更改","固定資産の変更","Asset change"),asset_toggle:m("固定资产更改","固定資産の変更","Asset change"),delete_asset:m("删除固定资产","固定資産の削除","Delete asset"),recurring:m("定期账目更改","定期取引の変更","Recurring entry change"),recurring_toggle:m("定期账目更改","定期取引の変更","Recurring entry change"),delete_recurring:m("删除定期账目","定期取引の削除","Delete recurring entry"),budget:m("预算更改","予算の変更","Budget change"),credit_plan:m("信用卡计划更改","カード返済予定の変更","Credit plan change"),credit_plan_toggle:m("信用卡计划更改","カード返済予定の変更","Credit plan change"),credit_plan_delete:m("删除信用卡计划","カード返済予定の削除","Delete credit plan"),credit_repay:m("信用卡还款记录","カード返済記録","Credit repayment"),credit_snapshot:m("额度记录","利用枠の記録","Credit snapshot"),restore_credit:m("恢复额度记录","利用枠の復元","Restore credit snapshot"),food_purchase:m("食品采购记录","食品購入記録","Food purchase"),food_eaten:m("饮食记录","食事記録","Meal record"),food_group:m("食品分类更改","食品分類の変更","Food group change"),food_preference:m("饮食设置更改","食生活設定の変更","Food settings change"),delete_food:m("删除食品记录","食品記録の削除","Delete food record"),category_translation:m("类别名称更改","カテゴリ名の変更","Category name change"),run_due:m("处理到期项目","期日の処理","Process due entries"),agent_reset:m("新对话设置","新しい会話","New conversation")};
   const row=action==="edit_transaction"?findTransactionById(data.id):null;
   return action==="delete_account"&&data.name?labels[action]+" · "+data.name:action==="rename_account"&&data.oldName?labels[action]+" · "+data.oldName+" → "+data.name:action==="edit_transaction"&&row?labels[action]+" · "+row.description:labels[action]||m("账本更改","台帳の変更","Ledger change");
 }
@@ -277,7 +341,38 @@ function buildPendingActionPreview(action,data,opId){
   if(action==="onboarding_save"){previewData.settings=safeSettingsPreview(data.settings||{});previous.preferences=deepCopy(workspace?.preferences||{});previous.settings=deepCopy(workspace?.settings||{});}
   if(["payment_rules","budget","food_preference"].includes(action)){previous.preferences=deepCopy(workspace?.preferences||{});previous.settings=deepCopy(workspace?.settings||{});}
   if(["edit_transaction","review_transaction"].includes(action)){const id=String(data.id);previewData.transactionId=id;previous.transaction=deepCopy((workspace?.transactions||[]).find(row=>String(row.id)===id)||null);previous.bootstrapTransaction=deepCopy((cachedBootstrap?.transactions||[]).find(row=>String(row.id)===id)||null);previous.rangeTransaction=deepCopy((ledgerRangeRows||[]).find(row=>String(row.id)===id)||null);}
-  if(action==="credit_snapshot")previous.creditCard=deepCopy((workspace?.cards||[]).find(row=>row.name===data.account)||null);
+  if(["credit_snapshot","credit_repay","credit_plan","credit_plan_toggle","credit_plan_delete","restore_credit"].includes(action)){
+    const requestedCardId=String(data.accountId||"");
+    const card=(workspace?.cards||[]).find(row=>requestedCardId&&String(row.account_id)===requestedCardId)
+      ||(workspace?.cards||[]).find(row=>row.name===String(data.account||data.card||""))||null;
+    previewData.cardAccountId=String(card?.account_id||requestedCardId);
+    previewData.cardName=String(card?.name||data.account||data.card||"");
+    if(card)previous.creditCard=deepCopy(card);
+    if(card)previous.creditCardAccount=deepCopy((cachedBootstrap?.accounts||[]).find(row=>String(row.id)===String(card.account_id))||null);
+    if(card)previous.creditHistory=deepCopy(workspace?.creditHistory?.[String(card.account_id)]||null);
+    if(action==="credit_snapshot"){
+      previous.balanceSheet=deepCopy(workspace?.balanceSheet||null);
+      previous.reportBalanceSheet=deepCopy(workspace?.reports?.balanceSheet||null);
+    }
+    if(card)previous.creditRepaymentPlan=deepCopy((workspace?.repaymentPlans||[]).find(row=>String(row.card_account_id)===String(card.account_id))||null);
+    if(action==="credit_repay"){
+      const sourceName=String(data.source||"");
+      previewData.sourceName=sourceName;
+      previous.creditSourceAccount=deepCopy((cachedBootstrap?.accounts||[]).find(row=>row.name===sourceName)||null);
+      previous.creditSourceCash=deepCopy((workspace?.cash||[]).find(row=>row.account_name===sourceName)||null);
+      previewData.localCommitComplete=Boolean(card&&previous.creditSourceAccount&&previous.creditSourceAccount.currency===card.currency);
+    }
+    const reportCurrency=String(workspace?.settings?.base_currency||workspace?.preferences?.baseCurrency||"JPY").toUpperCase();
+    previewData.localCommitComplete=Boolean(card)&&(
+      action==="credit_plan"||action==="credit_plan_toggle"||action==="credit_plan_delete"||
+      (action==="credit_snapshot"&&!data.includeDifference&&card.debt_estimate_minor!==null&&card.currency===reportCurrency&&String(data.date||workspace.date)===String(workspace.date))||
+      (action==="credit_repay"&&card.debt_estimate_minor!==null&&card.currency===reportCurrency&&Boolean(previous.creditSourceAccount&&previous.creditSourceAccount.currency===card.currency))
+    );
+    if(action==="restore_credit"){
+      const history=workspace?.creditHistory?.[previewData.cardAccountId];
+      previewData.localCommitComplete=previewData.localCommitComplete&&Boolean((history?.snapshots||[]).some(row=>String(row.id)===String(data.snapshotId)&&String(row.snapshot_type)===String(data.snapshotType)));
+    }
+  }
   if(action==="category_translation")previous.category=deepCopy((cachedBootstrap?.categories||[]).find(row=>String(row.id)===String(data.id))||null);
   if(["asset","asset_toggle","delete_asset"].includes(action))previous.asset=deepCopy((workspace?.assets||[]).find(row=>String(row.id)===String(data.id))||null);
   if(["recurring","recurring_toggle","delete_recurring"].includes(action))previous.recurring=deepCopy((workspace?.recurring||[]).find(row=>String(row.id)===String(data.id))||null);
@@ -302,13 +397,51 @@ function applyRenameAccountPreview(item,pending=true,rollback=false){
   const preferenceSets=[workspace?.preferences,workspace?.preferences?.paymentRules,workspace?.preferences?.profiles];
   for(const value of preferenceSets){const profiles=Array.isArray(value)?value:Array.isArray(value?.profiles)?value.profiles:null;if(!profiles)continue;for(const profile of profiles){if(profile.payment_method===fromName)profile.payment_method=newName;if(typeof profile.purpose==="string"&&fromName)profile.purpose=profile.purpose.split(fromName).join(newName);if(Array.isArray(profile.account_order))profile.account_order=profile.account_order.map(name=>name===fromName?newName:name);}}
 }
+function applyCreditLiabilityPreview(card,oldDebt,newDebt,effectiveDate){
+  if(!card||oldDebt===null||oldDebt===undefined||newDebt===null||newDebt===undefined)return false;
+  const delta=BigInt(newDebt)-BigInt(oldDebt),currency=String(card.currency||""),digits=Number(card.minor_digits||0);
+  for(const balance of [workspace?.balanceSheet,workspace?.reports?.balanceSheet]){
+    if(!balance||String(balance.as_of||"")<String(effectiveDate||""))continue;
+    const row=(balance.rows||[]).find(value=>String(value.name)===String(card.name));
+    if(row){row.amount_minor=String(newDebt);row.amount_text=money(newDebt,currency,digits);row.section=BigInt(newDebt)>0n?"信用卡负债估算":"信用卡";}
+    balance.estimated_liabilities=balance.estimated_liabilities||{};
+    balance.net_assets=balance.net_assets||{};
+    balance.estimated_liabilities[currency]=String(BigInt(balance.estimated_liabilities[currency]||0)+delta);
+    balance.net_assets[currency]=String(BigInt(balance.net_assets[currency]||0)-delta);
+    if(String(balance.base_equivalent?.currency||"")===currency){
+      balance.base_equivalent.estimated_liabilities_minor=String(BigInt(balance.base_equivalent.estimated_liabilities_minor||0)+delta);
+      balance.base_equivalent.net_assets_minor=String(BigInt(balance.base_equivalent.net_assets_minor||0)-delta);
+    }
+  }
+  return true;
+}
 function applyPendingActionPreview(item,pending=true,rollback=false){
   if(!item?.preview||item.ownerId!==currentUser?.id||!workspace||workspaceOwner!==currentUser.id)return;
   const {action,data={},previous={}}=item.preview;
+  const previewCardId=String(data.cardAccountId||data.accountId||""),previewCardName=String(data.cardName||data.account||data.card||"");
   if(rollback){
     if(previous.preferences)workspace.preferences=deepCopy(previous.preferences);
     if(previous.settings)workspace.settings=deepCopy(previous.settings);
-    if(action==="credit_snapshot"&&previous.creditCard)workspace.cards=(workspace.cards||[]).map(row=>row.account_id===previous.creditCard.account_id?previous.creditCard:row);
+    if(["credit_snapshot","credit_repay","credit_plan","credit_plan_toggle","credit_plan_delete","restore_credit"].includes(action)){
+      const cardId=previewCardId;
+      if(previous.creditCard)workspace.cards=(workspace.cards||[]).map(row=>String(row.account_id)===String(previous.creditCard.account_id)?previous.creditCard:row);
+      if(cardId&&workspace.creditHistory){if(previous.creditHistory)workspace.creditHistory[cardId]=deepCopy(previous.creditHistory);else delete workspace.creditHistory[cardId];}
+      if(action==="credit_snapshot"){
+        if(previous.balanceSheet)workspace.balanceSheet=deepCopy(previous.balanceSheet);
+        if(previous.reportBalanceSheet&&workspace.reports)workspace.reports.balanceSheet=deepCopy(previous.reportBalanceSheet);
+      }
+      if(cardId&&Array.isArray(workspace.repaymentPlans)){
+        workspace.repaymentPlans=workspace.repaymentPlans.filter(row=>String(row.card_account_id)!==cardId);
+        if(previous.creditRepaymentPlan)workspace.repaymentPlans.push(deepCopy(previous.creditRepaymentPlan));
+      }
+      if(previous.creditSourceAccount&&cachedBootstrap?.accounts)cachedBootstrap.accounts=cachedBootstrap.accounts.map(row=>String(row.id)===String(previous.creditSourceAccount.id)?previous.creditSourceAccount:row);
+      if(previous.creditCardAccount&&cachedBootstrap?.accounts)cachedBootstrap.accounts=cachedBootstrap.accounts.map(row=>String(row.id)===String(previous.creditCardAccount.id)?previous.creditCardAccount:row);
+      if(previous.creditSourceCash&&Array.isArray(workspace.cash))workspace.cash=workspace.cash.map(row=>row.account_name===previous.creditSourceCash.account_name?previous.creditSourceCash:row);
+      const pendingId="pending-"+item.opId;
+      workspace.transactions=(workspace.transactions||[]).filter(row=>!String(row.id||"").startsWith(pendingId));
+      if(cachedBootstrap?.transactions)cachedBootstrap.transactions=cachedBootstrap.transactions.filter(row=>!String(row.id||"").startsWith(pendingId));
+      if(Array.isArray(ledgerRangeRows))ledgerRangeRows=ledgerRangeRows.filter(row=>!String(row.id||"").startsWith(pendingId));
+    }
     if(["edit_transaction","review_transaction"].includes(action)&&previous.transaction){const id=item.preview.transactionId;const patch=rows=>Array.isArray(rows)?rows.map(row=>String(row.id)===id?{...previous.transaction,pendingSync:false}:row):rows;workspace.transactions=patch(workspace.transactions);if(cachedBootstrap?.transactions)cachedBootstrap.transactions=patch(cachedBootstrap.transactions);if(Array.isArray(ledgerRangeRows))ledgerRangeRows=patch(ledgerRangeRows);}
     if(action==="category_translation"&&previous.category&&cachedBootstrap?.categories)cachedBootstrap.categories=cachedBootstrap.categories.map(row=>String(row.id)===String(data.id)?previous.category:row);
     if(action==="category"&&cachedBootstrap?.categories)cachedBootstrap.categories=cachedBootstrap.categories.filter(row=>String(row.id)!=="pending-"+item.opId);
@@ -326,12 +459,70 @@ function applyPendingActionPreview(item,pending=true,rollback=false){
   }
   if(action==="settings"||action==="onboarding_save"){
     const cfg=data.settings||data;workspace.preferences={...(workspace.preferences||{}),...safeSettingsPreview(cfg)};
+    if(cfg.timeZone){workspace.preferences.timeZone=cfg.timeZone;workspace.preferences.timeZoneConfigured=true;if(cachedBootstrap)cachedBootstrap.timeZone=cfg.timeZone;}
     workspace.settings={...(workspace.settings||{})};if(cfg.baseCurrency)workspace.settings.base_currency=cfg.baseCurrency;if(cfg.billingCycleStartDay)workspace.settings.billing_cycle_start_day=cfg.billingCycleStartDay;
   }else if(action==="payment_rules")workspace.preferences={...(workspace.preferences||{}),paymentRules:deepCopy(data.profiles||[])};
   else if(action==="budget"){workspace.settings={...(workspace.settings||{}),monthly_jpy_budget_minor:String(data.total||"0"),savings_goal_jpy:String(data.goal||"0"),["savings_plan:"+(workspace.profit?.start||workspace.date||"")]:JSON.stringify({items:data.items||{}})};}
   else if(action==="credit_snapshot"){
-    const card=(workspace.cards||[]).find(row=>row.name===data.account);
-    if(card){const digits=Number(card.minor_digits||0),limit=parseMinorPreview(data.limit,card.currency,digits),available=parseMinorPreview(data.available,card.currency,digits);Object.assign(card,{limit_minor:limit,available_minor:available,debt_estimate_minor:(BigInt(limit)-BigInt(available)).toString(),snapshot_date:data.date||workspace.date,pendingSync:pending});}
+    const card=(workspace.cards||[]).find(row=>String(row.account_id)===previewCardId)
+      ||(workspace.cards||[]).find(row=>row.name===previewCardName);
+    if(card){const digits=Number(card.minor_digits||0),limit=parseMinorPreview(data.limit,card.currency,digits),available=parseMinorPreview(data.available,card.currency,digits),oldDebt=card.debt_estimate_minor,newDebt=(BigInt(limit)-BigInt(available)).toString();applyCreditLiabilityPreview(card,oldDebt,newDebt,data.date||workspace.date);Object.assign(card,{limit_minor:limit,available_minor:available,debt_estimate_minor:newDebt,snapshot_date:data.date||workspace.date,pendingSync:pending,pendingActionOpId:pending?item.opId:""});
+      const key=String(card.account_id),history=workspace.creditHistory||(workspace.creditHistory={}),entry=history[key]||(history[key]={snapshots:[],transactions:[]});
+      if(!(entry.snapshots||[]).some(row=>String(row.id)==="pending-"+item.opId))entry.snapshots=[{id:"pending-"+item.opId,account_id:card.account_id,snapshot_date:data.date||workspace.date,limit_minor:limit,available_minor:available,note:String(data.note||""),created_at:new Date().toISOString(),transaction_id:null,snapshot_type:"manual",pendingSync:pending},...(entry.snapshots||[])];
+    }
+  }else if(action==="credit_repay"){
+    const card=(workspace.cards||[]).find(row=>String(row.account_id)===previewCardId)
+      ||(workspace.cards||[]).find(row=>row.name===previewCardName);
+    const sourceName=String(item.preview.sourceName||data.source||""),source=(cachedBootstrap?.accounts||[]).find(row=>row.name===sourceName);
+    if(card&&source){
+      const amount=BigInt(parseMinorPreview(data.amount,card.currency)),date=String(data.date||workspace.date||""),digits=Number(card.minor_digits||0);
+      if(source.currency===card.currency){
+        source.balanceMinor=(BigInt(source.balanceMinor||0)-amount).toString();source.pendingSync=pending;source.pendingActionOpId=pending?item.opId:"";
+        const cardAccount=(cachedBootstrap?.accounts||[]).find(row=>String(row.id)===String(card.account_id));if(cardAccount){cardAccount.balanceMinor=(BigInt(cardAccount.balanceMinor||0)-amount).toString();cardAccount.pendingSync=pending;cardAccount.pendingActionOpId=pending?item.opId:"";}
+        const cash=(workspace.cash||[]).find(row=>row.account_name===sourceName);if(cash){cash.balance_minor=(BigInt(cash.balance_minor||0)-amount).toString();cash.pendingSync=pending;cash.pendingActionOpId=pending?item.opId:"";}
+        const oldDebt=card.debt_estimate_minor;
+        if(card.available_minor!==null&&card.available_minor!==undefined&&(!card.snapshot_date||date>=String(card.snapshot_date))){
+          const limit=BigInt(card.limit_minor||0),available=BigInt(card.available_minor||0),next=available+amount;
+          card.available_minor=(next>limit?limit:next).toString();card.debt_estimate_minor=(limit-BigInt(card.available_minor)).toString();
+        }
+        applyCreditLiabilityPreview(card,oldDebt,card.debt_estimate_minor,date);
+        card.pendingSync=pending;card.pendingActionOpId=pending?item.opId:"";
+        const tx={id:"pending-"+item.opId,occurred_on:date,kind:"transfer",amount_minor:amount.toString(),currency:card.currency,currency_minor_digits:digits,minor_digits:digits,description:String(data.description||(`${card.name}信用卡还款`)),account_name:sourceName,account_type:source.type||"",to_account_name:card.name,to_account_type:"credit",to_currency:card.currency,to_amount_minor:amount.toString(),to_minor_digits:digits,balance_effect:"posted",needs_review:"0",pendingSync:pending,pendingActionOpId:pending?item.opId:""};
+        const upsert=(rows,limit)=>{const values=new Map((rows||[]).map(row=>[String(row.id),row]));values.set(String(tx.id),tx);return [...values.values()].sort((a,b)=>String(b.occurred_on||"").localeCompare(String(a.occurred_on||""))||Number(b.id||0)-Number(a.id||0)).slice(0,limit);};
+        workspace.transactions=upsert(workspace.transactions,2000);if(cachedBootstrap)cachedBootstrap.transactions=upsert(cachedBootstrap.transactions,100);if(Array.isArray(ledgerRangeRows))ledgerRangeRows=upsert(ledgerRangeRows,2000);
+        const history=workspace.creditHistory||(workspace.creditHistory={}),entry=history[String(card.account_id)]||(history[String(card.account_id)]={snapshots:[],transactions:[]});
+        entry.transactions=[{id:tx.id,occurred_on:date,kind:"transfer",description:tx.description,created_at:new Date().toISOString(),card_amount_minor:amount.toString(),direction:"in",pendingSync:pending,pendingActionOpId:pending?item.opId:""},...(entry.transactions||[])].slice(0,100);
+      }
+    }
+  }else if(action==="credit_plan"||action==="credit_plan_toggle"||action==="credit_plan_delete"){
+    const card=(workspace.cards||[]).find(row=>String(row.account_id)===previewCardId)
+      ||(workspace.cards||[]).find(row=>row.name===previewCardName);
+    if(card){
+      const current=card.repayment_schedule||{},old=(workspace.repaymentPlans||[]).find(row=>String(row.card_account_id)===String(card.account_id))||{};
+      const next=action==="credit_plan"?{...old,...current,id:old.id||"pending-"+item.opId,card_account_id:card.account_id,card_name:card.name,source_name:String(data.source||""),source_account_id:(cachedBootstrap?.accounts||[]).find(row=>row.name===data.source)?.id||old.source_account_id,currency:card.currency,due_day:Number(String(data.date||workspace.date||"").slice(-2))||1,next_due_date:data.date||workspace.date,due_time:String(data.time||old.due_time||"09:00"),enabled:"1",amount_minor:data.amount?parseMinorPreview(data.amount,card.currency):null,amount_status:data.amount?"pending":null,last_status:data.amount?"本期金额已填写，等待还款日":"等待本期金额或还款日",pendingSync:pending,pendingActionOpId:pending?item.opId:""}:action==="credit_plan_delete"?{...old,...current,enabled:"0",amount_minor:null,amount_status:"cancelled",last_status:"计划已删除",pendingSync:pending,pendingActionOpId:pending?item.opId:""}:{...old,...current,enabled:data.enabled?"1":"0",last_status:data.enabled?"等待本期金额或还款日":"已暂停",pendingSync:pending,pendingActionOpId:pending?item.opId:""};
+      card.repayment_schedule=next;card.pendingSync=pending;card.pendingActionOpId=pending?item.opId:"";
+      const plans=workspace.repaymentPlans||(workspace.repaymentPlans=[]),index=plans.findIndex(row=>String(row.card_account_id)===String(card.account_id));if(index>=0)plans[index]=next;else plans.push(next);
+    }
+  }else if(action==="restore_credit"){
+    const card=(workspace.cards||[]).find(row=>String(row.account_id)===previewCardId)
+      ||(workspace.cards||[]).find(row=>row.name===previewCardName),history=workspace.creditHistory?.[previewCardId],snapshots=history?.snapshots||[];
+    const selected=snapshots.find(row=>String(row.id)===String(data.snapshotId)&&String(row.snapshot_type)===String(data.snapshotType));
+    if(card&&selected){
+      const anchorDate=String(selected.snapshot_date||""),anchorCreated=String(selected.created_at||""),anchorTx=Number(selected.transaction_id||0);
+      history.snapshots=snapshots.filter(row=>{
+        const date=String(row.snapshot_date||""),created=String(row.created_at||""),tx=Number(row.transaction_id||0),rowId=Number(row.id||0);
+        return date<anchorDate||(date===anchorDate&&(created<anchorCreated||(created===anchorCreated&&(tx<anchorTx||(tx===anchorTx&&rowId<=Number(selected.id||0))))));
+      });
+      let available=BigInt(selected.available_minor||0);
+      for(const tx of history.transactions||[]){
+        const date=String(tx.occurred_on||""),created=String(tx.created_at||""),transactionId=Number(tx.id||0);
+        if(date<anchorDate||(date===anchorDate&&(created<anchorCreated||(created===anchorCreated&&transactionId<=anchorTx))))continue;
+        const amount=BigInt(tx.card_amount_minor||0);
+        if(tx.direction==="in"||tx.kind==="income")available+=amount;else available-=amount;
+      }
+      const limit=BigInt(selected.limit_minor||0);available=available<0n?0n:available>limit?limit:available;
+      Object.assign(card,{limit_minor:limit.toString(),available_minor:available.toString(),debt_estimate_minor:(limit-available).toString(),snapshot_date:anchorDate,pendingSync:pending,pendingActionOpId:pending?item.opId:""});
+    }
   }
   else if(action==="category"&&cachedBootstrap?.categories){const id="pending-"+item.opId;if(!cachedBootstrap.categories.some(row=>String(row.id)===id))cachedBootstrap.categories.push({id,name:String(data.name||""),kind:String(data.kind||"expense"),display_name:String(data.name||""),pendingSync:pending});}
   else if(action==="category_translation"&&cachedBootstrap?.categories)cachedBootstrap.categories=cachedBootstrap.categories.map(row=>String(row.id)===String(data.id)?{...row,display_name:String(data.name||row.display_name),pendingSync:pending}:row);
@@ -473,17 +664,45 @@ window.onPendingActionDispatched=async item=>{
   renderMobile();
   await renderOutbox();
 };
-window.onPendingActionFinished=async(item,succeeded,message="")=>{
+window.onPendingActionFinished=async(item,succeeded,message="",result={})=>{
   if(!succeeded)applyPendingActionPreview(item,false,true);
   else{
     if(item.action==="rename_account")applyPendingActionPreview(item,false,false);
+    if(item.action==="credit_plan"){
+      const card=(workspace?.cards||[]).find(row=>String(row.account_id)===String(item.preview?.data?.cardAccountId||item.preview?.data?.accountId||""));
+      if(card?.repayment_schedule){card.repayment_schedule.enabled="1";card.repayment_schedule.last_status=item.preview?.data?.amount?"本期金额已填写，等待还款日":"等待本期金额或还款日";}
+      const plan=(workspace?.repaymentPlans||[]).find(row=>String(row.card_account_id)===String(item.preview?.data?.cardAccountId||item.preview?.data?.accountId||""));
+      if(plan){plan.enabled="1";plan.last_status=card?.repayment_schedule?.last_status||plan.last_status;}
+    }
     const prefix="pending-"+item.opId;
     if(workspace){for(const key of ["food","eaten"])workspace[key]=(workspace[key]||[]).filter(row=>!String(row.id||"").startsWith(prefix));workspace.assets=(workspace.assets||[]).filter(row=>!String(row.id||"").startsWith(prefix));workspace.recurring=(workspace.recurring||[]).filter(row=>!String(row.id||"").startsWith(prefix));}
     if(cachedBootstrap?.accounts)cachedBootstrap.accounts=cachedBootstrap.accounts.filter(row=>!String(row.id||"").startsWith(prefix));
     if(cachedBootstrap?.categories)cachedBootstrap.categories=cachedBootstrap.categories.filter(row=>String(row.id)!==prefix);
     const clearPending=rows=>{for(const row of rows||[])if(row.pendingActionOpId===item.opId){delete row.pendingActionOpId;delete row.pendingActionDispatched;delete row.pendingActionSending;delete row.pendingSync;}};
-    if(item.action==="credit_snapshot"){const card=(workspace?.cards||[]).find(row=>row.name===item.preview?.data?.account);if(card)delete card.pendingSync;}
+    if(item.action==="credit_snapshot"){
+      const snapshotData=item.preview?.data||{},cardId=String(snapshotData.cardAccountId||""),card=(workspace?.cards||[]).find(row=>String(row.account_id)===cardId)
+        ||(workspace?.cards||[]).find(row=>row.name===String(snapshotData.account||item.preview?.cardName||""));
+      const confirmed=result?.snapshot;
+      if(card){
+        if(confirmed?.limit_minor!==undefined&&confirmed?.available_minor!==undefined){
+          if(confirmed.estimated_debt_minor!==undefined)applyCreditLiabilityPreview(card,card.debt_estimate_minor,String(confirmed.estimated_debt_minor),confirmed.snapshot_date||snapshotData.date||workspace.date);
+          card.limit_minor=String(confirmed.limit_minor);
+          card.available_minor=String(confirmed.available_minor);
+          if(confirmed.estimated_debt_minor!==undefined)card.debt_estimate_minor=String(confirmed.estimated_debt_minor);
+          card.snapshot_date=String(confirmed.snapshot_date||item.preview?.data?.date||workspace.date||"");
+        }
+        delete card.pendingSync;delete card.pendingActionOpId;
+      }
+      const history=workspace?.creditHistory?.[cardId],snapshot=(history?.snapshots||[]).find(row=>String(row.id)==="pending-"+item.opId),serverId=result?.snapshot?.snapshot_id;
+      if(snapshot&&serverId!==undefined){snapshot.id=serverId;snapshot.pendingSync=false;snapshot.created_at=new Date().toISOString();snapshot.transaction_id=confirmed?.transaction_id??null;if(confirmed){snapshot.limit_minor=String(confirmed.limit_minor);snapshot.available_minor=String(confirmed.available_minor);snapshot.snapshot_date=String(confirmed.snapshot_date||snapshot.snapshot_date);}}
+    }
+    if(item.action==="credit_repay"&&result?.transaction_id!==undefined){
+      const pendingId="pending-"+item.opId,serverId=String(result.transaction_id);
+      for(const rows of [workspace?.transactions,cachedBootstrap?.transactions,ledgerRangeRows,workspace?.creditHistory?.[String(item.preview?.data?.cardAccountId)]?.transactions])if(Array.isArray(rows))for(const row of rows)if(String(row.id)===pendingId)row.id=serverId;
+    }
     clearPending(workspace?.transactions);clearPending(cachedBootstrap?.transactions);clearPending(ledgerRangeRows);
+    for(const rows of [workspace?.cards,workspace?.cash,workspace?.repaymentPlans,cachedBootstrap?.accounts])for(const row of rows||[])if(row.pendingActionOpId===item.opId){delete row.pendingActionOpId;delete row.pendingSync;}
+    for(const entry of Object.values(workspace?.creditHistory||{}))for(const rows of [entry.snapshots,entry.transactions])for(const row of rows||[])if(row.pendingActionOpId===item.opId){delete row.pendingActionOpId;delete row.pendingSync;}
     const targetId=String(item.preview?.data?.id||"");
     for(const row of [...(workspace?.assets||[]),...(workspace?.recurring||[])])if(row.pendingSync&&(String(row.id)===targetId||String(row.id)===prefix))delete row.pendingSync;
   }
@@ -515,8 +734,23 @@ async function loadWorkspace(force=false) {
   workspaceLoading=request;
   workspaceError="";
   request.promise=(async()=>{
-    if(!force&&!workspace){
-      try{const cached=await cacheGet("workspace:"+owner);if(currentUser?.id===owner&&workspaceEpoch===epoch&&cached){workspace=cached;workspaceOwner=owner;await applyPendingAgentPreviews();renderMobile();}}catch{}
+    let cacheMeta=null;
+    if(workspaceOwner&&workspaceOwner!==owner){workspace=null;workspaceOwner="";cachedBootstrap=null;}
+    if(!workspace||workspaceOwner!==owner||cachedBootstrap?.user?.id!==owner){
+      try{
+        const [cached,cachedBase,meta]=await Promise.all([
+          cacheGet("workspace:"+owner),cacheGet("bootstrap:"+owner),cacheGet("workspace-meta:"+owner),
+        ]);
+        const valid=Boolean(cached&&cachedBase&&String(cached.revision||"")
+          &&cachedBase.user?.id===owner&&Array.isArray(cached.transactions)
+          &&Array.isArray(cachedBase.accounts)&&Array.isArray(cachedBase.categories));
+        if(currentUser?.id===owner&&workspaceEpoch===epoch&&valid){
+          workspace=cached;workspaceOwner=owner;cachedBootstrap=cachedBase;cacheMeta=meta||null;
+          await applyPendingAgentPreviews();renderMobile();
+        }
+      }catch{}
+    }else{
+      try{cacheMeta=await cacheGet("workspace-meta:"+owner)||null;}catch{}
     }
     do{
       request.again=false;
@@ -524,14 +758,48 @@ async function loadWorkspace(force=false) {
       const controller=new AbortController();
       const timeout=setTimeout(()=>controller.abort(),25000);
       try{
+        let version=null;
+        try{
+          version=await readLedger("/api/workspace/revision",{signal:controller.signal});
+        }catch(error){
+          // During a rolling deploy an older Worker may not have the validator
+          // route yet. The full snapshot endpoint remains a safe fallback.
+          if(error?.status!==404)throw error;
+        }
+        if(currentUser?.id!==owner||workspaceEpoch!==epoch)return;
+        if(request.again||language!==currentLanguage||date!==reportDate){request.again=true;continue;}
+        const cachedTimeZone=cachedBootstrap?.timeZone||workspace?.preferences?.timeZone||"Asia/Tokyo";
+        const currentServerDate=version?.serverTime
+          ?dateAtTimeZone(version.serverTime,cachedTimeZone)
+          :String(version?.serverDate||"");
+        const currentConfigRevision=String(version?.configRevision??version?.revision??"");
+        const cachedMatches=Boolean(version?.revision&&currentServerDate&&currentConfigRevision
+          &&workspace&&workspaceOwner===owner&&cachedBootstrap?.user?.id===owner
+          &&String(workspace.revision||"")===String(version.revision)
+          &&cacheMeta?.format===WORKSPACE_CACHE_FORMAT
+          &&String(cacheMeta.revision||"")===String(version.revision)
+          &&String(cacheMeta.configRevision||"")===currentConfigRevision
+          &&cacheMeta.serverDate===currentServerDate
+          &&cacheMeta.language===language&&cacheMeta.reportDate===date);
+        if(cachedMatches){
+          workspaceError="";
+          await applyPendingAgentPreviews();
+          if(currentUser?.id!==owner||workspaceEpoch!==epoch)return;
+          await renderAll();
+          continue;
+        }
         const data=await readLedger("/api/workspace?includeBootstrap=1&lang="+language+(date?"&asOf="+encodeURIComponent(date):""),{signal:controller.signal});
         if(currentUser?.id!==owner||workspaceEpoch!==epoch)return;
         if(request.again||language!==currentLanguage||date!==reportDate){request.again=true;continue;}
         const {bootstrap,...snapshot}=data;
-        if(!bootstrap||bootstrap.user?.id!==owner)throw new Error(m("账本响应不完整，请重试刷新。","台帳の応答が不完全です。再度更新してください。","The ledger response is incomplete. Please refresh again."));
+        if(!bootstrap||bootstrap.user?.id!==owner||!snapshot.revision)throw new Error(m("账本响应不完整，请重试刷新。","台帳の応答が不完全です。再度更新してください。","The ledger response is incomplete. Please refresh again."));
         workspace=snapshot;workspaceOwner=owner;cachedBootstrap=bootstrap;workspaceError="";
+        cacheMeta={format:WORKSPACE_CACHE_FORMAT,revision:String(snapshot.revision),configRevision:String(version?.configRevision??version?.revision??""),serverDate:String(bootstrap.serverDate||""),language,reportDate:date};
         await applyPendingAgentPreviews();
-        await Promise.allSettled([cacheSet("workspace:"+owner,snapshot),cacheSet("bootstrap:"+owner,bootstrap)]);
+        await Promise.allSettled([
+          cacheSet("workspace:"+owner,snapshot),cacheSet("bootstrap:"+owner,bootstrap),
+          cacheSet("workspace-meta:"+owner,cacheMeta),
+        ]);
         if(currentUser?.id!==owner||workspaceEpoch!==epoch)return;
         await renderAll();
       }catch(error){
@@ -556,10 +824,17 @@ async function loadWorkspace(force=false) {
 }
 async function refreshLedgerViews() {
   const owner=currentUser?.id;if(!owner)return;
+  const previousRevision=workspaceOwner===owner?String(workspace?.revision||""):"";
+  const previousRange=ledgerRangeRows;
   ledgerRangeRequest++;
-  ledgerRangeRows=null;
   await fetchBootstrap();
   if(currentUser?.id!==owner)return;
+  if(!workspaceError&&previousRevision&&String(workspace?.revision||"")===previousRevision){
+    ledgerRangeRows=previousRange;
+    renderMobileTransactions();
+    return;
+  }
+  ledgerRangeRows=null;
   if($("#historyStart").value||$("#historyEnd").value)await loadLedgerRange();
 }
 async function loadLedgerRange() {
@@ -573,6 +848,24 @@ async function loadLedgerRange() {
 }
 let firstRunSetupBusy=false,firstRunSetupReplay=false,firstRunSetupStep="base",firstRunSetupDraft=null;
 const firstRunSetupStages=["base","accounts","api","agents","skills"];
+const regionTimeZones=[
+  ["Asia/Tokyo",m("日本·东京","日本・東京","Japan · Tokyo")],
+  ["Asia/Shanghai",m("中国大陆·上海","中国本土・上海","Mainland China · Shanghai")],
+  ["Asia/Hong_Kong",m("中国香港","香港","Hong Kong")],
+  ["Asia/Taipei",m("中国台湾·台北","台湾・台北","Taiwan · Taipei")],
+  ["Asia/Seoul",m("韩国·首尔","韓国・ソウル","South Korea · Seoul")],
+  ["Asia/Singapore",m("新加坡","シンガポール","Singapore")],
+  ["Asia/Bangkok",m("泰国·曼谷","タイ・バンコク","Thailand · Bangkok")],
+  ["Asia/Dubai",m("阿联酋·迪拜","UAE・ドバイ","UAE · Dubai")],
+  ["Europe/London",m("英国·伦敦","英国・ロンドン","UK · London")],
+  ["Europe/Paris",m("中欧·巴黎","中央ヨーロッパ・パリ","Central Europe · Paris")],
+  ["America/Los_Angeles",m("美国西部·洛杉矶","米国西部・ロサンゼルス","US Pacific · Los Angeles")],
+  ["America/Chicago",m("美国中部·芝加哥","米国中部・シカゴ","US Central · Chicago")],
+  ["America/New_York",m("美国东部·纽约","米国東部・ニューヨーク","US Eastern · New York")],
+  ["Australia/Sydney",m("澳大利亚东部·悉尼","オーストラリア東部・シドニー","Australia Eastern · Sydney")],
+  ["Pacific/Auckland",m("新西兰·奥克兰","ニュージーランド・オークランド","New Zealand · Auckland")],
+];
+function regionTimeZoneOptions(selected,placeholder=false){return (placeholder&&!selected?'<option value="" selected disabled>'+m("请选择所在地区","所在地域を選択","Choose your region")+'</option>':"")+regionTimeZones.map(([value,label])=>'<option value="'+value+'" '+(value===selected?'selected':'')+'>'+label+'</option>').join("");}
 let tutorialTour=null,firstRunTourStarted=false,tutorialSpotlightTarget=null;
 const tutorialTourSteps=[
   {action:"page",id:"home",selector:'#bottomNav [data-action="page"][data-id="home"]',title:m("总览","概要","Overview"),description:m("查看本期收支、净利润、预算和最近流水。","当期の収支、純利益、予算、最近の取引を確認できます。","See this period's income, expenses, profit, budget, and recent entries."),prompt:m("请点击底部“总览”。","下部の「概要」を押してください。","Tap Overview below.")},
@@ -590,8 +883,9 @@ const tutorialTourSteps=[
 const requiredSetupTourSteps=[
   {action:"page",id:"more",selector:'#bottomNav [data-action="page"][data-id="more"]',title:m("开始前必需设置","開始前の必須設定","Required setup first"),description:m("先完成必需设置，最后一次保存。","まず必須項目を設定し、最後にまとめて保存します。","Complete setup first. Save everything once at the end."),prompt:m("请点击底部“更多”。","下部の「その他」を押してください。","Tap More below.")},
   {action:"module",id:"settings",selector:'#moreMenu .module-row[data-id="settings"]',title:m("进入设置","設定を開く","Open Settings"),description:m("这里有通用、类别、备份和 Agent 设置。","一般、カテゴリ、バックアップ、Agentの設定があります。","General, Categories, Backup, and Agent settings are here."),prompt:m("请点击列表中的“设置”。","一覧の「設定」を押してください。","Tap Settings in the list.")},
-  {action:"settings-tab",id:"general",selector:'#modulePanel [data-action="settings-tab"][data-id="general"]',title:m("打开通用设置","一般設定を開く","Open General settings"),description:m("这里选择总览和报表主要使用的货币。","概要とレポートに使うメイン通貨を選びます。","Choose the main currency used in the overview and reports."),prompt:m("请点击“通用设置”。","「一般設定」を押してください。","Tap General settings.")},
+  {action:"settings-tab",id:"general",selector:'#modulePanel [data-action="settings-tab"][data-id="general"]',title:m("打开通用设置","一般設定を開く","Open General settings"),description:m("在这里设置主要记账货币和所在地区。","メインの記帳通貨と所在地域を設定します。","Set your main currency and region here."),prompt:m("请点击“通用设置”。","「一般設定」を押してください。","Tap General settings.")},
   {form:"baseCurrency",selector:"#baseCurrencyForm",title:m("选择主要记账货币","メインの記帳通貨を選択","Choose your main currency"),description:m("选择你平时主要用来记账的货币。其他货币会单独显示。","普段使う通貨を選んでください。他の通貨は別に表示されます。","Choose the currency you use most. Other currencies stay separate."),prompt:m("选好后点击“保存设置”。","選択したら「設定を保存」を押してください。","Choose one, then tap Save settings.")},
+  {form:"timeZone",selector:"#regionSettingsForm",title:m("选择所在地区","所在地域を選択","Choose your region"),description:m("还款和定期记账时间会按这里的当地时间执行；夏令时也会自动调整。","返済と定期記帳はこの地域の現地時刻で実行し、夏時間も自動調整します。","Repayments and recurring entries use this local time. Daylight saving time is handled automatically."),prompt:m("选好后点击“保存设置”。","選択したら「設定を保存」を押してください。","Choose one, then tap Save settings.")},
   {action:"settings-tab",id:"agent",selector:'#modulePanel [data-action="settings-tab"][data-id="agent"]',title:m("打开 Agent 相关","Agent関連を開く","Open Agent settings"),description:m("在这里分配 API 服务并检查 Skill。","ここでAPIを割り当て、Skillを確認します。","Assign API services and review Skills here."),prompt:m("请点击“Agent 相关”。","「Agent関連」を押してください。","Tap Agent settings.")},
   {form:"agent-api",guideNext:true,selector:"#apiServiceSettings .section-heading",allowedSelector:"#apiServiceSettings",title:m("配置 API 服务","APIサービスを設定","Configure API services"),description:m("新账号这里是空的，需要自己添加 API；密钥不会从其他账号复制。","新しいアカウントにはAPI設定がありません。自分で追加してください。キーは他のアカウントからコピーされません。","New accounts start with no API service. Add your own; keys are never copied from other accounts."),prompt:m("先点“+”添加服务，再填写接口地址、模型和你自己的 API 密钥。","まず「+」でサービスを追加し、URL・モデル・ご自身のAPIキーを入力してください。","Tap + to add a service, then enter its endpoint, model, and your own API key.")},
   {form:"agent-assignments",guideNext:true,selector:"#agentAssignments",allowedSelector:"#agentAssignments",title:m("分配 API 服务","APIを割り当て","Assign API services"),description:m("为记账和饮食 Agent 分配文字与图片服务。","記帳Agentと食事Agentにテキスト・画像サービスを割り当てます。","Assign text and image services to both Agents."),prompt:m("四项都选好后继续；同一服务可以重复使用。","4項目を選んで続けてください。同じサービスを複数に使えます。","Choose all four services, then continue. You can reuse one service.")},
@@ -600,7 +894,7 @@ const requiredSetupTourSteps=[
   {form:"billingCycleStartDay",selector:"#billingCycleForm",title:m("设置每月统计起始日","毎月の集計開始日を設定","Set the monthly start day"),description:m("选择每月从几号开始统计；总览、报表和预算会跟着更新。","毎月何日から集計するか選びます。概要、レポート、予算も更新されます。","Choose which day monthly totals start. The overview, reports, and budget will update."),prompt:m("选好后点击“保存设置”。","選んだら「設定を保存」を押してください。","Choose a day, then tap Save settings.")},
   {action:"page",id:"assets",selector:'#bottomNav [data-action="page"][data-id="assets"]',title:m("打开余额","残高を開く","Open Balances"),description:m("添加账户，并填写或核对里面的钱。","口座を追加し、残高を入力または確認します。","Add accounts and enter or check their balances."),prompt:m("请点击底部“余额”。","下部の「残高」を押してください。","Tap Balances below.")},
   {form:"accounts",selector:"#showAccountForm",allowedSelector:"#showAccountForm,#accountForm",title:m("设置账户余额","口座残高を設定","Set up account balances"),description:m("第一次使用请添加账户并填写现在有多少钱；已有账户请核对。","初めての場合は口座を追加して今の残高を入力します。既存口座は確認してください。","Add an account and enter how much is in it now, or check existing accounts."),prompt:m("新用户请点右上角“添加账户”；已有账户可点下方确认。","初めての場合は右上の「口座を追加」を押してください。既存口座は下のボタンで確認できます。","New users: tap Add account at the top right. Existing users can confirm below.")},
-  {final:true,title:m("必需设置已完成","必須設定が完了","Required setup complete"),description:m("主要记账货币、每月统计日期、账户和 Agent 设置会一起保存。","メイン通貨、毎月の集計日、口座、Agent設定をまとめて保存します。","Your main currency, monthly start day, accounts, and Agent settings will save together."),prompt:m("点击下方按钮保存并开始导览。","下のボタンで保存してガイドを開始します。","Save and start the app tour below.")}
+  {final:true,title:m("必需设置已完成","必須設定が完了","Required setup complete"),description:m("主要记账货币、所在地区、每月统计日期、账户和 Agent 设置会一起保存。","メイン通貨、所在地域、毎月の集計日、口座、Agent設定をまとめて保存します。","Your main currency, region, monthly start day, accounts, and Agent settings will save together."),prompt:m("点击下方按钮保存并开始导览。","下のボタンで保存してガイドを開始します。","Save and start the app tour below.")}
 ];
 function setTutorialPageLocked(locked){
   const nodes=[document.querySelector(".topbar"),$("main"),$("#bottomNav")].filter(Boolean);
@@ -779,10 +1073,12 @@ function stageGuidedTutorialSettings(changes){
   Object.assign(tutorialTour.draft.settings,changes);tutorialTour.draft.dirty=true;settingsDraft=deepCopy(tutorialTour.draft.settings);
   if(Object.hasOwn(changes,"baseCurrency"))tutorialTour.draft.confirmedSettings.baseCurrency=true;
   if(Object.hasOwn(changes,"billingCycleStartDay"))tutorialTour.draft.confirmedSettings.billingCycleStartDay=true;
+  if(Object.hasOwn(changes,"timeZone"))tutorialTour.draft.confirmedSettings.timeZone=true;
   tutorialTour.focusSelector="";
   showToast(m("已暂存在教程中，尚未上传；最后统一保存。","チュートリアル内に一時保存しました。まだ送信されていません。最後にまとめて保存します。","Staged in the tutorial only. Nothing has been uploaded; it will be saved at the end."));
   if(tutorialTour.mode==="required-setup"){
     if(Object.hasOwn(changes,"baseCurrency"))completeRequiredSetupStep("baseCurrency");
+    else if(Object.hasOwn(changes,"timeZone"))completeRequiredSetupStep("timeZone");
     else if(Object.hasOwn(changes,"billingCycleStartDay"))completeRequiredSetupStep("billingCycleStartDay");
     return true;
   }
@@ -850,6 +1146,7 @@ function tutorialSetupIssue(){
   if(!workspace?.preferences?.onboardingRequired&&tutorialTour?.mode!=="required-setup")return "";
   const draft=tutorialTour?.draft;if(!draft)return "baseCurrency";
   if(!draft.confirmedSettings.baseCurrency)return "baseCurrency";
+  if(!draft.confirmedSettings.timeZone)return "timeZone";
   if(!draft.confirmedSettings.billingCycleStartDay)return "billingCycleStartDay";
   if(!(cachedBootstrap?.accounts||[]).length&&!draft.accounts.length)return "accounts";
   return tutorialAgentSetupIssue();
@@ -857,6 +1154,7 @@ function tutorialSetupIssue(){
 function tutorialSetupIssueMessage(issue){
   const messages={
     baseCurrency:m("请先选择主要记账货币。","メインの記帳通貨を選択してください。","Choose your main bookkeeping currency first."),
+    timeZone:m("请先选择所在地区。","所在地域を選択してください。","Choose your region first."),
     billingCycleStartDay:m("请先选择每月统计起始日。","毎月の集計開始日を選択してください。","Choose the monthly start day first."),
     accounts:m("请先添加并确认至少一个账户。","口座を1つ追加して確認してください。","Add and confirm at least one account first."),
     api:m("请先添加 API 服务，并填写名称、接口地址、模型和自己的密钥。","APIサービスを追加し、名前・URL・モデル・ご自身のキーを入力してください。","Add an API service with its name, endpoint, model, and your own key first."),
@@ -877,6 +1175,7 @@ async function saveTutorialTour(){
   try{
     const settings=deepCopy(draft.settings);
     settings.baseCurrency=settings.baseCurrency||workspace?.settings?.base_currency||"JPY";
+    settings.timeZone=settings.timeZone||"";
     settings.billingCycleStartDay=Number(settings.billingCycleStartDay||workspace?.preferences?.billingCycleStartDay||15);
     if(workspace?.preferences?.onboardingRequired){settings.onboardingStep="skills";settings.completeOnboarding=true;}
     const saveResult=await runAction("onboarding_save",{settings,accounts:draft.accounts,balanceChanges:draft.balanceChanges,categoryChanges:draft.categoryChanges,adjustmentDate:draft.adjustmentDate,confirmBalanceAdjustments:draft.confirmBalanceAdjustments,postDifferences:draft.postDifferences,setupConfirmations:draft.confirmedSettings},()=>{
@@ -969,6 +1268,7 @@ function setupBaseSettings(){
   return {
     baseCurrency:draft?.baseCurrency||workspace?.settings?.base_currency||"JPY",
     billingCycleStartDay:Number(draft?.billingCycleStartDay||workspace?.preferences?.billingCycleStartDay||15),
+    timeZone:draft?.timeZone||(workspace?.preferences?.timeZoneConfigured?workspace?.preferences?.timeZone:workspace?.preferences?.onboardingRequired?"":workspace?.preferences?.timeZone)||"",
   };
 }
 function setupProgress(stage){
@@ -1005,9 +1305,9 @@ function stageFirstRunSetupSettings(form,formData,accounts){
   const draft=firstRunSetupDraft;if(!draft?.settings)throw new Error(m("教程草稿已失效，请重新打开。","チュートリアルの下書きが失効しました。もう一度開いてください。","The tutorial draft expired. Please reopen it."));
   const settings=draft.settings;
   if(firstRunSetupStep==="base"){
-    const currency=String(formData.get("baseCurrency")||""),day=Number(formData.get("billingCycleStartDay"));
-    if(!["JPY","CNY","USD"].includes(currency)||!Number.isInteger(day)||day<1||day>31)throw new Error(m("请选择主要记账货币和每月统计起始日。","メインの記帳通貨と毎月の集計開始日を選択してください。","Choose your main currency and a valid monthly start day."));
-    settings.baseCurrency=currency;settings.billingCycleStartDay=day;
+    const currency=String(formData.get("baseCurrency")||""),day=Number(formData.get("billingCycleStartDay")),timeZone=String(formData.get("timeZone")||"");
+    if(!["JPY","CNY","USD"].includes(currency)||!Number.isInteger(day)||day<1||day>31||!regionTimeZones.some(([value])=>value===timeZone))throw new Error(m("请选择主要记账货币、所在地区和每月统计起始日。","メイン通貨・所在地域・毎月の集計開始日を選択してください。","Choose your main currency, region, and monthly start day."));
+    settings.baseCurrency=currency;settings.billingCycleStartDay=day;settings.timeZone=timeZone;
   }else if(firstRunSetupStep==="accounts"){
     const name=String(formData.get("name")||"").trim(),balanceChanges={};
     let newAccount=null;
@@ -1018,7 +1318,7 @@ function stageFirstRunSetupSettings(form,formData,accounts){
     if(!name&&!accounts.length&&!replay)throw new Error(m("请填写账户名称。","口座名を入力してください。","Enter an account name."));
     if(!hiddenAmounts)for(const account of accounts){
       if(account.pending)continue;
-      const value=String(formData.get("balance-"+account.id)||"").trim(),original=plainAmount(account.balanceMinor,account.minorDigits||0);
+      const value=String(formData.get("balance-"+account.id)||"").trim(),original=plainAmount(account.balanceMinor,account.minorDigits||0,account.currency);
       if(value&&value!==original)balanceChanges[account.name]=value;
     }
     if(Object.keys(balanceChanges).length&&formData.get("confirmBalanceAdjustments")!=="yes")throw new Error(m("请先勾选确认：修改余额会生成调整流水。","残高の変更で調整取引が作成されることを確認してください。","Confirm that changing balances will create adjustment entries."));
@@ -1060,11 +1360,11 @@ function renderFirstRunSetupStep(){
     const currencies=[["JPY",m("日元","日本円","Japanese yen")],["CNY",m("人民币","人民元","Chinese yuan")],["USD",m("美元","米ドル","US dollar")]];
     const currencyOptions=(replay?"":'<option value="" selected disabled>'+m("请选择主要记账货币","メインの記帳通貨を選択","Choose your main currency")+'</option>')+currencies.map(([code,label])=>'<option value="'+code+'" '+(replay&&base.baseCurrency===code?"selected":"")+'>'+code+' · '+label+'</option>').join("");
     const dayOptions=Array.from({length:31},(_,index)=>'<option value="'+(index+1)+'" '+(replay&&base.billingCycleStartDay===index+1?"selected":"")+'>'+e(m((index+1)+"日",(index+1)+"日",String(index+1)))+'</option>').join("");
-    stepBody='<label class="field"><span>'+m("主要记账货币","メインの記帳通貨","Main bookkeeping currency")+'</span><select name="baseCurrency" required>'+currencyOptions+'</select></label><label class="field"><span>'+m("每月从几号开始统计","毎月何日から集計するか","Which day monthly totals start")+'</span><select name="billingCycleStartDay" required>'+(replay?"":'<option value="" selected disabled>'+m("请选择日期","日付を選択","Choose a day")+'</option>')+dayOptions+'</select></label><p class="fineprint">'+m("每月从你选的日期开始统计，到下个月同一日期的前一天结束。比如选15号，就是每月15号到下月14号。改好后，总览和报表会重新统计，已有记录日期不会改变。","選択した日から翌月の同じ日の前日までを集計します。たとえば15日なら、毎月15日から翌月14日までです。変更後、概要とレポートを再集計します。過去の取引日は変わりません。","Each month starts on your chosen day and ends the day before that day next month. For example, choosing the 15th means the 15th through the 14th. Totals update; existing entry dates do not change.")+'</p>';
+    stepBody='<label class="field"><span>'+m("主要记账货币","メインの記帳通貨","Main bookkeeping currency")+'</span><select name="baseCurrency" required>'+currencyOptions+'</select></label><label class="field"><span>'+m("所在地区","所在地域","Region")+'</span><select name="timeZone" required>'+regionTimeZoneOptions(base.timeZone,!base.timeZone)+'</select></label><p class="fineprint">'+m("所在地区会决定当天日期和自动还款等功能使用的当地时间；夏令时会自动调整。","所在地域は今日の日付や自動返済などに使う現地時刻を決めます。夏時間も自動調整します。","Your region sets local dates and times for features such as automatic repayments. Daylight saving time is handled automatically.")+'</p><label class="field"><span>'+m("每月从几号开始统计","毎月何日から集計するか","Which day monthly totals start")+'</span><select name="billingCycleStartDay" required>'+(replay?"":'<option value="" selected disabled>'+m("请选择日期","日付を選択","Choose a day")+'</option>')+dayOptions+'</select></label><p class="fineprint">'+m("每月从你选的日期开始统计，到下个月同一日期的前一天结束。比如选15号，就是每月15号到下月14号。改好后，总览和报表会重新统计，已有记录日期不会改变。","選択した日から翌月の同じ日の前日までを集計します。たとえば15日なら、毎月15日から翌月14日までです。変更後、概要とレポートを再集計します。過去の取引日は変わりません。","Each month starts on your chosen day and ends the day before that day next month. For example, choosing the 15th means the 15th through the 14th. Totals update; existing entry dates do not change.")+'</p>';
   }else if(firstRunSetupStep==="accounts"){
-    const accountList=accounts.length?'<div class="onboarding-account-list">'+accounts.map(account=>'<div class="onboarding-account-row"><div><strong>'+e(account.name)+'</strong><span>'+e(t("accountTypes."+account.type)||account.type)+' · '+e(account.currency)+'</span></div>'+(replay&&!hiddenAmounts&&!account.pending?'<label class="field"><span>'+m("当前余额","現在残高","Current balance")+'</span><input name="balance-'+e(account.id)+'" type="text" inputmode="decimal" value="'+e(plainAmount(account.balanceMinor,account.minorDigits||0))+'"></label>':"")+'</div>').join("")+'</div>':'<p class="fineprint">'+m("当前还没有配置账户。","口座はまだ設定されていません。","No accounts are configured yet.")+'</p>';
+    const accountList=accounts.length?'<div class="onboarding-account-list">'+accounts.map(account=>'<div class="onboarding-account-row"><div><strong>'+e(account.name)+'</strong><span>'+e(t("accountTypes."+account.type)||account.type)+' · '+e(account.currency)+'</span></div>'+(replay&&!hiddenAmounts&&!account.pending?'<label class="field"><span>'+m("当前余额","現在残高","Current balance")+'</span><input name="balance-'+e(account.id)+'" type="text" inputmode="decimal" autocomplete="off" value="'+e(plainAmount(account.balanceMinor,account.minorDigits||0,account.currency))+'"></label>':"")+'</div>').join("")+'</div>':'<p class="fineprint">'+m("当前还没有配置账户。","口座はまだ設定されていません。","No accounts are configured yet.")+'</p>';
     const balanceAdjustmentForm=replay&&accounts.length&&!hiddenAmounts?'<label class="field"><span>'+m("余额核对日期","残高照合日","Balance adjustment date")+'</span><input name="adjustmentDate" type="date" value="'+e(workspace?.date||"")+'" required></label><label class="check-row"><input name="confirmBalanceAdjustments" type="checkbox" value="yes"><span>'+m("确认：修改的余额差额会作为一笔调整流水记入账本","確認：変更した残高の差額を調整取引として台帳に記録します","Confirm: balance differences will be posted as adjustment entries.")+'</span></label>':"";
-    const accountForm='<div class="onboarding-account-add"><strong>'+m("添加账户","口座を追加","Add an account")+'</strong><p class="fineprint">'+m("已有账户可以核对现在的余额；填写账户名称也可以添加新账户。所有更改会在最后一步一起保存。","登録済み口座の残高を確認できます。口座名を入力すると新しい口座を追加できます。変更は最後にまとめて保存します。","Check current balances or enter a name to add an account. Changes are saved together at the end.")+'</p><label class="field"><span>'+m("账户名称","口座名","Account name")+'</span><input name="name" '+(replay?"":"required")+' maxlength="80" placeholder="'+e(m("例如：日常银行卡","例：生活費の銀行口座","e.g. Main bank account"))+'"></label><label class="field"><span>'+m("账户类型","口座の種類","Account type")+'</span><select name="type" '+(replay?"":"required")+'><option value="bank">'+t("accountTypes.bank")+'</option><option value="wallet">'+t("accountTypes.wallet")+'</option><option value="prepaid">'+t("accountTypes.prepaid")+'</option><option value="transit">'+t("accountTypes.transit")+'</option><option value="credit">'+t("accountTypes.credit")+'</option></select></label><label class="field"><span>'+m("币种","通貨","Currency")+'</span><select name="currency" '+(replay?"":"required")+'><option value="JPY" '+(base.baseCurrency==="JPY"?"selected":"")+'>JPY</option><option value="CNY" '+(base.baseCurrency==="CNY"?"selected":"")+'>CNY</option><option value="USD" '+(base.baseCurrency==="USD"?"selected":"")+'>USD</option></select></label><label class="field"><span>'+m("当前余额","現在残高","Current balance")+'</span><input name="openingBalance" type="text" inputmode="decimal" value="0" '+(replay?"":"required")+'></label><label class="field"><span>'+m("余额日期","残高日","Balance as of")+'</span><input name="openingDate" type="date" value="'+e(workspace?.date||"")+'" '+(replay?"":"required")+'></label><label class="field"><span>'+m("余额确认状态","残高の確認状態","Balance confidence")+'</span><select name="completeness"><option value="known">'+m("已核实","確認済み","Verified")+'</option><option value="partial">'+m("部分核实","一部確認","Partially verified")+'</option><option value="inferred">'+m("估算值","推定","Estimated")+'</option></select></label></div>';
+    const accountForm='<div class="onboarding-account-add"><strong>'+m("添加账户","口座を追加","Add an account")+'</strong><p class="fineprint">'+m("已有账户可以核对现在的余额；填写账户名称也可以添加新账户。所有更改会在最后一步一起保存。","登録済み口座の残高を確認できます。口座名を入力すると新しい口座を追加できます。変更は最後にまとめて保存します。","Check current balances or enter a name to add an account. Changes are saved together at the end.")+'</p><label class="field"><span>'+m("账户名称","口座名","Account name")+'</span><input name="name" '+(replay?"":"required")+' maxlength="80" placeholder="'+e(m("例如：日常银行卡","例：生活費の銀行口座","e.g. Main bank account"))+'"></label><label class="field"><span>'+m("账户类型","口座の種類","Account type")+'</span><select name="type" '+(replay?"":"required")+'><option value="bank">'+t("accountTypes.bank")+'</option><option value="wallet">'+t("accountTypes.wallet")+'</option><option value="prepaid">'+t("accountTypes.prepaid")+'</option><option value="transit">'+t("accountTypes.transit")+'</option><option value="credit">'+t("accountTypes.credit")+'</option></select></label><label class="field"><span>'+m("币种","通貨","Currency")+'</span><select name="currency" '+(replay?"":"required")+'><option value="JPY" '+(base.baseCurrency==="JPY"?"selected":"")+'>JPY</option><option value="CNY" '+(base.baseCurrency==="CNY"?"selected":"")+'>CNY</option><option value="USD" '+(base.baseCurrency==="USD"?"selected":"")+'>USD</option></select></label><label class="field"><span>'+m("当前余额","現在残高","Current balance")+'</span><input name="openingBalance" type="text" inputmode="decimal" autocomplete="off" value="0" '+(replay?"":"required")+'></label><label class="field"><span>'+m("余额日期","残高日","Balance as of")+'</span><input name="openingDate" type="date" value="'+e(workspace?.date||"")+'" '+(replay?"":"required")+'></label><label class="field"><span>'+m("余额确认状态","残高の確認状態","Balance confidence")+'</span><select name="completeness"><option value="known">'+m("已核实","確認済み","Verified")+'</option><option value="partial">'+m("部分核实","一部確認","Partially verified")+'</option><option value="inferred">'+m("估算值","推定","Estimated")+'</option></select></label></div>';
     stepBody=replay?accountList+balanceAdjustmentForm+accountForm:accounts.length?accountList+'<p class="fineprint">'+m("至少一个账户已就绪。其他账户之后可在“账户”页面添加。","口座を1つ以上登録しました。ほかの口座は後から追加できます。","At least one account is ready. Add more later from Accounts.")+'</p>':accountForm;
   }else if(firstRunSetupStep==="api"){
     const existing=prefs.profiles?.[0]||{};
@@ -1095,7 +1395,7 @@ function renderFirstRunSetupStep(){
     agents:m("选择各 Agent 使用的文字和图片服务。","各Agentのテキスト・画像サービスを選択します。","Choose text and image services for each Agent."),
     skills:m("检查随请求发送给模型的操作说明。","モデルに送信する指示内容を確認します。","Review the instructions sent to your model."),
   };
-  dialog.innerHTML='<form id="firstRunSetupForm" class="first-run-setup-form">'+(replay?'<button type="button" class="button secondary onboarding-close" data-onboarding-close>'+m("退出教程","チュートリアルを終了","Exit tutorial")+'</button>':"")+'<div class="assistant-orb">'+icon("settings")+'</div>'+setupProgress(firstRunSetupStep)+'<h2 id="firstRunSetupTitle">'+labels[firstRunSetupStep]+'</h2><p class="muted onboarding-description">'+descriptions[firstRunSetupStep]+'</p>'+(replay?'<p class="fineprint onboarding-save-note">'+m("每一步只暂存在当前页面，不会更新云端。最后一步才统一提交；刷新或关闭页面会丢弃草稿。","各ステップはこのページ内に一時保存され、クラウドは更新されません。最後にまとめて送信します。更新・終了すると下書きは破棄されます。","Each step stays temporarily on this page; nothing is sent to the cloud until the final step. Refreshing or closing the page discards this draft.")+'</p>':"")+stepBody+'<p id="firstRunSetupError" class="first-run-setup-error hidden" role="alert"></p>'+navigation+'</form>';
+  dialog.innerHTML='<form id="firstRunSetupForm" class="first-run-setup-form" autocomplete="off">'+(replay?'<button type="button" class="button secondary onboarding-close" data-onboarding-close>'+m("退出教程","チュートリアルを終了","Exit tutorial")+'</button>':"")+'<div class="assistant-orb">'+icon("settings")+'</div>'+setupProgress(firstRunSetupStep)+'<h2 id="firstRunSetupTitle">'+labels[firstRunSetupStep]+'</h2><p class="muted onboarding-description">'+descriptions[firstRunSetupStep]+'</p>'+(replay?'<p class="fineprint onboarding-save-note">'+m("每一步只暂存在当前页面，不会更新云端。最后一步才统一提交；刷新或关闭页面会丢弃草稿。","各ステップはこのページ内に一時保存され、クラウドは更新されません。最後にまとめて送信します。更新・終了すると下書きは破棄されます。","Each step stays temporarily on this page; nothing is sent to the cloud until the final step. Refreshing or closing the page discards this draft.")+'</p>':"")+stepBody+'<p id="firstRunSetupError" class="first-run-setup-error hidden" role="alert"></p>'+navigation+'</form>';
   dialog.oncancel=event=>{if(!firstRunSetupReplay)event.preventDefault();else{firstRunSetupReplay=false;firstRunSetupDraft=null;}};
   const form=$("#firstRunSetupForm",dialog),errorBox=$("#firstRunSetupError",dialog);
   if(replay)restoreTutorialDraftForm(form);
@@ -1128,16 +1428,16 @@ function renderFirstRunSetupStep(){
     firstRunSetupBusy=true;form.querySelectorAll("button,input,select,textarea").forEach(control=>control.disabled=true);errorBox.classList.add("hidden");button.textContent=m("正在保存…","保存中…","Saving…");
     try{
       if(firstRunSetupStep==="base"){
-        const baseCurrency=String(formData.get("baseCurrency")||""),billingCycleStartDay=Number(formData.get("billingCycleStartDay"));
-        if(!["JPY","CNY","USD"].includes(baseCurrency)||!Number.isInteger(billingCycleStartDay)||billingCycleStartDay<1||billingCycleStartDay>31)throw new Error(m("请选择主要记账货币和每月统计起始日。","メインの記帳通貨と毎月の集計開始日を選択してください。","Choose your main currency and a valid monthly start day."));
-        const cfg=deepCopy(prefs);cfg.baseCurrency=baseCurrency;cfg.billingCycleStartDay=billingCycleStartDay;cfg.onboardingStep="base";
+        const baseCurrency=String(formData.get("baseCurrency")||""),billingCycleStartDay=Number(formData.get("billingCycleStartDay")),timeZone=String(formData.get("timeZone")||"");
+        if(!["JPY","CNY","USD"].includes(baseCurrency)||!Number.isInteger(billingCycleStartDay)||billingCycleStartDay<1||billingCycleStartDay>31||!regionTimeZones.some(([value])=>value===timeZone))throw new Error(m("请选择主要记账货币、所在地区和每月统计起始日。","メイン通貨・所在地域・毎月の集計開始日を選択してください。","Choose your main currency, region, and monthly start day."));
+        const cfg=deepCopy(prefs);cfg.baseCurrency=baseCurrency;cfg.billingCycleStartDay=billingCycleStartDay;cfg.timeZone=timeZone;cfg.onboardingStep="base";
         const result=await runAction("settings",cfg,null,false);if(!result?.queued)await loadWorkspace(true);firstRunSetupStep="accounts";
       }else if(firstRunSetupStep==="accounts"){
         const name=String(formData.get("name")||"").trim();
         const changedBalances={};
         if(firstRunSetupReplay&&!hiddenAmounts)for(const account of accounts){
           if(account.pending)continue;
-          const value=String(formData.get("balance-"+account.id)||"").trim(),original=plainAmount(account.balanceMinor,account.minorDigits||0);
+          const value=String(formData.get("balance-"+account.id)||"").trim(),original=plainAmount(account.balanceMinor,account.minorDigits||0,account.currency);
           if(value&&value!==original)changedBalances[account.name]=value;
         }
         if(Object.keys(changedBalances).length&&formData.get("confirmBalanceAdjustments")!=="yes")throw new Error(m("请先勾选确认：修改余额会生成调整流水。","残高の変更で調整取引が作成されることを確認してください。","Confirm that changing balances will create adjustment entries."));
@@ -1149,26 +1449,25 @@ function renderFirstRunSetupStep(){
         if(name){
           await api("/api/accounts",{method:"POST",body:JSON.stringify({name,type:String(formData.get("type")||"bank"),currency:String(formData.get("currency")||baseSettings.baseCurrency),openingBalance:String(formData.get("openingBalance")||"0"),openingDate:String(formData.get("openingDate")||workspace?.date||""),completeness:String(formData.get("completeness")||"known"),note:"",onboardingStep:"accounts"})});
           await loadWorkspace(true);
-          void runBackgroundCloudBackup("write");
         }else if(!accounts.length&&!firstRunSetupReplay)throw new Error(m("请填写账户名称。","口座名を入力してください。","Enter an account name."));
         firstRunSetupStep="api";
       }else if(firstRunSetupStep==="api"){
         const cfg=deepCopy(prefs),old=cfg.profiles?.[0]||{},apiKey=String(formData.get("apiKey")||"");
         if(!String(formData.get("profileName")||"").trim()||!String(formData.get("apiUrl")||"").trim()||!String(formData.get("model")||"").trim()||(!old.keyPresent&&!apiKey))throw new Error(m("请填写 API 名称、地址、模型和密钥。","API名、URL、モデル名、キーを入力してください。","Enter the API name, endpoint, model, and key."));
         const profile={...old,id:old.id||crypto.randomUUID(),name:String(formData.get("profileName")).trim(),api_url:String(formData.get("apiUrl")).trim(),model:String(formData.get("model")).trim(),api_key:apiKey};
-        cfg.profiles=[profile,...(cfg.profiles||[]).slice(1)];cfg.baseCurrency=baseSettings.baseCurrency;cfg.billingCycleStartDay=baseSettings.billingCycleStartDay;cfg.onboardingStep="api";
+        cfg.profiles=[profile,...(cfg.profiles||[]).slice(1)];cfg.baseCurrency=baseSettings.baseCurrency;cfg.billingCycleStartDay=baseSettings.billingCycleStartDay;cfg.timeZone=baseSettings.timeZone;cfg.onboardingStep="api";
         const result=await runAction("settings",cfg,null,false);if(!result?.queued)await loadWorkspace(true);firstRunSetupStep="agents";
       }else if(firstRunSetupStep==="agents"){
         const cfg=deepCopy(prefs);cfg.agents={...(cfg.agents||{})};cfg.visionAgents={...(cfg.visionAgents||{})};
         cfg.agents.bookkeeping=String(formData.get("text-bookkeeping")||"");cfg.visionAgents.bookkeeping=String(formData.get("vision-bookkeeping")||"");cfg.agents.food_health=String(formData.get("text-food")||"");cfg.visionAgents.food_health=String(formData.get("vision-food")||"");
         if(Object.values(cfg.agents).some(value=>!value)||Object.values(cfg.visionAgents).some(value=>!value))throw new Error(m("请为两个 Agent 都选择文字和图片服务。","両方のAgentにテキストと画像サービスを選んでください。","Select text and image services for both Agents."));
-        cfg.baseCurrency=baseSettings.baseCurrency;cfg.billingCycleStartDay=baseSettings.billingCycleStartDay;cfg.onboardingStep="agents";
+        cfg.baseCurrency=baseSettings.baseCurrency;cfg.billingCycleStartDay=baseSettings.billingCycleStartDay;cfg.timeZone=baseSettings.timeZone;cfg.onboardingStep="agents";
         const result=await runAction("settings",cfg,null,false);if(!result?.queued)await loadWorkspace(true);firstRunSetupStep="skills";
       }else{
         const cfg=deepCopy(prefs);cfg.skills={...(cfg.skills||{})};
         cfg.skills.bookkeeping=String(formData.get("skill-bookkeeping")||"");cfg.skills.food_health=String(formData.get("skill-food_health")||"");
         if(Object.values(cfg.skills).some(value=>!String(value||"").trim()))throw new Error(m("请保留或恢复两个 Agent 的 Skill 文本。","両方のAgentにSkillテキストを設定してください。","Keep or restore skill text for both Agents."));
-        cfg.baseCurrency=baseSettings.baseCurrency;cfg.billingCycleStartDay=baseSettings.billingCycleStartDay;cfg.onboardingStep="skills";cfg.completeOnboarding=true;
+        cfg.baseCurrency=baseSettings.baseCurrency;cfg.billingCycleStartDay=baseSettings.billingCycleStartDay;cfg.timeZone=baseSettings.timeZone;cfg.onboardingStep="skills";cfg.completeOnboarding=true;
         const result=await runAction("settings",cfg,null,false);if(!result?.queued)await loadWorkspace(true);
         if(!workspace?.preferences?.onboardingRequired){
           if(firstRunSetupReplay){firstRunSetupReplay=false;dialog.close();showToast(m("设置已保存，新手教程完成。","設定を保存し、チュートリアルを終了しました。","Settings saved. Tutorial complete."));return;}
@@ -1187,7 +1486,8 @@ function startGuidedTutorial(){
   const settings=deepCopy(workspace?.preferences||{});
   settings.baseCurrency=settings.baseCurrency||workspace?.settings?.base_currency||"JPY";
   settings.billingCycleStartDay=Number(settings.billingCycleStartDay||15);
-  tutorialTour={mode:"required-setup",index:0,phase:"action",batchSave:true,finalRouted:false,draft:{settings,accounts:[],balanceChanges:{},categoryChanges:[],confirmedSettings:{baseCurrency:false,billingCycleStartDay:false},adjustmentDate:workspace?.date||"",confirmBalanceAdjustments:false,postDifferences:false,dirty:false}};
+  settings.timeZone=settings.timeZone||"";
+  tutorialTour={mode:"required-setup",index:0,phase:"action",batchSave:true,finalRouted:false,draft:{settings,accounts:[],balanceChanges:{},categoryChanges:[],confirmedSettings:{baseCurrency:false,timeZone:false,billingCycleStartDay:false},adjustmentDate:workspace?.date||"",confirmBalanceAdjustments:false,postDifferences:false,dirty:false}};
   firstRunTourStarted=true;
   navigate("home");
   renderTutorialTour();
@@ -1215,7 +1515,7 @@ $("#accountForm")?.addEventListener("submit",event=>{
   void guarded(async()=>{
     const data={name:String(values.get("name")||"").trim(),type:String(values.get("type")||"bank"),currency:String(values.get("currency")||"JPY"),openingBalance:String(values.get("openingBalance")||"0").trim(),openingDate:String(values.get("openingDate")||workspace.date||""),completeness:String(values.get("completeness")||"known"),note:"",onboardingStep:"accounts"};
     if(tutorialTour?.batchSave){const {onboardingStep,...account}=data;tutorialTour.draft.accounts.push(account);tutorialTour.draft.dirty=true;form.reset();form.querySelector('[name="openingDate"]').value=workspace.date||"";form.classList.add("hidden");renderTutorialDraftNotice();showToast(m("账户已暂存，尚未上传；最后会和其他设置一起保存。","口座を一時保存しました。まだ送信されず、最後に他の設定と一緒に保存します。","Account staged locally; it will be saved with the other settings at the end."));if(tutorialTour.mode==="required-setup")completeRequiredSetupStep("accounts");else renderTutorialTour();return;}
-    await api("/api/accounts",{method:"POST",body:JSON.stringify(data)});form.reset();form.querySelector('[name="openingDate"]').value=workspace.date||"";form.classList.add("hidden");await loadWorkspace(true);void runBackgroundCloudBackup("write");showToast(m("账户已保存，可以继续设置。","口座を保存しました。設定を続けてください。","Account saved. Continue with setup."));
+    await api("/api/accounts",{method:"POST",body:JSON.stringify(data)});form.reset();form.querySelector('[name="openingDate"]').value=workspace.date||"";form.classList.add("hidden");await loadWorkspace(true);showToast(m("账户已保存，可以继续设置。","口座を保存しました。設定を続けてください。","Account saved. Continue with setup."));
   }).finally(()=>{delete form.dataset.onboardingSaving;if(submit)submit.disabled=false;});
 },true);
 function renderMobile() {
@@ -1261,12 +1561,33 @@ function categoryBars(categories={},currency="JPY") {
   const max=entries.reduce((x,item)=>BigInt(item[1])>x?BigInt(item[1]):x,1n);
   return entries.map(([name,amount],index)=>'<div class="category-bar"><div class="spread"><span>'+e(name)+'</span><strong>'+money(amount,currency)+'</strong></div><svg viewBox="0 0 300 7" preserveAspectRatio="none" class="spark-bar color-'+index+'"><rect width="300" height="7" rx="3.5" class="bar-track"/><rect width="'+Number(BigInt(amount)*300n/max)+'" height="7" rx="3.5" class="bar-fill"/></svg></div>').join("")||empty(m("记录后会在这里呈现","記帳するとここに表示されます","Your spending will appear here"));
 }
+function transactionDisplayDescription(row){
+  const description=String(row?.description||"");
+  const legacy=description.match(/^信用卡欠款调整：[\s\S]*?欠款\s*([\d,]+(?:\.\d+)?)\s*(JPY|CNY|USD)[\s\S]*?本次快照估算欠款\s*([\d,]+(?:\.\d+)?)\s*(JPY|CNY|USD)/i);
+  if(!legacy)return description;
+  const currency=legacy[2].toUpperCase();
+  if(currency!==String(row.currency||"").toUpperCase())return description;
+  const card=(workspace?.cards||[]).find(value=>value.name===row.account_name&&String(value.currency||"").toUpperCase()===currency);
+  if(!card)return description;
+  const snapshots=workspace?.creditHistory?.[String(card.account_id)]?.snapshots||[];
+  const current=snapshots.filter(value=>String(value.snapshot_date)===String(row.occurred_on)&&String(value.snapshot_type)==="manual")
+    .sort((left,right)=>String(right.created_at||"").localeCompare(String(left.created_at||"")))[0];
+  if(!current||current.limit_minor===null||current.limit_minor===undefined||current.available_minor===null||current.available_minor===undefined)return description;
+  const createdAt=String(row.created_at||"");
+  const prior=snapshots.filter(value=>value.limit_minor!==null&&value.limit_minor!==undefined&&createdAt&&String(value.created_at||"")<createdAt)
+    .sort((left,right)=>String(right.created_at||"").localeCompare(String(left.created_at||"")))[0];
+  const baselineLimit=prior?.limit_minor??current.limit_minor;
+  const previousDebt=parseMinorPreview(legacy[1].replace(/,/g,""),currency);
+  const previousAvailable=(BigInt(baselineLimit)-BigInt(previousDebt)).toString();
+  const digits=Number(card.minor_digits||0),previousText=money(previousAvailable,currency,digits).replace(new RegExp("\\s*"+currency+"$"),"");
+  return "信用卡额度盘点调整：可用额度 "+previousText+" → "+money(current.available_minor,currency,digits);
+}
 function txCard(row) {
   const arrow=row.kind==="income"?"↙":row.kind==="transfer"?"⇄":"↗";
   const account=row.kind==="transfer"?(row.account_name||"")+" → "+(row.to_account_name||""):row.account_name||m("备查","メモ","Memo");
   const sign=row.kind==="income"?"+":row.kind==="expense"?"−":"";
   const syncLabel=row.pendingDelete?(row.pendingDeleteDispatched?m("云端删除处理中","クラウドで削除中","Deletion processing in cloud"):row.pendingDeleteSending?m("正在确认云端接收状态","クラウドの受付状態を確認中","Checking whether the cloud accepted it"):m("待删除 · 可撤销","削除待ち・取り消し可能","Pending deletion · undo available")):row.pendingSync?(row.conflict?m("同步冲突，待核对","同期競合・確認待ち","Sync conflict"):m("云端同步中","クラウド同期中","Syncing to cloud")):"";
-  return '<button class="transaction-card'+(row.pendingDelete?' pending-delete':'')+'" data-action="tx-detail" data-id="'+e(row.id)+'"><span class="transaction-icon kind-'+e(row.kind)+'">'+arrow+'</span><span class="transaction-description"><strong>'+e(row.description)+'</strong><small>'+e(row.category_name||t(row.kind))+' · '+e(account)+'</small><time>'+e(row.occurred_on)+(row.needs_review&&row.needs_review!=="0"?" · "+t("review"):"")+(syncLabel?" · "+syncLabel:"")+'</time></span><span class="transaction-amount kind-'+e(row.kind)+'">'+sign+money(row.amount_minor,row.currency,row.currency_minor_digits||row.minor_digits)+'</span></button>';
+  return '<button class="transaction-card'+(row.pendingDelete?' pending-delete':'')+'" data-action="tx-detail" data-id="'+e(row.id)+'"><span class="transaction-icon kind-'+e(row.kind)+'">'+arrow+'</span><span class="transaction-description"><strong>'+e(transactionDisplayDescription(row))+'</strong><small>'+e(row.category_name||t(row.kind))+' · '+e(account)+'</small><time>'+e(row.occurred_on)+(row.needs_review&&row.needs_review!=="0"?" · "+t("review"):"")+(syncLabel?" · "+syncLabel:"")+'</time></span><span class="transaction-amount kind-'+e(row.kind)+'">'+sign+money(row.amount_minor,row.currency,row.currency_minor_digits||row.minor_digits)+'</span></button>';
 }
 function findTransactionById(id) {
   for (const rows of [workspace?.transactions, ledgerRangeRows, cachedBootstrap?.transactions]) {
@@ -1296,7 +1617,13 @@ function renderCredits() {
   const cards=workspace?.cards||[];
   $("#creditPanel").innerHTML='<div class="section-heading"><h2>'+m("信用卡管理","カード管理","Credit cards")+'</h2>'+b("add-card",icon("plus"),"","icon-button")+'</div>'+
     '<p class="fineprint">'+m("欠款为额度差额估算，不代表当月账单。还款仅记录转账，不操作银行。","債務は利用枠の差による目安です。返済は台帳内の振替のみです。","Debt is an estimate from credit availability. Repayments only record ledger transfers.")+'</p>'+
-    (cards.map((card,i)=>'<article class="credit-card credit-'+i%3+'"><div class="spread"><h3>'+e(card.name)+'</h3>'+icon("card")+'</div><span>'+m("当前可用额度","利用可能額","Available credit")+'</span><strong>'+ (card.available_minor===null?"—":money(card.available_minor,card.currency,card.minor_digits))+'</strong><div class="credit-details"><span>'+m("总额度","利用限度額","Total limit")+'<b>'+(card.limit_minor===null?"—":money(card.limit_minor,card.currency,card.minor_digits))+'</b></span><span>'+m("欠款估算","債務の目安","Estimated debt")+'<b>'+(card.debt_estimate_minor===null?"—":money(card.debt_estimate_minor,card.currency,card.minor_digits))+'</b></span></div><p>'+m("快照","スナップショット","Snapshot")+' '+e(hiddenAmounts?"••••":card.snapshot_date||"—")+'</p><div class="button-row">'+b("account-rename",m("更改称呼","口座名を変更","Rename"),card.account_id)+b("credit-snapshot",m("录入快照","枠を入力","Snapshot"),card.account_id)+b("credit-repay",m("还款","返済","Repay"),card.account_id)+b("credit-history",m("恢复额度快照","枠履歴を復元","Restore snapshot"),card.account_id)+b("credit-plan",m("应还计划","返済予定","Due plan"),card.account_id)+(card.repayment_schedule?b("credit-toggle",card.repayment_schedule.enabled==="1"?m("暂停计划","予定を停止","Pause plan"):m("启用计划","予定を有効化","Enable plan"),card.account_id):"")+'</div></article>').join("")||empty(m("先登记一张信用卡","カードを追加してください","Add your first credit card")));
+    (cards.map((card,i)=>'<article class="credit-card credit-'+i%3+'"><div class="spread"><h3>'+e(card.name)+'</h3>'+icon("card")+'</div><span>'+m("当前可用额度","利用可能額","Available credit")+'</span><strong>'+ (card.available_minor===null?"—":money(card.available_minor,card.currency,card.minor_digits))+'</strong><div class="credit-details"><span>'+m("总额度","利用限度額","Total limit")+'<b>'+(card.limit_minor===null?"—":money(card.limit_minor,card.currency,card.minor_digits))+'</b></span><span>'+m("欠款估算","債務の目安","Estimated debt")+'<b>'+(card.debt_estimate_minor===null?"—":money(card.debt_estimate_minor,card.currency,card.minor_digits))+'</b></span></div><p>'+m("快照","スナップショット","Snapshot")+' '+e(hiddenAmounts?"••••":card.snapshot_date||"—")+'</p>'+(card.pendingSync?'<p class="fineprint" role="status">'+m("已先在本机更新，正在后台同步云端。","端末に先に反映しました。クラウドへ同期中です。","Updated on this device first; syncing to cloud in the background.")+'</p>':'')+'<div class="button-row">'+b("account-rename",m("更改称呼","口座名を変更","Rename"),card.account_id)+b("credit-snapshot",m("录入快照","枠を入力","Snapshot"),card.account_id)+b("credit-repay",m("还款","返済","Repay"),card.account_id)+b("credit-history",m("恢复额度快照","枠履歴を復元","Restore snapshot"),card.account_id)+b("credit-plan",m("应还计划","返済予定","Due plan"),card.account_id)+(card.repayment_schedule&&card.repayment_schedule.last_status!=="计划已删除"?b("credit-plan-delete",m("删除计划","予定を削除","Delete plan"),card.account_id,"button danger-text"):"")+'</div></article>').join("")||empty(m("先登记一张信用卡","カードを追加してください","Add your first credit card")));
+  const inactivePlanIds=new Set(cards.filter(card=>card.repayment_schedule&&card.repayment_schedule.enabled!=="1").map(card=>String(card.account_id)));
+  if(inactivePlanIds.size)for(const button of $("#creditPanel").querySelectorAll('[data-action="credit-plan"]'))if(inactivePlanIds.has(String(button.dataset.id)))button.remove();
+  for(const button of $("#creditPanel").querySelectorAll('[data-action="credit-plan-delete"]')){
+    const card=cards.find(row=>String(row.account_id)===String(button.dataset.id));
+    if(!card?.repayment_schedule||card.repayment_schedule.enabled!=="1")button.remove();
+  }
 }
 function renderAssets() {
   const balanceRows=workspace?.balanceSheet?.rows||[];
@@ -1362,7 +1689,9 @@ function generalSettingsContent(){
   const languagePanel='<section class="profile-editor"><h3>'+m("语言","言語","Language")+'</h3><label class="field"><span>'+m("界面语言","表示言語","Interface language")+'</span><select id="languageSelect">'+languageOptions.map(([value,label])=>'<option value="'+value+'" '+(currentLanguage===value?'selected':'')+'>'+label+'</option>').join("")+'</select></label><p class="fineprint">'+m("语言只保存在当前浏览器，不会同步到其他设备。切换时会先确认；确认后清空 Agent 对话和未发送内容。","言語設定はこのブラウザーだけに保存され、他の端末には同期されません。変更前に確認し、確定後はAgentの会話と未送信内容を消去します。","Language is saved in this browser only and is not synced to other devices. Switching asks for confirmation and then clears Agent chats and unsent content.")+'</p></section>';
   const baseCurrency=(tutorialTour?.batchSave?tutorialTour.draft.settings.baseCurrency:"")||workspace?.settings?.base_currency||"JPY";
   const currencyPanel='<form id="baseCurrencyForm" class="profile-editor"><h3>'+m("主要记账货币","メインの記帳通貨","Main bookkeeping currency")+'</h3><label class="field"><span>'+m("总览和报表显示的货币","概要とレポートに表示する通貨","Currency shown in overview and reports")+'</span><select id="baseCurrencySelect">'+[["JPY","JPY · 日元"],["CNY","CNY · 人民币"],["USD","USD · 美元"]].map(([value,label])=>'<option value="'+value+'" '+(baseCurrency===value?'selected':'')+'>'+label+'</option>').join("")+'</select></label><p class="fineprint">'+m("这里选择总览和报表主要使用的货币。账户余额和以前的记录会保留原来的货币；其他货币需要合计时，软件会按汇率换算。现在的预算仍按日元计算。","概要とレポートに使う通貨を選びます。口座残高と過去の記録は元の通貨のままです。他の通貨を合計する場合は為替レートで換算します。予算は引き続き日本円で計算します。","Choose the main currency shown in the overview and reports. Account balances and past entries keep their original currency. Other currencies are converted when a total is needed. Budgets are still calculated in JPY.")+'</p><div class="button-row"><button class="button primary" type="submit">'+m("保存设置","設定を保存","Save settings")+'</button></div></form>';
-  return '<div class="settings-general-grid">'+appearanceSettingsHtml(currentMode)+languagePanel+currencyPanel+'</div>';
+  const settings=tutorialTour?.batchSave?tutorialTour.draft.settings:(workspace?.preferences||{}),configured=Boolean(settings.timeZoneConfigured||!workspace?.preferences?.onboardingRequired),timeZone=configured?(settings.timeZone||"Asia/Tokyo"):"";
+  const regionPanel='<form id="regionSettingsForm" class="profile-editor"><h3>'+m("所在地区","所在地域","Region")+'</h3><label class="field"><span>'+m("当地日期和时间","現地の日付と時刻","Local date and time")+'</span><select id="regionTimeZoneSelect" required>'+regionTimeZoneOptions(timeZone,!timeZone)+'</select></label><p class="fineprint">'+m("用于账单日期、自动还款和“今天/昨天”等日期判断。按该地区实际时间运行，夏令时会自动调整。更改地区不会修改已记账日期。","明細の日付、自動返済、「今日／昨日」などの判定に使います。選択した地域の時刻で動作し、夏時間も自動調整します。過去の取引日は変更しません。","Used for entry dates, automatic repayments, and words like today or yesterday. Schedules use this region's local clock and adjust for daylight saving time. Existing entry dates will not change.")+'</p><div class="button-row"><button class="button primary" type="submit">'+m("保存设置","設定を保存","Save settings")+'</button></div></form>';
+  return '<div class="settings-general-grid">'+appearanceSettingsHtml(currentMode)+languagePanel+currencyPanel+regionPanel+'</div>';
 }
 function renderModule(id) {
   if(id==="budget"||id==="reports"){
@@ -1394,6 +1723,17 @@ function renderModule(id) {
         if(stageGuidedTutorialSettings({baseCurrency}))return;
         const cfg=deepCopy(workspace.preferences||{});cfg.baseCurrency=baseCurrency;if(workspace.preferences?.onboardingRequired)cfg.onboardingStep="base";
         await guarded(async()=>{const result=await runAction("settings",cfg,null,false);if(!result?.queued)await loadWorkspace(true);renderModule("settings");if(!result?.queued)showToast(m("主要记账货币已保存","メインの記帳通貨を保存しました","Main currency saved"));});
+      });
+      pane.querySelector("#regionSettingsForm")?.addEventListener("submit",async event=>{
+        event.preventDefault();
+        const timeZone=String(event.currentTarget.querySelector("#regionTimeZoneSelect").value||"");
+        if(!regionTimeZones.some(([value])=>value===timeZone)){showToast(m("请选择所在地区。","所在地域を選択してください。","Choose a region."),true);return;}
+        const previous=(tutorialTour?.batchSave?tutorialTour.draft.settings.timeZone:"")||workspace?.preferences?.timeZone||"Asia/Tokyo";
+        if(timeZone===previous&&workspace?.preferences?.timeZoneConfigured){if(tutorialTour?.batchSave&&(workspace?.preferences?.onboardingRequired||tutorialTour.mode==="required-setup")){stageGuidedTutorialSettings({timeZone});return;}return;}
+        if(stageGuidedTutorialSettings({timeZone}))return;
+        const cfg=deepCopy(workspace?.preferences||{});cfg.timeZone=timeZone;
+        if(workspace?.preferences?.onboardingRequired)cfg.onboardingStep="base";
+        await guarded(async()=>{const result=await runAction("settings",cfg,null,false);if(!result?.queued)await loadWorkspace(true);renderModule("settings");if(!result?.queued)showToast(m("所在地区已保存，后续日期和定时操作将使用当地时间。","所在地域を保存しました。今後の日付と予定は現地時刻を使います。","Region saved. Future dates and scheduled actions will use local time."));});
       });
     }
     else if(settingsTab==="categories"){
@@ -1491,6 +1831,8 @@ function renderModule(id) {
       const budgetRows=Object.entries(plan).sort(([a],[b])=>a.localeCompare(b)).map(([name,value])=>({cells:[e(name),'<span class="finance-amount">'+e(money(analytics.actualByCategory[name]||"0"))+'</span>','<span class="finance-amount">'+e(money(value))+'</span>','<span class="finance-amount">'+e(money((BigInt(value||0)-BigInt(analytics.actualByCategory[name]||0)).toString()))+'</span>']}));
       const period=finance.profit.start+" — "+finance.profit.through;
       const allocation=Object.values(plan).reduce((sum,value)=>sum+BigInt(value||0),0n);
+      financePieColorNames=[...(cachedBootstrap?.categories||[]).map(row=>String(row.name||row.display_name||"")),...Object.keys(analytics.actualByCategory),...Object.keys(plan),m("其他","その他","Other")].filter(Boolean);
+      financePieCategoryOrder=Object.entries(plan).sort(([,left],[,right])=>BigInt(left||0)>BigInt(right||0)?-1:BigInt(left||0)<BigInt(right||0)?1:0).map(([name])=>name);
       content+='<div class="finance-budget-layout"><div class="finance-budget-side finance-spending-side"><div class="finance-spending-summary"><strong>'+e(period)+'</strong><span>'+m("本期已入账支出","今期の記帳済み支出","Posted spending this period")+' <b>'+money(analytics.totalSpent.toString())+'</b></span>'+(analytics.missingFxCount?'<small>'+m("缺少汇率的人民币流水：","為替未登録の人民元取引：","CNY entries missing exchange rates: ")+analytics.missingFxCount+m("笔，未计入图表。","件。グラフには含まれません。"," entries; excluded from charts.")+'</small>':"")+'</div><section class="finance-chart-panel"><div class="finance-chart-heading"><h3>'+m("支出趋势","支出の推移","Spending trend")+'</h3><div class="finance-chart-modes">'+b("budget-trend-mode",m("日度","日別","Daily"),"daily","pill "+(financeTrendMode==="daily"?"selected":""))+b("budget-trend-mode",m("月度","月別","Monthly"),"monthly","pill "+(financeTrendMode==="monthly"?"selected":""))+'</div></div><p class="finance-chart-hint">'+m("日度显示本期；月度显示近12个月。将鼠标移到折线上的圆点查看日期和金额。","日別は今期、月別は直近12か月です。折れ線の点にカーソルを合わせると日付と金額を表示します。","Daily shows this period; monthly shows the last 12 months. Hover over a point on the line for its date and amount.")+'</p>'+trendChart(analytics,financeTrendMode)+'</section><section class="finance-chart-panel"><h3>'+m("本期消费类别","今期の支出カテゴリ","Spending categories this period")+'</h3>'+financePieChart(Object.entries(analytics.actualByCategory),m("本期暂无已入账分类支出。","今期の記帳済みカテゴリ支出はありません。","No posted category spending this period."))+'</section></div><div class="finance-budget-side"><div class="finance-budget-head"><div><strong>'+e(period)+'</strong><p>'+m("总预算","予算合計","Total budget")+'：<b>'+money(total)+'</b>　·　'+m("分类分配","カテゴリ配分","Category allocation")+'：<b>'+money(allocation.toString())+'</b><br>'+m("已使用","使用済み","Spent")+'：<b>'+money(analytics.totalSpent.toString())+'</b>　·　'+m("剩余","残額","Remaining")+'：<b>'+money(remaining.toString())+'</b></p></div>'+b("budget-edit",m("编辑预算","予算編集","Edit budget"),"","button secondary finance-budget-edit")+'</div>'+(budgetRows.length?"":'<p class="fineprint finance-footnote">'+m("尚未设置分类预算。点击“编辑预算”设置。","カテゴリ予算は未設定です。「予算編集」から設定できます。","No category budgets yet. Select Edit budget to set them.")+'</p>')+financeTable([m("类别","カテゴリ","Category"),m("已使用","使用額","Spent"),m("预算","予算","Budget"),m("剩余","残額","Remaining")],budgetRows,m("本期分类预算","今期カテゴリ予算","Period category budget"),"budget-table")+'<section class="finance-chart-panel"><h3>'+m("预算分配","予算配分","Budget allocation")+'</h3>'+financePieChart(Object.entries(plan),m("添加类别预算后显示预算分配。","カテゴリ予算を追加すると配分を表示します。","Add category budgets to see the allocation."))+'</section></div></div>';
     }
   }
@@ -1509,6 +1851,13 @@ function renderModule(id) {
   }
   root.innerHTML=content;
   if(id==="finance"&&financialTab==="budget"){
+    const layout=root.querySelector(".finance-budget-layout");
+    const piePanels=[...root.querySelectorAll(".finance-pie")].map(pie=>pie.closest(".finance-chart-panel")).filter(Boolean);
+    if(layout&&piePanels.length===2){
+      const row=document.createElement("div");row.className="finance-pie-row";
+      layout.append(row);
+      piePanels.forEach(panel=>row.append(panel));
+    }
     const chart=root.querySelector(".trend-chart"),wrap=root.querySelector(".finance-chart-wrap"),tooltip=root.querySelector(".finance-chart-tooltip");
     chart?.addEventListener("pointermove",event=>{
       const point=event.target instanceof Element?event.target.closest(".trend-point"):null;
@@ -1525,7 +1874,7 @@ function renderModule(id) {
       const pieWrap=pie.closest(".finance-pie-wrap"),pieTooltip=pieWrap?.querySelector(".finance-chart-tooltip");
       pie.addEventListener("pointermove",event=>{
         const slice=event.target instanceof Element?event.target.closest("[data-tip]"):null;
-        if(!slice){pieTooltip?.classList.add("hidden");return;}
+        if(!slice){if(!pie.dataset.tapTip)pieTooltip?.classList.add("hidden");return;}
         if(!pieTooltip||!pieWrap)return;
         pieTooltip.textContent=slice.dataset.tip||"";
         pieTooltip.classList.remove("hidden");
@@ -1533,7 +1882,19 @@ function renderModule(id) {
         pieTooltip.style.left=Math.max(4,Math.min(left,bounds.width-pieTooltip.offsetWidth-4))+"px";
         pieTooltip.style.top=Math.max(4,Math.min(top,bounds.height-pieTooltip.offsetHeight-4))+"px";
       });
-      pie.addEventListener("pointerleave",()=>pieTooltip?.classList.add("hidden"));
+      pie.addEventListener("pointerleave",event=>{if(event.pointerType!=="touch"&&!pie.dataset.tapTip)pieTooltip?.classList.add("hidden");});
+      pie.addEventListener("click",event=>{
+        const slice=event.target instanceof Element?event.target.closest("[data-tip]"):null;
+        if(!slice){if(!pie.dataset.tapTip)pieTooltip?.classList.add("hidden");return;}
+        if(!pieTooltip||!pieWrap)return;
+        if(pie.dataset.tapTip===slice.dataset.tip){delete pie.dataset.tapTip;pieTooltip.classList.add("hidden");return;}
+        pie.dataset.tapTip=slice.dataset.tip||"";
+        pieTooltip.textContent=pie.dataset.tapTip;
+        pieTooltip.classList.remove("hidden");
+        const bounds=pieWrap.getBoundingClientRect(),left=event.clientX-bounds.left+10,top=event.clientY-bounds.top-pieTooltip.offsetHeight-9;
+        pieTooltip.style.left=Math.max(4,Math.min(left,bounds.width-pieTooltip.offsetWidth-4))+"px";
+        pieTooltip.style.top=Math.max(4,Math.min(top,bounds.height-pieTooltip.offsetHeight-4))+"px";
+      });
     });
   }
 }
@@ -1561,13 +1922,20 @@ function budgetAnalytics(start,through) {
   return {daily,monthly,actualByCategory,totalSpent,missingFxCount};
 }
 function financePieChart(entries,emptyMessage) {
-  const ranked=(entries||[]).map(([name,value])=>[String(name),BigInt(value||0)]).filter(([,value])=>value>0n).sort((a,b)=>a[1]>b[1]?-1:a[1]<b[1]?1:0);
+  const preferred=new Map(financePieCategoryOrder.map((name,index)=>[name,index]));
+  const ranked=(entries||[]).map(([name,value])=>[String(name),BigInt(value||0)]).filter(([,value])=>value>0n).sort((a,b)=>{
+    const left=preferred.get(a[0]),right=preferred.get(b[0]);
+    if(left!==undefined||right!==undefined){if(left===undefined)return 1;if(right===undefined)return -1;return left-right;}
+    return a[1]>b[1]?-1:a[1]<b[1]?1:a[0].localeCompare(b[0]);
+  });
   if(!ranked.length)return '<p class="finance-pie-empty">'+e(emptyMessage)+'</p>';
   const visible=ranked.length>8?[...ranked.slice(0,7),[m("其他","その他","Other"),ranked.slice(7).reduce((sum,row)=>sum+row[1],0n)]]:ranked;
-  const total=visible.reduce((sum,row)=>sum+row[1],0n),colors=["#2563EB","#F97316","#16A34A","#DC2626","#7C3AED","#0891B2","#DB2777","#CA8A04","#4F46E5","#0D9488","#EA580C","#65A30D","#9333EA","#475569"];
+  const total=visible.reduce((sum,row)=>sum+row[1],0n);
+  const categoryOrder=[...new Set([...financePieColorNames,...visible.map(([name])=>name)])].sort((a,b)=>a.localeCompare(b));
+  const categoryColor=name=>"hsl("+((categoryOrder.indexOf(name)*137.508+216)%360).toFixed(1)+" 70% 48%)";
   const cx=82,cy=82,radius=78;let angle=-90;
-  const slices=visible.map(([name,value],index)=>{
-    const fraction=Number(value*1_000_000n/total)/1_000_000,end=angle+fraction*360,color=colors[index%colors.length];
+  const slices=visible.map(([name,value])=>{
+    const fraction=Number(value*1_000_000n/total)/1_000_000,end=angle+fraction*360,color=categoryColor(name);
     const percent=Number(value*10_000n/total)/100,tip=name+" · "+percent.toFixed(percent%1?1:0)+"% · "+(hiddenAmounts?m("金额已隐藏","金額を非表示","Amount hidden"):money(value.toString()));
     let shape;
     if(visible.length===1)shape='<circle data-tip="'+e(tip)+'" cx="'+cx+'" cy="'+cy+'" r="'+radius+'" fill="'+color+'"><title>'+e(tip)+'</title></circle>';
@@ -1628,16 +1996,19 @@ async function openForm(title, fields, submit, options={}) {
   $("#editorSave").classList.remove("hidden");
   $("#editorTitle").textContent=title;$("#editorSave").textContent=m("保存","保存","Save");$("#editorCancel").textContent=t("cancel");
   $("#editorFooter").replaceChildren();
+  $("#editorBody").className="sheet-body"+(options.bodyClass?" "+options.bodyClass:"");
   $("#editorBody").innerHTML=(options.note?'<p class="fineprint">'+e(options.note)+'</p>':"")+fields.map(item=>{
     const id="edit-"+item.name;
     let control;
     if(item.type==="select")control='<select id="'+id+'" name="'+item.name+'" '+(item.optional?"":"required")+'>'+item.options.map(option=>'<option value="'+e(option[0])+'" '+(String(option[0])===String(item.value)?"selected":"")+'>'+e(option[1])+'</option>').join("")+'</select>';
     else if(item.type==="textarea")control='<textarea id="'+id+'" name="'+item.name+'" rows="'+(item.rows||5)+'" '+(item.optional?"":"required")+'>'+e(item.value)+'</textarea>';
     else if(item.type==="checkbox")control='<input id="'+id+'" name="'+item.name+'" type="checkbox" '+(item.value?"checked":"")+'>';
-    else control='<input id="'+id+'" name="'+item.name+'" type="'+(["decimal","integer"].includes(item.type)?"text":item.type)+'" '+(item.type==="decimal"?'inputmode="decimal"':item.type==="integer"?'inputmode="numeric"':"")+' value="'+e(item.value)+'" '+(item.optional?"":"required")+' '+(item.type==="password"?'autocomplete="new-password"':"")+'>';
-    return '<label class="'+(item.type==="checkbox"?"check-row":"field")+'"><span>'+e(item.label)+'</span>'+control+'</label>';
+    else control='<input id="'+id+'" name="'+item.name+'" type="'+(["decimal","integer"].includes(item.type)?"text":item.type)+'" '+(item.type==="decimal"?'inputmode="decimal" autocomplete="off"':item.type==="integer"?'inputmode="numeric"':"")+' value="'+e(item.value)+'" '+(item.optional?"":"required")+' '+(item.readonly?'readonly aria-readonly="true"':"")+' '+(item.type==="password"?'autocomplete="new-password"':"")+'>';
+    return '<label class="'+(item.type==="checkbox"?"check-row":"field")+(item.className?" "+e(item.className):"")+'"><span>'+e(item.label)+'</span>'+control+'</label>';
   }).join("");
-  const dialog=$("#editorDialog"); if(!dialog.open)dialog.showModal();
+  const dialog=$("#editorDialog");
+  if(options.bodyClass)dialog.addEventListener("close",()=>{$("#editorBody").className="sheet-body";},{once:true});
+  if(!dialog.open)dialog.showModal();
   $("#editorForm").onsubmit=async event=>{
     event.preventDefault();if(event.currentTarget.dataset.busy)return;
     const data=Object.fromEntries(new FormData(event.currentTarget));for(const item of fields)if(item.type==="checkbox")data[item.name]=!!$("#edit-"+item.name).checked;
@@ -1683,41 +2054,6 @@ window.confirmBeforeQueuedOperation=async()=>{
     {accept:m("继续","続ける","Continue")}
   );
 };
-let backgroundBackupTask=null, lastBackgroundBackupAt=0;
-async function runBackgroundCloudBackup(reason="background"){
-  if(backgroundBackupTask)return backgroundBackupTask;
-  const owner=currentUser?.id,prefs=workspace?.preferences;
-  if(!owner||!navigator.onLine||!serverReachable||cloudBootstrapFailed||!prefs||prefs.autoSync!==true)return;
-  const providers=["github","gitee"].filter(provider=>prefs.cloud?.[provider]?.connected);
-  if(!providers.length)return;
-  if((await outboxAll()).length){void syncQueue();return;}
-  if(activeJob||jobRecoveryOwner||sending)return;
-  const now=Date.now();
-  if(reason!=="refresh"&&now-lastBackgroundBackupAt<45000)return;
-  lastBackgroundBackupAt=now;
-  backgroundBackupTask=(async()=>{
-    window.backgroundBackupActive=true;updateConnection();
-    try{
-      for(const provider of providers){
-        if(currentUser?.id!==owner)return;
-        const result=await runAction("cloud_upload",{provider,automatic:true},()=>{},false);
-        if(result?.remoteUpdated){
-          const warningKey=`hh-cloud-remote-warning:${owner}:${provider}`;
-          if(localStorage.getItem(warningKey)!==String(result.remoteSha||"updated")){
-            localStorage.setItem(warningKey,String(result.remoteSha||"updated"));
-            showToast(m("云端有其他设备的新备份；为保护数据，本次没有下载或覆盖。需要时请到“更多 → 设置 → 备份”手动核对。","別の端末から新しいバックアップが保存されています。データ保護のため、今回は取得も上書きもしていません。必要に応じて「その他 → 設定 → バックアップ」で確認してください。","A newer backup exists from another device. To protect your data, nothing was downloaded or overwritten. Review it under More → Settings → Backup if needed."),true);
-          }
-        }
-      }
-    }catch(error){
-      if(currentUser?.id===owner)showToast(m("后台云端备份未完成：","クラウドへのバックアップを完了できませんでした：","Background cloud backup did not complete: ")+error.message,true);
-    }finally{
-      window.backgroundBackupActive=false;updateConnection();
-    }
-  })();
-  try{return await backgroundBackupTask;}finally{backgroundBackupTask=null;}
-}
-window.runBackgroundCloudBackup=runBackgroundCloudBackup;
 function showActionProgress(action,state="running",error="") {
   const isAgent=action==="agent"||action==="agent_prepare";
   const copies={
@@ -1755,7 +2091,7 @@ async function runAction(action,data={},progress=null,refresh=true) {
     if(activeJob)throw new Error(m("记账仍在处理中，请等待当前请求完成后再修改账本。","記帳を処理中です。完了後に台帳を変更してください。","Bookkeeping is still processing. Wait for it to finish before changing the ledger."));
     if(window.confirmBeforeQueuedOperation&&!await window.confirmBeforeQueuedOperation())throw new Error(m("已取消本次操作。","今回の操作を取り消しました。","This operation was cancelled."));
     const operation=newOperation("pending_action",data),preview=buildPendingActionPreview(action,data,operation.opId);
-    const item={...operation,type:"pending_action",action,preview,displayLabel:pendingActionLabel(action,data),notBefore:Date.now()+1800,error:"",conflict:false};
+    const item={...operation,type:"pending_action",action,preview,displayLabel:pendingActionLabel(action,data),notBefore:0,error:"",conflict:false};
     await outboxPut(item);
     if(action==="onboarding_save"){
       // The saved outbox row is the durable local commit. Do not hold the
@@ -1780,12 +2116,16 @@ async function runAction(action,data={},progress=null,refresh=true) {
   }
   if(activeJob&&action!=="agent"&&action!=="agent_prepare")throw new Error(m("记账仍在处理中，你可以查看其他页面；完成后再修改账本。","記帳を処理中です。ほかの画面は確認できますが、台帳の変更は完了後に行ってください。","Bookkeeping is still processing. You can view other pages; wait until it finishes before changing the ledger."));
   const opId=crypto.randomUUID();
+  const isAgentAction=action==="agent"||action==="agent_prepare";
+  activeJobAgent=isAgentAction?String(data.agent||chatAgent):"";
   const ownsProgress=!progress;
   if(ownsProgress)showActionProgress(action);
   try{
     let job=await api("/api/action",{method:"POST",body:JSON.stringify({action,data,opId})});
     if(currentUser?.id!==owner)throw new Error(t("logout"));
-    localStorage.setItem("hh-active-job:"+owner,job.id);activeJob=job.id;window.cloudJobActive=true;updateConnection();
+    localStorage.setItem("hh-active-job:"+owner,job.id);
+    if(isAgentAction){localStorage.setItem("hh-active-job-agent:"+owner,String(data.agent||chatAgent));localStorage.setItem("hh-active-job-conversation:"+owner,String(data.conversationId||""));}
+    activeJob=job.id;window.cloudJobActive=true;updateConnection();
     if(action==="agent"||action==="agent_prepare"){renderAgent();if(ownsProgress)showActionProgress(action);}
     let pollFailures=0;
     while(job.state==="running"){
@@ -1795,14 +2135,16 @@ async function runAction(action,data={},progress=null,refresh=true) {
       try{job=await api("/api/job?id="+encodeURIComponent(job.id));pollFailures=0;}
       catch(error){
         const retryable=!error.status||error.status===408||error.status===429||error.status>=500;
-        if(!retryable){activeJob="";window.cloudJobActive=false;updateConnection();renderAgent();throw error;}
+        if(!retryable){activeJob="";if(!isAgentAction)activeJobAgent="";window.cloudJobActive=false;updateConnection();renderAgent();throw error;}
         pollFailures++;
       }
     }
     if(currentUser?.id!==owner)throw new Error(t("logout"));
-    localStorage.removeItem("hh-active-job:"+owner);activeJob="";window.cloudJobActive=false;updateConnection();
+    localStorage.removeItem("hh-active-job:"+owner);localStorage.removeItem("hh-active-job-agent:"+owner);localStorage.removeItem("hh-active-job-conversation:"+owner);activeJob="";if(!isAgentAction)activeJobAgent="";window.cloudJobActive=false;updateConnection();
     if(job.state!=="done")throw new Error(localizeServerError(job.result?.error||job.message||m("操作未完成","操作未完了","Action did not complete")));
     if(job.cloudSnapshotSaved===false)showToast(m("操作已完成，但云端快照未能保存。请保持服务运行并稍后重试备份。","操作は完了しましたが、クラウドスナップショットを保存できませんでした。サービスを終了せず、後でバックアップを再試行してください。","The action completed, but its cloud snapshot was not saved. Keep the service running and retry the backup later."),true);
+    if(!job.result?.readOnly&&!['agent_prepare','cloud_upload','cloud_restore','cloud_connect','cloud_disconnect','github_auth','startup_pull','agent_reset','backup','restore_local'].includes(action)){
+    }
     if(refresh){
       try{await refreshLedgerViews();}
       catch(error){
@@ -1810,12 +2152,11 @@ async function runAction(action,data={},progress=null,refresh=true) {
       }
     }
     if(ownsProgress){showActionProgress(action,"done");await sleepMobile(450);}
-    if(!["cloud_upload","cloud_restore","cloud_connect","cloud_disconnect","github_auth","startup_pull","agent_prepare","agent_reset","backup","restore_local"].includes(action)){
-      void runBackgroundCloudBackup("write");
-    }
     return job.result;
   }catch(error){
-    if(activeJob===opId){activeJob="";window.cloudJobActive=false;updateConnection();}
+    if(activeJob===opId){activeJob="";if(!isAgentAction)activeJobAgent="";window.cloudJobActive=false;updateConnection();}
+    if(isAgentAction&&!localStorage.getItem("hh-active-job:"+owner))localStorage.removeItem("hh-active-job-conversation:"+owner);
+    else if(!activeJob&&!isAgentAction)activeJobAgent="";
     if(ownsProgress){showActionProgress(action,"failed",error.message);await sleepMobile(action==="agent"||action==="agent_prepare"?1800:700);}
     throw error;
   }finally{if(ownsProgress)hideCloudProgress();}
@@ -1863,10 +2204,12 @@ async function runWithCloudProgress(action,provider,callback) {
 async function resumeJob() {
   const owner=currentUser?.id;if(!owner||jobRecoveryOwner===owner||activeJob)return;
   const id=localStorage.getItem("hh-active-job:"+owner);if(!id)return;
+  const requestedAgent=localStorage.getItem("hh-active-job-agent:"+owner);
+  const requestedConversation=localStorage.getItem("hh-active-job-conversation:"+owner)||"";
   jobRecoveryOwner=owner;
   window.cloudJobActive=true;updateConnection();
-  try{let job=await api("/api/job?id="+encodeURIComponent(id));while(job.state==="running"){showDeviceChallenge(job);await sleepMobile(1500);if(currentUser?.id!==owner)return;job=await api("/api/job?id="+encodeURIComponent(id));}localStorage.removeItem("hh-active-job:"+owner);if(job.state==="done"){
-      if(job.result?.answer){const agent=job.result.agent||"bookkeeping";chats[agent].push({role:"assistant",text:job.result.answer});await cacheSet("chat:"+owner+":"+agent,chats[agent]);renderAgent();}
+  try{let job=await api("/api/job?id="+encodeURIComponent(id));while(job.state==="running"){showDeviceChallenge(job);await sleepMobile(1500);if(currentUser?.id!==owner)return;job=await api("/api/job?id="+encodeURIComponent(id));}localStorage.removeItem("hh-active-job:"+owner);localStorage.removeItem("hh-active-job-agent:"+owner);localStorage.removeItem("hh-active-job-conversation:"+owner);if(job.state==="done"){
+      if(job.result?.answer){const agent=["bookkeeping","food_health","ledger_query"].includes(requestedAgent)?requestedAgent:(job.result.agent||"bookkeeping"),sessionId=agent==="ledger_query"?(requestedConversation||"legacy"):"",key=chatCacheKey(owner,agent,sessionId);let saved=null;try{saved=await cacheGet(key);}catch{}const isCurrent=agent!=="ledger_query"||localStorage.getItem(chatSessionKey(owner))===sessionId;const transcript=Array.isArray(saved)?saved:(isCurrent?(chats[agent]||[]):[]);transcript.push({role:"assistant",text:job.result.answer,route:job.result.routedAgent||job.result.agent||agent,usage:job.result.usage||null});try{await cacheSet(key,transcript);}catch{}if(isCurrent){chats[agent]=transcript;renderAgent();}}
       if(job.result?.prepared){await queuePreparedAgent(job.result,owner);showToast(m("已在此设备保存，云端上传中…","この端末に保存しました。クラウドへ同期中…","Saved on this device. Syncing to cloud…"));void syncQueue();}
       else {await refreshLedgerViews();showToast(m("后台操作已完成","バックグラウンド処理が完了しました","Background action completed"));}
     }else showToast(job.result?.error||job.message,true);}
@@ -1886,22 +2229,33 @@ async function restoreFile(file) {
   try{await api("/api/restore-bundle",{method:"POST",body:file,headers:{"Content-Type":"application/zip","X-Confirm-Restore":"confirmed-once"}});await refreshLedgerViews();showToast(m("已恢复","復元しました","Restored"));}catch(error){showToast(error.message,true);}finally{hideCloudProgress();}
 }
 
-function renderAgent() {
+function renderAgent({refreshBalance=true}={}) {
   const root=$("#agentPanel");if(!root)return;
-  const pending=activeJob?'<span class="loading-pulse">'+m("处理中…","処理中…","Working…")+'</span>':m("自然地说，认真地记","いつもの言葉で、ていねいに","Your words. A clear record.");
-  root.innerHTML='<div class="mode-pills">'+b("agent-switch",m("记账助手","記帳アシスタント","Ledger assistant"),"bookkeeping","pill "+(chatAgent==="bookkeeping"?"selected":""))+b("agent-switch",m("饮食健康","食生活","Food & wellbeing"),"food_health","pill "+(chatAgent==="food_health"?"selected":""))+'</div><div class="chat-caption">'+pending+b("agent-reset",m("新对话","新しい会話","New chat"),"","text-button")+'</div><section id="modelUsagePanel" class="model-usage-panel" aria-live="polite"></section><div id="chatMessages" class="chat-messages" aria-live="polite"></div><form id="chatForm" class="chat-composer"><div id="chatImages" class="chat-images"></div><textarea id="chatInput" rows="3" maxlength="24000" placeholder="'+m(chatAgent==="bookkeeping"?"例如：午饭980日元":"问问最近的饮食，或记录今天吃了什么",chatAgent==="bookkeeping"?"例：昼食980円":"最近の食生活について聞いてみましょう",chatAgent==="bookkeeping"?"For example: lunch 980 yen":"Ask about your recent meals")+'" aria-label="'+m("消息","メッセージ","Message")+'"></textarea><div class="composer-tools"><label class="icon-button" aria-label="'+m("添加图片","画像を追加","Add image")+'">'+icon("folder")+'<input id="chatImageInput" type="file" accept="image/jpeg,image/png,image/webp" multiple></label><span class="muted">'+m("可拖入或选择图片 · 单张不超过20MB · 自动压缩到3MB内","画像をドロップ/選択 · 1枚20MB以下 · 3MB以内に自動圧縮","Drop/select images · max 20 MB each · compressed to under 3 MB")+'</span>'+(activeJob?b("agent-cancel",m("中断","中断","Stop"),"","button secondary"):'<button type="submit" class="send-circle" aria-label="'+m("发送","送信","Send")+'">↑</button>')+'</div></form>';
-  const messages=chats[chatAgent];
-  $("#chatMessages").innerHTML=messages.length?messages.map(item=>'<article class="bubble '+item.role+'"><span class="bubble-label">'+(item.role==="user"?m("你","あなた","You"):m("助手","アシスタント","Assistant"))+'</span><p>'+e(item.text)+'</p>'+(item.role==="assistant"&&item.usage?'<small class="bubble-usage">'+usageCostLabels(item.usage,chatAgent)+'</small>':"")+'</article>').join(""):'<div class="chat-welcome"><span class="assistant-orb">'+icon(chatAgent==="bookkeeping"?"chat":"food")+'</span><h2>'+m("让生活，清楚一点","暮らしを、少しクリアに","A clearer picture of everyday life")+'</h2><p>'+m("告诉我一笔收支，或拍下小票。信息不足时先确认，记录成功后再备份。","収支を伝えるか、レシートを撮影してください。不明点は確認してから記帳します。","Tell me about an entry, or photograph a receipt. Unclear details are checked before recording.")+'</p></div>';
+  const queryMode=chatAgent==="ledger_query",foodMode=chatAgent==="food_health";
+  const agentBusy=!!(activeJob||agentSubmitting)&&activeJobAgent===chatAgent;
+  const otherAgentBusy=!!(activeJob||agentSubmitting)&&!!activeJobAgent&&activeJobAgent!==chatAgent;
+  const pending=agentBusy?'<span class="loading-pulse">'+m("处理中…","処理中…","Working…")+'</span>':otherAgentBusy?m("另一位助手正在处理；可以切换，完成后再发送。","別のアシスタントが処理中です。切り替えはできます。送信は完了後にできます。","Another assistant is working. You can switch modes; send after it finishes."):queryMode?m("自动理解你的话 · 按需查账、记账或闲聊","話の内容に合わせて照会・記帳・会話を切替","Understands your request and routes chat, ledger queries, or bookkeeping"):m("自然地说，认真地记","いつもの言葉で、ていねいに","Your words. A clear record.");
+  const assistantHeader='<div class="smart-assistant-banner"><span class="smart-assistant-icon">'+icon("chat")+'</span><span class="smart-assistant-copy"><strong>'+m("智能助手","スマートアシスタント","Smart assistant")+'</strong><small>'+m("自动选择记账、查账或饮食助手","記帳・照会・食事の内容に応じて自動で選択","Automatically chooses bookkeeping, ledger query, or food assistant")+'</small></span></div>';
+  const imageTools='<label class="icon-button" aria-label="'+m("添加图片","画像を追加","Add image")+'">'+icon("folder")+'<input id="chatImageInput" type="file" accept="image/jpeg,image/png,image/webp" multiple></label><span class="muted">'+m("可拖入或选择图片 · 单张不超过20MB · 自动压缩到3MB内","画像をドロップ/選択 · 1枚20MB以下 · 3MB以内に自動圧縮","Drop/select images · max 20 MB each · compressed to under 3 MB")+'</span>';
+  const placeholder=queryMode?m("随便聊、问账本，或直接说要记什么","自由に話す、台帳を聞く、記帳を頼む","Chat, ask about your ledger, or tell me what to record"):foodMode?m("问问最近的饮食，或记录今天吃了什么","最近の食生活について質問、または今日の食事を記録","Ask about your diet or record what you ate today"):m("例如：午饭980日元","例：昼食980円","For example: lunch 980 yen");
+  const composerAction=agentBusy?(activeJob?b("agent-cancel",m("中断","中断","Stop"),"","button secondary"):'<span class="muted">'+m("正在准备请求…","リクエストを準備中…","Preparing request…")+'</span>'):otherAgentBusy?'<span class="muted">'+m("请等待当前助手完成后发送","現在の処理が終わってから送信してください","Wait for the current request before sending")+'</span>':'<button type="submit" class="send-circle" aria-label="'+m("发送","送信","Send")+'">↑</button>';
+  root.innerHTML=assistantHeader+'<div class="chat-caption">'+pending+b("agent-reset",m("新对话","新しい会話","New chat"),"","text-button")+'</div><section id="modelUsagePanel" class="model-usage-panel" aria-live="polite"></section><div id="chatMessages" class="chat-messages" aria-live="polite"></div><form id="chatForm" class="chat-composer"><div id="chatImages" class="chat-images"></div><textarea id="chatInput" rows="3" maxlength="24000" placeholder="'+placeholder+'" aria-label="'+m("消息","メッセージ","Message")+'"></textarea><div class="composer-tools">'+imageTools+composerAction+'</div></form>';
+  const messages=chats[chatAgent]||[];
+  const welcome=queryMode
+    ?'<div class="chat-welcome"><span class="assistant-orb">'+icon("chat")+'</span><h2>'+m("你可以直接说，我会接着处理","そのまま話しかけてください","Just say what you need")+'</h2><p>'+m("可以闲聊、问收支余额、分析消费，也可以直接记账或发小票。我会自动选择合适的助手。","気軽な会話、残高や支出の確認、使い方の相談、記帳やレシート画像にも対応します。内容に合うAgentを自動で選びます。","Chat, ask about balances or spending, get an analysis, record an entry, or send a receipt. I’ll choose the right assistant automatically.")+'</p></div>'
+    :'<div class="chat-welcome"><span class="assistant-orb">'+icon(foodMode?"food":"chat")+'</span><h2>'+m("让生活，清楚一点","暮らしを、少しクリアに","A clearer picture of everyday life")+'</h2><p>'+ (foodMode?m("问问最近的饮食，或记录今天吃了什么。","最近の食生活を質問したり、今日の食事を記録したりできます。","Ask about your recent meals or record what you ate today."):m("告诉我一笔收支，或拍下小票。信息不足时先确认，记录成功后再备份。","収支を伝えるか、レシートを撮影してください。不明点は確認してから記帳します。","Tell me about an entry, or photograph a receipt. Unclear details are checked before recording."))+'</p></div>';
+  $("#chatMessages").innerHTML=messages.length?messages.map(item=>'<article class="bubble '+item.role+'"><span class="bubble-label">'+(item.role==="user"?m("你","あなた","You"):m("助手","アシスタント","Assistant"))+'</span><p>'+e(item.text)+'</p>'+(item.role==="assistant"&&chatAgent==="ledger_query"&&item.route?'<small class="bubble-usage">'+m("自动调用：","使用：","Used: ")+e(({chat:m("普通聊天","通常会話","Chat"),ledger_query:m("账本查询","台帳照会","Ledger query"),bookkeeping:m("记账助手","記帳Agent","Bookkeeping"),food_health:m("饮食助手","食事Agent","Food assistant")})[item.route]||item.route)+'</small>':"")+(item.role==="assistant"&&item.usage?'<small class="bubble-usage">'+usageCostLabels(item.usage,chatAgent)+'</small>':"")+'</article>').join(""):welcome;
   renderModelUsagePanel();
-  void refreshModelBalance(chatAgent,currentUsageVision||attachments.length>0);
+  if(refreshBalance)void refreshModelBalance(chatAgent,currentUsageVision||attachments.length>0);
   renderAttachments();
   $("#chatForm").onsubmit=sendAgent;
   $("#chatInput").onkeydown=event=>{
-    if(event.key==="Enter"&&event.ctrlKey&&!event.isComposing&&event.keyCode!==229){
+    if(event.key==="Enter"&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){
       event.preventDefault();$("#chatForm").requestSubmit();
     }
   };
-  $("#chatImageInput").onchange=async event=>{await guarded(()=>attachImages([...event.target.files]));event.target.value="";};
+  const chatImageInput=$("#chatImageInput");
+  if(chatImageInput)chatImageInput.onchange=async event=>{await guarded(()=>attachImages([...event.target.files]));event.target.value="";};
   const dropTarget=$("#agentPanel");
   dropTarget.dataset.dropLabel=m("松开鼠标添加图片","ドロップして画像を追加","Drop to add images");
   const carriesFiles=event=>Array.from(event.dataTransfer?.types||[]).includes("Files")||Boolean(event.dataTransfer?.files?.length);
@@ -1944,22 +2298,28 @@ async function attachImages(files) {
   renderAttachments();
 }
 async function sendAgent(event) {
-  event.preventDefault();if(activeJob||agentSubmitting)return;
+  event.preventDefault();if(activeJob||agentSubmitting){showToast(activeJobAgent?m("当前助手仍在处理请求，切换助手不受影响。","現在のアシスタントが処理中です。切り替えはできます。","The current assistant is still working. You can switch modes."):m("云端操作正在进行，完成后即可发送；切换助手不受影响。","クラウド処理中です。完了後に送信できます。切り替えは可能です。","A cloud operation is in progress. You can switch modes and send when it finishes."),true);return;}
   const text=$("#chatInput").value.trim();if(!text&&!attachments.length)return;
   agentSubmitting=true;
   const owner=currentUser?.id,agent=chatAgent,images=attachments.map(image=>({...image}));
+  activeJobAgent=agent;
   try{
+    await chatRestoreLoads.get(owner);
+    const conversationId=await ensureChatSessionId(owner),chatKey=chatCacheKey(owner,agent,conversationId);
     const queued=await outboxAll();
     if(queued.length){
       void syncQueue();
       showToast(m("还有记录正在等待云端同步。请等顶部状态灯恢复绿色后再继续记账。","同期待ちの記録があります。上部の表示が緑に戻ってから続けてください。","Entries are still waiting to sync. Continue after the status at the top turns green."),true);
       return;
     }
-    const vision=images.length>0,balanceKey=agent+":"+(vision?"vision":"text"),pricingProfile=selectedUsageProfile(agent,vision);currentUsageVision=vision;
+    const vision=images.length>0,balanceKey=agent+":"+(vision?"vision":"text");currentUsageVision=vision;
     const beforeBalance=await refreshModelBalance(agent,vision,{force:true});
+    if(agent==="ledger_query"&&localStorage.getItem(chatSessionKey(owner))!==conversationId)throw new Error(m("这段对话已在别处重开，请确认当前对话后再发送。","別の画面で新しい会話が始まりました。現在の会話を確認してから送信してください。","A new chat was started elsewhere. Check the current conversation before sending."));
+    const history=(chats[agent]||[]).slice(-8).map(item=>({role:item.role,text:String(item.text||"").slice(0,1600),route:item.route||""}));
     chats[agent].push({role:"user",text:text+(images.length?"\n"+m("附图","画像","Images")+": "+images.length:"")});
+    try{await cacheSet(chatKey,chats[agent]);}catch{}
     $("#chatInput").value="";attachments=[];renderAgent();
-    const result=await runAction("agent_prepare",{agent,text,images,language:currentLanguage,reportDate:reportDate||null},null,false);
+    const result=await runAction("agent_prepare",{agent,text,images,history,conversationId,language:currentLanguage,reportDate:reportDate||null},null,false);
     if(currentUser?.id!==owner)return;
     if(result.prepared){
       await queuePreparedAgent(result,owner);
@@ -1967,16 +2327,20 @@ async function sendAgent(event) {
     }else if(result.cloudCommitted){
       void refreshLedgerViews();
     }
-    const usagePricing=result.usage?(estimateModelUsageCost(result.usage,pricingProfile,new Date())||{available:false}):null;
-    chats[agent].push({role:"assistant",text:result.answer,usage:result.usage?{...result.usage,vision,cost_cny:usagePricing}:null});
-    await cacheSet("chat:"+currentUser.id+":"+agent,chats[agent]);
+    const usageBreakdown=Array.isArray(result.usageBreakdown)&&result.usageBreakdown.length?result.usageBreakdown:[{agent:result.usageAgent||agent,vision,usage:result.usage}];
+    const usageCosts=usageBreakdown.map(part=>estimateModelUsageCost(part.usage,selectedUsageProfile(part.agent||agent,!!part.vision),new Date()));
+    let usagePricing=null;
+    if(usageCosts.length&&usageCosts.every(cost=>cost?.available))usagePricing={available:true,currency:"CNY",estimated:true,hit_cny:usageCosts.reduce((sum,cost)=>sum+cost.hit_cny,0),miss_cny:usageCosts.reduce((sum,cost)=>sum+cost.miss_cny,0),output_cny:usageCosts.reduce((sum,cost)=>sum+cost.output_cny,0)};
+    else if(result.usage)usagePricing={available:false};
+    const assistantMessage={role:"assistant",text:result.answer,route:result.routedAgent||agent,usage:result.usage?{...result.usage,vision,cost_cny:usagePricing}:null};
+    if(agent==="ledger_query"&&localStorage.getItem(chatSessionKey(owner))!==conversationId){let prior=[];try{prior=await cacheGet(chatKey)||[];}catch{}if(!Array.isArray(prior))prior=[];prior.push(assistantMessage);await cacheSet(chatKey,prior);}else{chats[agent].push(assistantMessage);await cacheSet(chatKey,chats[agent]);}
     const afterBalance=await refreshModelBalance(agent,vision,{force:true});
     const beforeAmounts=new Map((beforeBalance?.balances||[]).map(item=>[item.currency,Number(item.total)]));
     const afterEntry=(afterBalance?.balances||[]).find(item=>beforeAmounts.has(item.currency));
     if(afterEntry){const before=beforeAmounts.get(afterEntry.currency),after=Number(afterEntry.total);if(Number.isFinite(before)&&Number.isFinite(after)&&before>after)modelBalanceSpend[balanceKey]=afterEntry.currency+" "+(before-after).toFixed(4);else modelBalanceSpend[balanceKey]=m("暂未体现","まだ反映されていません","Not reflected yet");}
     if(result.prepared)void syncQueue();
-  }catch(error){if(currentUser?.id===owner){chats[agent].push({role:"assistant",text:error.message});if(images.length)attachments=images;showToast(error.message,true);}}
-  finally{agentSubmitting=false;if(currentUser?.id===owner)renderAgent();}
+  }catch(error){if(currentUser?.id===owner){const sessionId=await ensureChatSessionId(owner),key=chatCacheKey(owner,agent,sessionId),message={role:"assistant",text:error.message};if(agent==="ledger_query"&&localStorage.getItem(chatSessionKey(owner))!==sessionId){let prior=[];try{prior=await cacheGet(key)||[];}catch{}if(!Array.isArray(prior))prior=[];prior.push(message);try{await cacheSet(key,prior);}catch{}}else{chats[agent].push(message);try{await cacheSet(key,chats[agent]);}catch{}}if(images.length)attachments=images;showToast(error.message,true);}}
+  finally{agentSubmitting=false;if(activeJobAgent===agent)activeJobAgent="";if(currentUser?.id===owner)renderAgent();}
 }
 
 function appearanceSettingsHtml(mode) {
@@ -2111,12 +2475,15 @@ async function handleMobileClick(event) {
       return;
     }
     if(action==="page"){navigate(id);advanceTutorialTour(action,id);return;}
+    if(action==="account-layout"){
+      if(id!=="cards"&&id!=="list")return;
+      accountViewMode=id;localStorage.setItem("hh-account-view",id);renderAccountViewControls();return;
+    }
     if(action==="hero-mode-toggle"){heroProfitMode=!heroProfitMode;return renderDashboard();}
     if(action==="privacy"){hiddenAmounts=!hiddenAmounts;localStorage.setItem("hh-hide-amounts",hiddenAmounts?"1":"0");renderMobile();await renderAccounts();return;}
     if(action==="refresh"){
       await syncQueue();
       await refreshLedgerViews();
-      void runBackgroundCloudBackup("refresh");
       return;
     }
     if(action==="workspace-retry"){workspaceError="";renderMobile();return loadWorkspace(true);}
@@ -2136,7 +2503,11 @@ async function handleMobileClick(event) {
     if(action==="scope-cancel"){backupDraft=null;if(moreTab==="settings"){settingsTab="backup";renderModule("settings");}else renderCloud();return;}
     if(action==="scope-all"){const inputs=$$("#scopeForm .scope-grid input");const all=inputs.every(input=>input.checked);inputs.forEach(input=>input.checked=!all);$("#scopeForm").onchange();return;}
     if(action==="cloud-connect"){
-      if(id==="github"){await runAction("github_auth",{provider:"github"},showDeviceChallenge);$("#deviceDialog").close();await loadWorkspace(true);void runBackgroundCloudBackup("login");return;}
+      if(id==="github"){
+        if(typeof window.startGithubBackupReauth!=="function")throw new Error(m("授权窗口尚未准备好，请刷新页面后重试。","認証画面を準備できません。画面を更新して再試行してください。","The authorization window is not ready. Refresh and try again."));
+        await window.startGithubBackupReauth();
+        return;
+      }
       return openForm("Gitee",[field("token",m("私人令牌 · user_info 与 projects 权限","個人トークン・user_infoとprojects権限","Personal token · user_info and projects"),"password"),field("repositoryName",m("私有仓库名称","非公開リポジトリ名","Private repository name"),"text",workspace.preferences.cloud.gitee?.repositoryName||"household-bookkeeping-data")],data=>runAction("cloud_connect",{...data,provider:"gitee"}));
     }
     if(["cloud-upload","cloud-restore","cloud-disconnect","local-restore"].includes(action)){
@@ -2152,8 +2523,7 @@ async function handleMobileClick(event) {
       }
       return runAction(map[action],{provider:id,name:id,confirmed:true});
     }
-    if(action==="agent-switch"){if(activeJob)throw new Error(m("请等待当前请求完成","現在の処理をお待ちください","Wait for the current request"));chatAgent=id;attachments=[];currentUsageVision=false;const saved=await cacheGet("chat:"+currentUser.id+":"+chatAgent);if(saved)chats[chatAgent]=saved;renderAgent();return;}
-    if(action==="agent-reset"){if(activeJob)return;if(!await confirmOnce(m("清空当前对话","会話を消去","Clear this conversation"),m("未完成的草稿和聊天显示会清除，已入账记录保留。","未確定下書きと会話を消去します。記帳済み取引は保持します。","Pending drafts and displayed chat will clear. Posted entries remain.")))return;await runAction("agent_reset",{agent:chatAgent});chats[chatAgent]=[];await cacheSet("chat:"+currentUser.id+":"+chatAgent,[]);renderAgent();return;}
+    if(action==="agent-reset"){if(activeJob||agentSubmitting)return;if(!await confirmOnce(m("开始新对话","新しい会話を始める","Start a new chat"),m("新对话会从空白上下文开始，未完成的旧记账草稿不会带入；已保存的账目不受影响。","新しい会話は空の状態から始まり、未完了の記帳内容は引き継ぎません。保存済みの取引には影響しません。","The new chat starts with a clean context. Unfinished intent from the previous chat will not carry over; saved entries stay unchanged.")))return;const owner=currentUser?.id;if(!owner)return;await ensureChatSessionId(owner);const freshId=createChatSessionId();localStorage.setItem(chatSessionKey(owner),freshId);chatSessionLoads.set(owner,Promise.resolve(freshId));chats={bookkeeping:[],food_health:[],ledger_query:[]};attachments=[];const input=$("#chatInput");if(input)input.value="";try{await cacheSet(chatCacheKey(owner,"ledger_query",freshId),[]);}catch{}renderAttachments();renderAgent();showToast(m("新对话已开始，旧的未完成内容不会带入。","新しい会話を開始しました。前の未完了内容は引き継がれません。","New chat started. Unfinished context from the previous chat was left behind."));return;}
     if(action==="agent-cancel"){await api("/api/cancel-job",{method:"POST",body:JSON.stringify({id:activeJob})});showToast(m("正在中断","中断中","Stopping…"));return;}
     if(action==="image-remove"){if(await confirmOnce(m("移除这张待发送图片","送信前の画像を削除","Remove this pending image"),m("该图片将不会发送。","この画像は送信されません。","This image will not be sent."))){attachments.splice(Number(id),1);renderAttachments();}return;}
     const dateField=()=>field("date",t("date"),"date",workspace.date);
@@ -2169,34 +2539,65 @@ async function handleMobileClick(event) {
         return runAction("rename_account",{accountId:account.id,oldName:account.name,name});
       });
     }
-    if(action==="credit-toggle")return runAction("credit_plan_toggle",{card:card.name,enabled:card.repayment_schedule.enabled!=="1"});
-    if(action==="credit-snapshot")return openForm(m("录入额度快照","利用枠を記録","Credit snapshot")+" · "+card.name,[field("account",t("account"),"select",card.name,[[card.name,card.name]]),dateField(),amountField("limit",m("总额度","利用限度額","Total limit"),card.limit_minor?plainAmount(card.limit_minor,card.minor_digits):""),amountField("available",m("当前可用额度","利用可能額","Available credit"),card.available_minor?plainAmount(card.available_minor,card.minor_digits):""),field("includeDifference",m("将欠款差额计入账本（余额盘盈/盘亏）","利用残高の差額を台帳に記録（残高過剰・不足）","Post debt difference to ledger (balance surplus/shortage)"),"checkbox",false),{...field("note",m("备注","メモ","Note")),optional:true}],data=>runAction("credit_snapshot",data),{note:m("默认只保存快照。勾选后，将“总额度−可用额度”的估算欠款与账面信用卡余额的差额记入“余额盘盈/余额盘亏”，并影响收支报表。","通常はスナップショットのみ保存します。チェックすると「利用限度額−利用可能額」の概算債務と台帳残高の差額を「残高過剰／不足」として記帳し、収支レポートに反映します。","By default, this only saves a snapshot. If checked, the difference between estimated debt (limit minus available credit) and the ledger card balance is posted as a balance surplus/shortage and affects reports.")});
-    if(action==="credit-repay"||action==="credit-plan")return openForm(action==="credit-repay"?m("记录还款","返済を記録","Record repayment"):m("每月应还计划","毎月の返済予定","Monthly repayment plan"),[field("card",m("信用卡","カード","Credit card"),"select",card.name,[[card.name,card.name]]),accountField("source","cash",card.repayment_schedule?.source_name),{...dateField(),value:action==="credit-plan"?(card.repayment_schedule?.next_due_date||workspace.date):workspace.date},{...amountField(),optional:action==="credit-plan"}],data=>runAction(action==="credit-repay"?"credit_repay":"credit_plan",data),{note:action==="credit-plan"?m("本期金额每月重填，空白不记账。只记录本地转账，不实际扣款。","当月金額は毎月入力。空欄なら記帳しません。実際の銀行引落は行いません。","Enter this period's amount each month. Blank amounts are not posted. No actual bank debit occurs."):""});
+    if(action==="credit-plan-delete"){
+      if(!await confirmOnce(m("删除每月应还计划？","毎月の返済予定を削除しますか？","Delete the monthly repayment plan?"),m("删除后将停止后续自动记账，并取消尚未记账的本期计划金额；已记入账本的还款流水会保留。之后点“还款”可重新设置计划。本功能只管理账本，不会实际扣款。","削除すると今後の自動記帳を停止し、未記帳の今期予定額を取り消します。記帳済みの返済履歴は保持されます。「返済」から再設定できます。実際の引落は行いません。","This stops future automatic ledger entries and cancels unposted amounts. Posted repayment entries remain. Click Repay to set up the plan again. This only changes the ledger; it never makes a bank payment.")))return;
+      return runAction("credit_plan_delete",{card:card.name,accountId:card.account_id});
+    }
+    if(action==="credit-snapshot")return openForm(m("录入额度快照","利用枠を記録","Credit snapshot")+" · "+card.name,[field("account",t("account"),"select",card.name,[[card.name,card.name]]),dateField(),amountField("limit",m("总额度","利用限度額","Total limit"),card.limit_minor?plainAmount(card.limit_minor,card.minor_digits,card.currency):""),amountField("available",m("当前可用额度","利用可能額","Available credit"),card.available_minor?plainAmount(card.available_minor,card.minor_digits,card.currency):""),field("includeDifference",m("将欠款差额计入账本（余额盘盈/盘亏）","利用残高の差額を台帳に記録（残高過剰・不足）","Post debt difference to ledger (balance surplus/shortage)"),"checkbox",true),{...field("note",m("备注","メモ","Note")),optional:true}],data=>runAction("credit_snapshot",{...data,accountId:card.account_id}),{note:m("默认将欠款差额计入账本。取消勾选则只保存快照；有历史额度记录时，差额按上次额度快照及此后卡片流水计算；首次记录时按账面信用卡欠款比较。","初期設定では債務差額を台帳に記録します。チェックを外すとスナップショットのみ保存します。過去の利用枠記録がある場合は、その記録以降のカード取引を反映した債務との差額を記帳し、初回のみ台帳上のカード債務と比較します。","By default, the debt difference is posted to the ledger. Uncheck to save only the snapshot. Existing snapshots use the latest snapshot plus later card transactions as the baseline; the first snapshot compares against the ledger card debt.")});
+    if(action==="credit-repay"||action==="credit-plan"){
+      const schedule=card.repayment_schedule||{},recreatingPlan=Boolean(Object.keys(schedule).length)&&schedule.enabled!=="1",isPlan=action==="credit-plan"||(action==="credit-repay"&&recreatingPlan);
+      const planDate=schedule.next_due_date&&String(schedule.next_due_date)>=String(workspace.date||"")?schedule.next_due_date:workspace.date;
+      const fields=[field("card",m("信用卡","カード","Credit card"),"select",card.name,[[card.name,card.name]]),accountField("source","cash",schedule.source_name),{...dateField(),value:isPlan?planDate:workspace.date}];
+      const regionLabel=regionTimeZones.find(([value])=>value===(workspace.preferences?.timeZone||"Asia/Tokyo"))?.[1]||m("日本·东京","日本・東京","Japan · Tokyo");
+      const timeLabel=currentLanguage==="ja-JP"?`自動記帳時刻（${regionLabel}）`:currentLanguage==="en-US"?`Automatic ledger time (${regionLabel})`:`自动记账时间（${regionLabel}）`;
+      if(isPlan)fields.push(field("time",timeLabel,"time",schedule.due_time||"09:00"));
+      const savedAmount=schedule.amount_minor===null||schedule.amount_minor===undefined?"":plainAmount(schedule.amount_minor,card.minor_digits,card.currency);
+      fields.push({...amountField("amount",t("amount"),isPlan?savedAmount:""),optional:isPlan});
+      const formTitle=isPlan?(recreatingPlan?m("重新设置应还计划","返済予定を再設定","Recreate repayment plan"):m("每月应还计划","毎月の返済予定","Monthly repayment plan")):m("记录还款","返済を記録","Record repayment");
+      const planNote=recreatingPlan?m("原计划已删除或停用。填写还款账户、日期、时间和本期金额后保存，即可重新启用。只记入账本，不会实际扣款。","予定は削除または停止されています。口座・日付・時刻・今期金額を入力して保存すると再設定できます。台帳への記録のみで、実際の引落は行いません。","The previous plan was deleted or disabled. Enter the account, date, time, and amount, then save to set it up again. This only records in the ledger; no payment is made."):m("本期应还金额请手动填写；留空不会自动记账。日期已过的计划会标为错过，不会补记。此功能只记入账本，不会实际扣款；时间按所选地区执行，后台会在设定时间后的下一次检查时处理。","今月の返済額は入力してください。空欄の場合、自動記帳されません。期日を過ぎた予定は見送り扱いとなり、遡って記帳しません。帳簿への記録のみで、実際の引落は行いません。時刻は選択した地域の時刻で、設定時刻後の次回確認時に処理されます。","Enter this month's amount; blank means nothing is posted. Past-due plans are marked missed and are not backdated. This only records a ledger entry, never a bank debit. Times follow your selected region and are processed at the next background check after the selected time.");
+      return openForm(formTitle,fields,data=>runAction(isPlan?"credit_plan":"credit_repay",data),{note:isPlan?planNote:""});
+    }
     if(action==="credit-history"){
       const history=workspace.creditHistory[id]||{};$("#editorTitle").textContent=card.name;$("#editorCancel").textContent=m("退出教程","チュートリアルを終了","Exit tutorial");$("#editorSave").classList.add("hidden");$("#editorFooter").replaceChildren();$("#editorForm").onsubmit=event=>event.preventDefault();
-      $("#editorBody").innerHTML='<h3>'+m("额度快照历史","利用枠履歴","Credit snapshots")+'</h3>'+(history.snapshots||[]).map(row=>'<div class="history-snapshot"><div><strong>'+e(hiddenAmounts?"••••":row.snapshot_date)+'</strong><p>'+money(row.available_minor,card.currency,card.minor_digits)+" / "+money(row.limit_minor,card.currency,card.minor_digits)+'</p><small>'+e(row.description||row.note||row.snapshot_type)+'</small></div>'+b("credit-restore",m("恢复","復元","Restore"),id+":"+row.snapshot_type+":"+row.id)+'</div>').join("")+'<h3>'+m("信用卡流水","カード取引","Card activity")+'</h3>'+(history.transactions||[]).map(row=>'<div class="report-row"><span>'+e(hiddenAmounts?"••••":row.occurred_on)+" · "+e(row.description)+'</span><b>'+money(row.card_amount_minor,card.currency,card.minor_digits)+'</b></div>').join("");$("#editorDialog").showModal();$("#editorDialog").addEventListener("close",()=>$("#editorSave").classList.remove("hidden"),{once:true});return;
+      $("#editorBody").innerHTML='<h3>'+m("额度快照历史","利用枠履歴","Credit snapshots")+'</h3>'+(history.snapshots||[]).map(row=>'<div class="history-snapshot"><div><strong>'+e(hiddenAmounts?"••••":row.snapshot_date)+'</strong><p>'+money(row.available_minor,card.currency,card.minor_digits)+" / "+money(row.limit_minor,card.currency,card.minor_digits)+'</p><small>'+e(row.description||row.note||row.snapshot_type)+(row.pendingSync?" · "+m("待同步","同期待ち","Sync pending"):"")+'</small></div>'+(row.pendingSync?"":b("credit-restore",m("恢复","復元","Restore"),id+":"+row.snapshot_type+":"+row.id))+'</div>').join("")+'<h3>'+m("信用卡流水","カード取引","Card activity")+'</h3>'+(history.transactions||[]).map(row=>'<div class="report-row"><span>'+e(hiddenAmounts?"••••":row.occurred_on)+" · "+e(row.description)+'</span><b>'+money(row.card_amount_minor,card.currency,card.minor_digits)+'</b></div>').join("");$("#editorDialog").showModal();$("#editorDialog").addEventListener("close",()=>$("#editorSave").classList.remove("hidden"),{once:true});return;
     }
     if(action==="credit-restore"){const [accountId,snapshotType,snapshotId]=id.split(":");if(await confirmOnce(m("恢复额度快照","利用枠を復元","Restore credit snapshot"),m("移除较新的快照，保留账目；操作前会备份。","新しい枠履歴を削除し取引は保持。先にバックアップします。","Newer snapshots will be removed; entries stay. A backup is made first."))){await runAction("restore_credit",{accountId,snapshotType,snapshotId,confirmed:true});$("#editorDialog").close();}return;}
     if(action==="asset-edit"){
       const asset=workspace.assets.find(row=>row.id===id)||{};
-      return openForm(m("固定资产","固定資産","Fixed asset"),[field("name",m("资产名称","資産名","Asset name"),"text",asset.name||""),field("currency",t("currency"),"select",asset.currency||"JPY",[["JPY","JPY"],["CNY","CNY"],["USD","USD"]]),amountField("cost",m("购入原值","取得原価","Acquisition cost"),plainAmount(asset.cost_minor,["CNY","USD"].includes(asset.currency)?2:0)),field("month",m("购入月份","取得月","Acquisition month"),"month",asset.acquisition_month||workspace.date.slice(0,7)),field("months",m("预计使用月数","耐用月数","Useful life in months"),"integer",asset.useful_life_months||"36"),field("included",m("计入余额总额","残高合計に含める","Include in the balance total"),"checkbox",asset.include_in_balance_sheet!=="0"),{...field("disposal",m("报废月份（可空）","除却月（任意）","Disposal month (optional)"),"month",asset.disposal_month||""),optional:true}],data=>runAction("asset",{...data,id:asset.id||""}));
+      return openForm(m("固定资产","固定資産","Fixed asset"),[field("name",m("资产名称","資産名","Asset name"),"text",asset.name||""),field("currency",t("currency"),"select",asset.currency||"JPY",[["JPY","JPY"],["CNY","CNY"],["USD","USD"]]),amountField("cost",m("购入原值","取得原価","Acquisition cost"),plainAmount(asset.cost_minor,currencyMinorDigits(asset.currency,0),asset.currency)),field("month",m("购入月份","取得月","Acquisition month"),"month",asset.acquisition_month||workspace.date.slice(0,7)),field("months",m("预计使用月数","耐用月数","Useful life in months"),"integer",asset.useful_life_months||"36"),field("included",m("计入余额总额","残高合計に含める","Include in the balance total"),"checkbox",asset.include_in_balance_sheet!=="0"),{...field("disposal",m("报废月份（可空）","除却月（任意）","Disposal month (optional)"),"month",asset.disposal_month||""),optional:true}],data=>runAction("asset",{...data,id:asset.id||""}));
     }
     if(action==="asset-toggle"){const asset=(workspace.assets||[]).find(row=>String(row.id)===String(id));if(!asset)throw new Error(m("找不到这项固定资产。","固定資産が見つかりません。","Fixed asset not found."));return runAction("asset_toggle",{id:asset.id,included:asset.include_in_balance_sheet!=="1"});}
     if(action==="asset-delete"||action==="recurring-delete"){if(await confirmOnce(button.textContent+" #"+id,m("删除前保存完整备份；已有流水保留。","削除前に完全バックアップ。既存取引は保持。","A full backup is made before deletion. Posted entries remain.")))return runAction(action==="asset-delete"?"delete_asset":"delete_recurring",{id,confirmed:true});return;}
-    if(action==="cash-adjust"){const account=cachedBootstrap.accounts.find(row=>row.id==id);if(hiddenAmounts)throw new Error(m("请先显示数字再调整","先に数字を表示してください","Show numbers before editing"));return openForm(m("核对实际余额","実残高を照合","Reconcile balance")+" · "+account.name,[amountField("amount",m("实际余额","実際の残高","Actual balance"),plainAmount(account.balanceMinor,account.minorDigits)),dateField(),field("postDifferences",m("将差额记入账本","差額を記帳","Post the difference"),"checkbox",true)],data=>{
+    if(action==="cash-adjust"){const account=cachedBootstrap.accounts.find(row=>row.id==id);if(hiddenAmounts)throw new Error(m("请先显示数字再调整","先に数字を表示してください","Show numbers before editing"));return openForm(m("核对实际余额","実残高を照合","Reconcile balance")+" · "+account.name,[amountField("amount",m("实际余额","実際の残高","Actual balance"),plainAmount(account.balanceMinor,account.minorDigits,account.currency)),dateField(),field("postDifferences",m("将差额记入账本","差額を記帳","Post the difference"),"checkbox",true)],data=>{
       if(tutorialTour?.batchSave){tutorialTour.draft.balanceChanges[account.name]=data.amount;tutorialTour.draft.adjustmentDate=data.date;tutorialTour.draft.postDifferences=!!data.postDifferences;tutorialTour.draft.confirmBalanceAdjustments=!!data.postDifferences;tutorialTour.draft.dirty=true;renderTutorialDraftNotice();renderTutorialTour();showToast(m("余额核对已暂存；教程最后一步统一上传。","残高照合を一時保存しました。最後にまとめて送信します。","Balance check staged; it will upload with the rest at the end."));return;}
       return runAction("reconcile",{date:data.date,postDifferences:data.postDifferences,amounts:{[account.name]:data.amount}});
     });}
     if(action==="cash-delete"){const account=cachedBootstrap.accounts.find(row=>row.id==id);if(await confirmOnce(m("删除账户：","口座を削除：","Delete account: ")+account.name,m("关联流水或计划的账户不能删除。删除前会备份。","取引・予定で使う口座は削除できません。先にバックアップします。","Accounts referenced by entries or plans cannot be deleted. A backup is made first.")))return runAction("delete_account",{name:account.name,confirmed:true});return;}
     if(action==="recurring-edit"){
-      const row=workspace.recurring.find(row=>row.id===id)||{};return openForm(m("定期收支","定期取引","Recurring entry"),[field("name",m("规则名称","予定名","Schedule name"),"text",row.name||""),field("kind",t("type"),"select",row.kind||"expense",[["expense",t("expense")],["income",t("income")]]),accountField("account","all",row.account_name),field("currency",m("账单币种","請求通貨","Bill currency"),"select",row.currency||"JPY",[["JPY","JPY"],["CNY","CNY"],["USD","USD"]]),amountField("amount",t("amount"),row.amount_minor?plainAmount(row.amount_minor,row.minor_digits):""),field("category",t("category"),"select",row.category_name,[...fieldsCategories("expense"),...fieldsCategories("income")]),field("frequency",m("周期","周期","Frequency"),"select",row.frequency||"monthly",[["daily",m("每天","毎日","Daily")],["weekly",m("每周","毎週","Weekly")],["monthly",m("每月","毎月","Monthly")],["yearly",m("每年","毎年","Yearly")]]),field("interval",m("每隔几个周期","間隔","Interval"),"integer",row.interval_count||"1"),{...dateField(),value:row.next_due_date||workspace.date}],data=>runAction("recurring",{...data,id:row.id||""}));
+      const row=workspace.recurring.find(row=>row.id===id)||{};return openForm(m("定期收支","定期取引","Recurring entry"),[field("name",m("规则名称","予定名","Schedule name"),"text",row.name||""),field("kind",t("type"),"select",row.kind||"expense",[["expense",t("expense")],["income",t("income")]]),accountField("account","all",row.account_name),field("currency",m("账单币种","請求通貨","Bill currency"),"select",row.currency||"JPY",[["JPY","JPY"],["CNY","CNY"],["USD","USD"]]),amountField("amount",t("amount"),row.amount_minor?plainAmount(row.amount_minor,row.minor_digits,row.currency):""),field("category",t("category"),"select",row.category_name,[...fieldsCategories("expense"),...fieldsCategories("income")]),field("frequency",m("周期","周期","Frequency"),"select",row.frequency||"monthly",[["daily",m("每天","毎日","Daily")],["weekly",m("每周","毎週","Weekly")],["monthly",m("每月","毎月","Monthly")],["yearly",m("每年","毎年","Yearly")]]),field("interval",m("每隔几个周期","間隔","Interval"),"integer",row.interval_count||"1"),{...dateField(),value:row.next_due_date||workspace.date}],data=>runAction("recurring",{...data,id:row.id||""}));
     }
     if(action==="recurring-toggle"){const row=workspace.recurring.find(row=>row.id===id);return runAction("recurring_toggle",{id,enabled:row.enabled!=="1"});}
     if(action==="run-due"){const result=await runAction("run_due");if(!result?.queued)showToast(m("到期项目已检查","期日の確認が完了しました","Due entries checked"));return;}
     if(action==="budget-edit"){
       const settings=workspace.settings||{};
       let plan={};try{plan=JSON.parse(settings["savings_plan:"+workspace.profit.start]||settings["savings_plan:monthly_template"]||"{}").items||{};}catch{}
-      const categories=fieldsCategories("expense");return openForm(m("本期预算","今期予算","Period budget"),[amountField("total",m("总预算 · JPY","予算合計 · JPY","Total budget · JPY"),settings.monthly_jpy_budget_minor||"0"),amountField("goal",m("储蓄目标 · JPY","貯蓄目標 · JPY","Savings goal · JPY"),settings.savings_goal_jpy||"0"),...categories.map(([name,label],index)=>({...amountField("category"+index,label,plan[name]||"0"),optional:true}))],data=>runAction("budget",{total:data.total,goal:data.goal,items:Object.fromEntries(categories.map(([name],index)=>[name,data["category"+index]||"0"]))}));
+      const categories=fieldsCategories("expense");
+      const totalFromCategories=()=>categories.reduce((sum,_category,index)=>{
+        const raw=( $("#edit-category"+index)?.value||"" ).replace(/[，,\s]/g,"").trim();
+        return /^\d+$/.test(raw)?sum+BigInt(raw):sum;
+      },0n).toString();
+      return openForm(m("本期预算","今期予算","Period budget"),[
+        {...amountField("total",m("总预算 · JPY（自动合计）","予算合計 · JPY（自動計算）","Total budget · JPY (automatic total)"),"0"),readonly:true,className:"budget-total-field"},
+        amountField("goal",m("储蓄目标 · JPY","貯蓄目標 · JPY","Savings goal · JPY"),settings.savings_goal_jpy||"0"),
+        ...categories.map(([name,label],index)=>({...amountField("category"+index,label,plan[name]||"0"),optional:true}))
+      ],data=>runAction("budget",{total:totalFromCategories(),goal:data.goal,items:Object.fromEntries(categories.map(([name],index)=>[name,data["category"+index]||"0"]))}),{
+        bodyClass:"budget-editor-body",
+        onReady:()=>{
+          const totalField=$("#edit-total"),updateTotal=()=>{if(totalField)totalField.value=totalFromCategories();};
+          categories.forEach((_,index)=>$("#edit-category"+index)?.addEventListener("input",updateTotal));
+          updateTotal();
+        }
+      });
     }
     if(action==="food-purchase"||action==="food-eaten")return openForm(action==="food-purchase"?m("添加食品采购","食品の購入","Food purchase"):m("记录饮食","食事を記録","Log a meal"),[dateField(),field("items",m("每行一种食物；数量可写在 | 后面","1行に1品。数量は | の後に記入","One food per line; optional quantity after |"),"textarea"),{...field("meal",m("餐次（可空）","食事区分（任意）","Meal (optional)")),optional:true},{...field("note",m("备注（可空）","メモ（任意）","Note (optional)")),optional:true}],data=>runAction(action==="food-purchase"?"food_purchase":"food_eaten",{...data,items:data.items.split("\n").filter(line=>line.trim()).map(line=>{const parts=line.split("|");return [parts[0].trim(),parts.slice(1).join("|").trim()];})}));
     if(action==="food-preference")return openForm(m("采购计入偏好","購入の計上設定","Purchase preference"),[field("enabled",m("将采购食品计入已吃回顾（不生成食用流水）","購入食品を食事回顧に含める（食事記録は作成しない）","Count food purchases in food reviews (does not create meals)"),"checkbox",workspace.settings?.food_review_purchases_count_as_eaten==="1")],data=>runAction("food_preference",data));
@@ -2213,7 +2614,7 @@ async function handleMobileClick(event) {
       const actions=row.pendingDelete
         ? (!row.pendingDeleteSending?'<div class="button-row">'+b("queue-undo-delete",m("撤销删除","削除を取り消す","Undo deletion"),row.pendingDeleteOpId,"button secondary")+'</div>':"")
         : row.pendingSync?"":'<div class="button-row">'+(row.needs_review==="1"?b("tx-review",m("核对并确认","確認する","Review & confirm"),id):"")+b("tx-edit",m("编辑账单","取引を編集","Edit entry"),id)+b("tx-delete",m("删除这笔账","取引を削除","Delete this entry"),id,"button danger-text")+'</div>';
-      $("#editorBody").innerHTML='<strong class="detail-amount kind-'+e(row.kind)+'">'+sign+money(row.amount_minor,row.currency,row.currency_minor_digits)+'</strong><p class="prewrap">'+e(row.description)+'</p>'+["occurred_on","category_name","account_name","to_account_name","balance_effect"].map(key=>row[key]?'<div class="report-row"><span>'+e({occurred_on:t("date"),category_name:t("category"),account_name:t("fromAccount"),to_account_name:t("toAccount"),balance_effect:t("status")}[key])+'</span><strong>'+e(row[key])+'</strong></div>':"").join("")+pendingNote+pendingDeleteNote+actions;
+      $("#editorBody").innerHTML='<strong class="detail-amount kind-'+e(row.kind)+'">'+sign+money(row.amount_minor,row.currency,row.currency_minor_digits)+'</strong><p class="prewrap">'+e(transactionDisplayDescription(row))+'</p>'+["occurred_on","category_name","account_name","to_account_name","balance_effect"].map(key=>row[key]?'<div class="report-row"><span>'+e({occurred_on:t("date"),category_name:t("category"),account_name:t("fromAccount"),to_account_name:t("toAccount"),balance_effect:t("status")}[key])+'</span><strong>'+e(row[key])+'</strong></div>':"").join("")+pendingNote+pendingDeleteNote+actions;
       $("#editorDialog").showModal();$("#editorDialog").addEventListener("close",()=>$("#editorSave").classList.remove("hidden"),{once:true});return;
     }
     if(action==="tx-edit"){
@@ -2229,13 +2630,13 @@ async function handleMobileClick(event) {
       return openForm(m("编辑账单","取引を編集","Edit entry"),[
         field("date",t("date"),"date",row.occurred_on),
         field("kind",t("type"),"select",row.kind,[["expense",t("expense")],["income",t("income")],["transfer",t("transfer")]]),
-        field("description",m("说明","内容","Description"),"text",row.description||""),
+        field("description",m("说明","内容","Description"),"text",transactionDisplayDescription(row)),
         field("currency",t("currency"),"select",row.currency,currencies),
-        amountField("amount",t("amount"),plainAmount(row.amount_minor,digits)),
+        amountField("amount",t("amount"),plainAmount(row.amount_minor,digits,row.currency)),
         {...field("account_name",t("account"),"select",row.account_name||"",accountOptions),optional:true},
         {...field("category_name",t("category"),"select",row.category_name||"",categoryOptions),optional:true},
         {...field("to_account_name",m("转入账户","振込先口座","Destination account"),"select",row.to_account_name||"",accountOptions),optional:true},
-        {...amountField("to_amount",m("转入金额（跨币种时填写）","入金額（異なる通貨の場合）","Destination amount (for FX transfers)"),row.to_amount_minor?plainAmount(row.to_amount_minor,toDigits):""),optional:true},
+        {...amountField("to_amount",m("转入金额（跨币种时填写）","入金額（異なる通貨の場合）","Destination amount (for FX transfers)"),row.to_amount_minor?plainAmount(row.to_amount_minor,toDigits,row.to_currency||row.currency):""),optional:true},
         field("memo_only",m("备查记录（不影响账户余额）","メモ記録（残高に反映しない）","Memo only (does not affect balances)"),"checkbox",row.balance_effect==="memo"),
         field("needs_review",m("待核对","要確認","Needs review"),"checkbox",row.needs_review==="1"),
       ],async data=>{const result=await runAction("edit_transaction",{id,...data});if(!result?.queued)showToast(m("账单已保存，修改前备份已保留。","取引を保存し、変更前のバックアップを保管しました。","Entry saved. A pre-edit backup was kept."));return result;},{note:m("保存前会自动完整备份；信用卡自动还款流水需在还款计划中修改。","保存前に完全バックアップします。カード自動返済の流水は返済予定から変更してください。","A full backup is created before saving. Automatic card repayment entries must be changed in the repayment plan."),onReady:()=>{
@@ -2277,17 +2678,25 @@ async function handleMobileClick(event) {
 mountMobile();
 window.onCloudLedgerRestored = () => {
   workspaceEpoch++;workspaceLoading=null;
-  chats={bookkeeping:[],food_health:[]};workspace=null;workspaceOwner="";workspaceError="";backupDraft=null;
+  chats={bookkeeping:[],food_health:[],ledger_query:[]};workspace=null;workspaceOwner="";workspaceError="";backupDraft=null;
+  if(currentUser)void Promise.allSettled([
+    idbRequest("cache","readwrite",store=>store.delete("workspace:"+currentUser.id)),
+    idbRequest("cache","readwrite",store=>store.delete("bootstrap:"+currentUser.id)),
+    idbRequest("cache","readwrite",store=>store.delete("workspace-meta:"+currentUser.id)),
+  ]);
+  if(currentUser){const freshId=createChatSessionId();localStorage.setItem(chatSessionKey(currentUser.id),freshId);chatSessionLoads.set(currentUser.id,Promise.resolve(freshId));void cacheSet(chatCacheKey(currentUser.id,"ledger_query",freshId),[]).catch(()=>{});}
   ledgerRangeRows=null;attachments=[];renderAgent();
 };
 document.addEventListener("visibilitychange", async () => {
-  if (document.hidden || !currentUser || cloudBootstrapFailed || !serverReachable || activeJob || sending || visibilityRefreshRunning || document.querySelector("dialog[open]")) return;
+  // Login and the first visible-tab event can overlap. The in-flight initial
+  // load already refreshes the ledger; forcing another pass here downloads the
+  // full D1 snapshot twice and can hit the client timeout on the duplicate.
+  if (document.hidden || !currentUser || cloudBootstrapFailed || !serverReachable || activeJob || sending || visibilityRefreshRunning || workspaceLoading || document.querySelector("dialog[open]")) return;
   visibilityRefreshRunning = true;
   try {
     await guarded(async () => {
       if (currentUser) await refreshLedgerViews();
       resumeJob();
-      void runBackgroundCloudBackup("window");
     });
   } finally {
     visibilityRefreshRunning = false;
@@ -2297,13 +2706,14 @@ const baseRenderAccounts=renderAccounts;
 renderAccounts=async function(){
   await baseRenderAccounts();
   const accounts=(await localAccountsAndCategories()).accounts;
+  renderAccountViewControls();
   $$("#accountGrid .account-card").forEach((node,index)=>{
     const account=accounts[index];if(!account)return;
     // Credit cards have their own tab with limit and debt details. Keep them
     // out of the funds list, which otherwise renders every account type.
     if(account.type==="credit"){node.remove();return;}
     if(hiddenAmounts)$(".account-balance",node).textContent="••••••";
-    if(!account.pending){
+    if(!account.pending&&!$(".account-actions",node)){
       const actions=document.createElement("div");actions.className="button-row account-actions";
       actions.innerHTML=b("account-rename",m("更改称呼","口座名を変更","Rename"),account.id,"text-button")+b("cash-adjust",m("核对余额","残高照合","Reconcile"),account.id,"text-button accent")+b("cash-delete",m("删除","削除","Delete"),account.id,"text-button danger-text");node.append(actions);
     }
@@ -2312,9 +2722,9 @@ renderAccounts=async function(){
 const baseRenderAll=renderAll;
 renderAll=async function(){await baseRenderAll();await applyPendingAgentPreviews();renderMobile();};
 const baseShowLoggedIn=showLoggedIn;
-showLoggedIn=function(){baseShowLoggedIn(); if(currentUser){const owner=currentUser.id;for(const agent of ["bookkeeping","food_health"])cacheGet("chat:"+owner+":"+agent).then(saved=>{if(currentUser?.id===owner&&saved){chats[agent]=saved;renderAgent();}});} renderNavigation();renderAgent();if(!workspace||workspaceOwner!==currentUser?.id)loadWorkspace();else renderMobile();};
+showLoggedIn=function(){baseShowLoggedIn(); if(currentUser){const owner=currentUser.id,restore=(async()=>{try{const sessionId=await ensureChatSessionId(owner),saved=await cacheGet(chatCacheKey(owner,"ledger_query",sessionId));if(currentUser?.id===owner&&localStorage.getItem(chatSessionKey(owner))===sessionId&&Array.isArray(saved)){chats.ledger_query=saved;renderAgent();}}catch{}})();chatRestoreLoads.set(owner,restore);for(const agent of ["bookkeeping","food_health"])cacheGet("chat:"+owner+":"+agent).then(saved=>{if(currentUser?.id===owner&&saved){chats[agent]=saved;}});} renderNavigation();renderAgent();if(!workspace||workspaceOwner!==currentUser?.id)loadWorkspace();else renderMobile();};
 const baseShowLoggedOut=showLoggedOut;
-showLoggedOut=function(){setTutorialPageLocked(false);clearTutorialSpotlight();baseShowLoggedOut();workspaceEpoch++;workspaceLoading=null;workspace=null;workspaceOwner="";firstRunSetupReplay=false;firstRunSetupDraft=null;tutorialTour=null;firstRunTourStarted=false;ledgerRangeRows=null;backupDraft=null;settingsDraft=null;settingsInlineCapture=null;settingsTab="general";reportDate="";chats={bookkeeping:[],food_health:[]};attachments=[];activeJob="";const queuePanel=document.querySelector(".queue-panel");if(queuePanel)$("#backupPage")?.append(queuePanel);document.querySelectorAll("dialog[open]").forEach(dialog=>dialog.close());$("#editorBody").replaceChildren();for(const id of ["accountGrid","ledgerList","page-home","creditPanel","fixedPanel","modulePanel","cloudControls"])$("#"+id)?.replaceChildren();renderAgent();};
+ showLoggedOut=function(){setTutorialPageLocked(false);clearTutorialSpotlight();baseShowLoggedOut();workspaceEpoch++;workspaceLoading=null;workspace=null;workspaceOwner="";firstRunSetupReplay=false;firstRunSetupDraft=null;tutorialTour=null;firstRunTourStarted=false;ledgerRangeRows=null;backupDraft=null;settingsDraft=null;settingsInlineCapture=null;settingsTab="general";reportDate="";chats={bookkeeping:[],food_health:[],ledger_query:[]};attachments=[];activeJob="";activeJobAgent="";const queuePanel=document.querySelector(".queue-panel");if(queuePanel)$("#backupPage")?.append(queuePanel);document.querySelectorAll("dialog[open]").forEach(dialog=>dialog.close());$("#editorBody").replaceChildren();for(const id of ["accountGrid","ledgerList","page-home","creditPanel","fixedPanel","modulePanel","cloudControls"])$("#"+id)?.replaceChildren();renderAgent();};
 const baseApplyLanguage=applyLanguage;
-applyLanguage=function(){baseApplyLanguage();renderMobile();renderAgent();};
+applyLanguage=function(){baseApplyLanguage();renderMobile();renderAgent();renderAccountViewControls();};
 renderTransactions=renderMobileTransactions;

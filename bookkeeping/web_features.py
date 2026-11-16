@@ -839,7 +839,8 @@ class MobileWorkspace:
                     if self.generations.get(uid, 0) != generation:
                         raise LedgerError("请求期间账本已更新，本次 Agent 结果没有写入。")
                     changed = merge_isolated_database(
-                        self.db_path(uid), directory / "baseline.sqlite3", directory / "candidate.sqlite3")
+                        self.db_path(uid), directory / "baseline.sqlite3", directory / "candidate.sqlite3",
+                        allow_agent_product_memory=agent == "bookkeeping")
                     receipt_images = images or state.get("receiptImages", [])
                     self.conversations[key] = {"history": history, "pending": pending,
                                                "profileId": profile_id,

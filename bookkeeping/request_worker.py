@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,10 +13,214 @@ from .natural_language import (
     OpenAICompatibleClient,
 )
 from .storage import Database
+from .region_time import DEFAULT_TIME_ZONE, regional_now
 
 
 class RequestMergeError(RuntimeError):
     """Raised when a finished isolated request cannot be safely committed."""
+
+
+_AGENT_PRODUCT_MEMORY_KEY = "agent_product_category_memory_v1"
+
+
+def _validate_agent_product_memory(columns: list[str], row: tuple[Any, ...]) -> None:
+    """Allow only the bounded account-local product-category memory setting."""
+    if ("key" not in columns or "value" not in columns
+            or "note" not in columns or len(row) != len(columns)):
+        raise RequestMergeError("Agent 商品记忆格式无效，本次结果没有写入。")
+    if row[columns.index("key")] != _AGENT_PRODUCT_MEMORY_KEY:
+        raise RequestMergeError("请求结果包含不支持的账本设置变更，本次结果没有写入。")
+    if row[columns.index("note")] not in {
+        "Agent product category corrections for this account",
+        "Account-local product category retrieval examples",
+    }:
+        raise RequestMergeError("Agent 商品记忆来源无效，本次结果没有写入。")
+    raw_value = row[columns.index("value")]
+    if not isinstance(raw_value, str) or len(raw_value.encode("utf-8")) > 1_500_000:
+        raise RequestMergeError("Agent 商品记忆超过安全范围，本次结果没有写入。")
+    try:
+        records = json.loads(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise RequestMergeError("Agent 商品记忆内容无效，本次结果没有写入。") from exc
+    if not isinstance(records, list) or len(records) > 400:
+        raise RequestMergeError("Agent 商品记忆内容无效，本次结果没有写入。")
+    for record in records:
+        if not isinstance(record, dict):
+            raise RequestMergeError("Agent 商品记忆内容无效，本次结果没有写入。")
+        aliases = record.get("aliases")
+        category = record.get("category")
+        if (record.get("kind") not in {"expense", "expense_history"}
+                or not isinstance(category, str) or not category.strip() or len(category) > 120
+                or not isinstance(aliases, list) or not 1 <= len(aliases) <= 12
+                or any(not isinstance(alias, str) or not alias.strip() or len(alias) > 240
+                       for alias in aliases)):
+            raise RequestMergeError("Agent 商品记忆内容无效，本次结果没有写入。")
+
+
+def _merge_usage_parts(parts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    totals: dict[str, Any] = {}
+    breakdown: list[dict[str, Any]] = []
+    for part in parts:
+        usage = part.get("usage") if isinstance(part, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        for key, value in usage.items():
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                totals[key] = totals.get(key, 0) + value
+        breakdown.append({
+            "usage": {key: value for key, value in usage.items()
+                      if isinstance(value, (int, float)) and not isinstance(value, bool)},
+            "api_url": str(part.get("api_url") or ""),
+            "model": str(part.get("model") or ""),
+        })
+    if not totals:
+        return None
+    totals["_cost_breakdown"] = breakdown
+    return totals
+
+
+def _run_smart_assistant_turn(
+    database: Database,
+    candidate_path: Path,
+    client_config: dict[str, Any],
+    user_text: str,
+    history_snapshot: list[dict[str, Any]],
+    pending_snapshot: dict[str, Any] | None,
+    payment_hints: list[dict[str, str]],
+    skill_content: str,
+    images: list[ImageAttachment],
+    response_language: str,
+    *,
+    opener: Any,
+    time_zone: str,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
+    """Dispatch one unified-chat turn while preserving each specialist's state."""
+    from .agent_manager import route_assistant_turn
+    from .ledger_query import run_ledger_query
+
+    pending_route = ""
+    specialist_pending = None
+    if isinstance(pending_snapshot, dict) and pending_snapshot.get("workflow") == "smart_dispatch":
+        candidate_route = str(pending_snapshot.get("agent") or "")
+        if candidate_route in {"bookkeeping", "food_health"}:
+            pending_route = candidate_route
+            specialist_pending = pending_snapshot.get("state")
+    elif pending_snapshot:
+        # Existing conversations created before the unified entry are treated as
+        # bookkeeping clarifications; their context is never given to food chat.
+        pending_route = "bookkeeping"
+        specialist_pending = pending_snapshot
+
+    parts: list[dict[str, Any]] = []
+    if pending_route:
+        route = pending_route
+    else:
+        routed = route_assistant_turn(
+            client_config, user_text, response_language, history_snapshot,
+            images, opener=opener,
+        )
+        route = str(routed["route"])
+        if routed.get("usage"):
+            parts.append({
+                "usage": routed["usage"], "api_url": client_config.get("api_url"),
+                "model": client_config.get("model"),
+            })
+        if route == "chat":
+            history = list(history_snapshot) + [
+                {"role": "user", "content": user_text, "route": "chat"},
+                {"role": "assistant", "content": routed["reply"], "route": "chat"},
+            ]
+            return routed["reply"], history, None, _merge_usage_parts(parts)
+
+    if route == "ledger_query":
+        previous_context = next((
+            item.get("query_context") for item in reversed(history_snapshot)
+            if isinstance(item, dict) and item.get("route") == "ledger_query"
+            and isinstance(item.get("query_context"), dict)
+        ), None)
+        query_history = [
+            {"role": item["role"], "content": str(item.get("content", item.get("text", "")))}
+            for item in history_snapshot
+            if isinstance(item, dict) and item.get("role") in {"user", "assistant"}
+            and item.get("route") == "ledger_query"
+        ][-8:]
+        query_result = run_ledger_query(
+            str(candidate_path), client_config, user_text, response_language,
+            opener=opener, request_now=regional_now(time_zone),
+            cycle_start_day=database.get_billing_cycle_start_day(),
+            conversation={"queryContext": previous_context} if previous_context else None,
+            history=query_history, time_zone=time_zone,
+        )
+        if query_result.get("usage"):
+            parts.append({
+                "usage": query_result["usage"], "api_url": client_config.get("api_url"),
+                "model": client_config.get("model"),
+            })
+        answer = str(query_result.get("answer") or "")
+        history = list(history_snapshot) + [
+            {"role": "user", "content": user_text, "route": "ledger_query"},
+            {"role": "assistant", "content": answer, "route": "ledger_query",
+             "query_context": query_result.get("context")},
+        ]
+        return answer, history, None, _merge_usage_parts(parts)
+
+    if route not in {"bookkeeping", "food_health"}:
+        raise NaturalLanguageError("助手暂时没能判断该使用哪项能力，请重试。")
+    specialists = client_config.get("specialist_profiles")
+    specialist_config = specialists.get(route) if isinstance(specialists, dict) else None
+    if not isinstance(specialist_config, dict):
+        specialist_config = client_config
+    specialist_config = {**client_config, **specialist_config}
+    specialist_config.pop("specialist_profiles", None)
+    specialist_client = OpenAICompatibleClient(
+        str(specialist_config.get("api_key", "")),
+        api_url=str(specialist_config["api_url"]),
+        model=str(specialist_config["model"]),
+        thinking_enabled=specialist_config.get("thinking_enabled", False),
+        reasoning_effort=str(specialist_config.get("reasoning_effort", "low")),
+        timeout=float(specialist_config.get("timeout", client_config.get("timeout", 90))),
+        opener=opener,
+    )
+    selected_skill = (
+        str(client_config.get("food_health_skill_content") or "")
+        if route == "food_health" else skill_content
+    )
+    session = NaturalLanguageSession(
+        database, specialist_client,
+        payment_hints=payment_hints if route == "bookkeeping" else [],
+        loaded_skill=selected_skill,
+        response_language=response_language,
+    )
+    specialist_history = []
+    for item in history_snapshot:
+        if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
+            continue
+        item_route = str(item.get("route") or "bookkeeping")
+        if item_route != route:
+            continue
+        message = {"role": item["role"], "content": str(item.get("content", item.get("text", "")))}
+        if item.get("images"):
+            message["images"] = item["images"]
+        specialist_history.append(message)
+    session.history = specialist_history[-12:]
+    session.pending_state = specialist_pending
+    answer = session.handle(user_text, images=images, agent_mode=route)
+    if specialist_client.usage_snapshot():
+        parts.append({
+            "usage": specialist_client.usage_snapshot(),
+            "api_url": specialist_config.get("api_url"),
+            "model": specialist_config.get("model"),
+        })
+    history = list(history_snapshot) + [
+        {"role": "user", "content": user_text, "route": route,
+         **({"images": list(images)} if images else {})},
+        {"role": "assistant", "content": answer, "route": route},
+    ]
+    wrapped_pending = (
+        {"workflow": "smart_dispatch", "agent": route, "state": session.pending_state}
+        if session.pending_state else None
+    )
+    return answer, history, wrapped_pending, _merge_usage_parts(parts)
 
 
 def receive_request_result(connection, worker, results, fallback):
@@ -38,7 +243,9 @@ def commit_request_result(message, live, baseline, candidate, results, fallback)
     inserted = []
     if status == 'ok':
         try:
-            inserted = merge_isolated_database(live, baseline, candidate)
+            inserted = merge_isolated_database(
+                live, baseline, candidate, allow_agent_product_memory=True
+            )
         except Exception as exc:
             message = ('error', str(exc), fallback[2], fallback[3], None)
     results.put(('finished', message, inserted))
@@ -132,32 +339,40 @@ def run_isolated_request_result(
 
         database = Database(candidate)
         database.initialize()
-        client = OpenAICompatibleClient(
-            str(client_config.get("api_key", "")),
-            api_url=str(client_config["api_url"]),
-            model=str(client_config["model"]),
-            thinking_enabled=client_config.get("thinking_enabled", False),
-            reasoning_effort=str(client_config.get("reasoning_effort", "low")),
-            timeout=float(client_config["timeout"]),
-            opener=opener,
-        )
-        session = NaturalLanguageSession(
-            database,
-            client,
-            payment_hints=payment_hints,
-            loaded_skill=skill_content,
-            response_language=response_language,
-        )
-        session.history = history_snapshot
-        session.pending_state = pending_snapshot
-        answer = session.handle(user_text, images=images, agent_mode=agent_mode)
-        message = (
-            "ok",
-            answer,
-            session.history,
-            session.pending_state,
-            client.usage_snapshot(),
-        )
+        if agent_mode == "smart":
+            answer, smart_history, smart_pending, smart_usage = _run_smart_assistant_turn(
+                database, candidate, client_config, user_text, history_snapshot,
+                pending_snapshot, payment_hints, skill_content, images,
+                response_language, opener=opener, time_zone=database.get_time_zone(),
+            )
+            message = ("ok", answer, smart_history, smart_pending, smart_usage)
+        else:
+            client = OpenAICompatibleClient(
+                str(client_config.get("api_key", "")),
+                api_url=str(client_config["api_url"]),
+                model=str(client_config["model"]),
+                thinking_enabled=client_config.get("thinking_enabled", False),
+                reasoning_effort=str(client_config.get("reasoning_effort", "low")),
+                timeout=float(client_config["timeout"]),
+                opener=opener,
+            )
+            session = NaturalLanguageSession(
+                database,
+                client,
+                payment_hints=payment_hints,
+                loaded_skill=skill_content,
+                response_language=response_language,
+            )
+            session.history = history_snapshot
+            session.pending_state = pending_snapshot
+            answer = session.handle(user_text, images=images, agent_mode=agent_mode)
+            message = (
+                "ok",
+                answer,
+                session.history,
+                session.pending_state,
+                client.usage_snapshot(),
+            )
     except NaturalLanguageError as exc:
         message = (
             "error",
@@ -223,6 +438,7 @@ def merge_isolated_database(
     baseline_path: str | Path,
     candidate_path: str | Path,
     *,
+    allow_agent_product_memory: bool = False,
     prepare_live_connection: Callable[[sqlite3.Connection], None] | None = None,
     after_live_commit: Callable[[sqlite3.Connection], None] | None = None,
 ) -> list[int]:
@@ -270,6 +486,24 @@ def merge_isolated_database(
                 if candidate_rows[key] != original_row
             ]
             new_keys = set(candidate_rows) - set(baseline_rows)
+            if table == "settings" and (deleted_keys or changed_rows or new_keys):
+                if not allow_agent_product_memory:
+                    raise RequestMergeError(
+                        "请求结果包含不支持的账本变更（settings），本次结果没有写入。"
+                    )
+                if primary_key != ["key"] or "key" not in columns:
+                    raise RequestMergeError("设置表结构无效，本次结果没有写入。")
+                touched_keys = [key[0] for key, _row in changed_rows]
+                touched_keys.extend(key[0] for key in new_keys)
+                if deleted_keys or any(key != _AGENT_PRODUCT_MEMORY_KEY for key in touched_keys):
+                    raise RequestMergeError(
+                        "请求结果包含不支持的账本变更（settings），本次结果没有写入。"
+                    )
+                value_rows = [row for _key, row in changed_rows]
+                value_rows.extend(candidate_rows[key] for key in new_keys)
+                for row in value_rows:
+                    _validate_agent_product_memory(columns, row)
+                allowed_tables.add("settings")
             if (deleted_keys or changed_rows or new_keys) and table not in allowed_tables:
                 raise RequestMergeError(f"请求结果包含不支持的账本变更（{table}），本次结果没有写入。")
             if deleted_keys:
@@ -298,7 +532,7 @@ def merge_isolated_database(
                     f'DELETE FROM "{escaped_table}" WHERE {where}', key
                 )
 
-        for table in ("fx_rates", "transactions", "credit_limit_recovery_points", "food_purchase_items"):
+        for table in ("fx_rates", "transactions", "credit_limit_recovery_points", "food_purchase_items", "settings"):
             for key, row in updates.get(table, []):
                 columns, primary_key, _ = baseline_state[table]
                 key_columns = set(primary_key)
@@ -316,7 +550,7 @@ def merge_isolated_database(
                     (*values, *key),
                 )
 
-        for table in ("fx_rates", "transactions", "credit_limit_recovery_points", "food_purchase_items"):
+        for table in ("fx_rates", "transactions", "credit_limit_recovery_points", "food_purchase_items", "settings"):
             rows = additions.get(table, [])
             if not rows:
                 continue

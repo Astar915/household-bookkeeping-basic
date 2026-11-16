@@ -41,6 +41,18 @@ MAX_LEDGER_DELTA_ROWS = 2000
 MAX_LEDGER_DELTA_BYTES = 2 * 1024 * 1024
 
 
+def _merge_agent_usage(parts: list[dict[str, Any]]) -> dict[str, int] | None:
+    totals: dict[str, int] = {}
+    for part in parts:
+        usage = part.get("usage") if isinstance(part, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        for key, value in usage.items():
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                totals[key] = totals.get(key, 0) + value
+    return totals or None
+
+
 def _ledger_schema_hash(connection: sqlite3.Connection) -> str:
     """Hash the initialized schema, including migrations outside SCHEMA_SQL."""
     schema = connection.execute(
@@ -110,6 +122,8 @@ def _default_config() -> dict[str, Any]:
         "visionAgents": {"bookkeeping": "", "food_health": ""},
         "scope": dict(DEFAULT_BACKUP_SCOPE),
         "billingCycleStartDay": 15,
+        "timeZone": "Asia/Tokyo",
+        "timeZoneConfigured": False,
         # Existing accounts predate the required first-run setup. New OAuth
         # accounts explicitly seed this as False during account creation.
         "onboardingCompleted": True,
@@ -125,7 +139,7 @@ def _default_config() -> dict[str, Any]:
 async def load_mobile_config(database: Any, env: Any, user_id: str) -> dict[str, Any]:
     cfg = _default_config()
     row = await database.prepare(
-        "SELECT encrypted_value FROM user_secrets WHERE user_id=? AND secret_name='mobile-config'"
+        "SELECT encrypted_value,updated_at FROM user_secrets WHERE user_id=? AND secret_name='mobile-config'"
     ).bind(user_id).first()
     if row is not None:
         saved = await decrypt_text(
@@ -135,6 +149,7 @@ async def load_mobile_config(database: Any, env: Any, user_id: str) -> dict[str,
         decoded = json.loads(saved)
         if isinstance(decoded, dict):
             cfg.update(decoded)
+            cfg["timeZoneConfigured"] = bool(decoded.get("timeZoneConfigured", "timeZone" in decoded))
             if int(cfg.get("autoSyncConsentVersion", 0) or 0) < 1:
                 # Earlier releases treated the default as consent. Migrate
                 # those accounts to the safe, opt-in behavior once.
@@ -144,6 +159,8 @@ async def load_mobile_config(database: Any, env: Any, user_id: str) -> dict[str,
     cfg.setdefault("agents", {"bookkeeping": "", "food_health": ""})
     cfg.setdefault("visionAgents", dict(cfg["agents"]))
     cfg.setdefault("cloud", {})
+    from bookkeeping.region_time import normalize_time_zone
+    cfg["timeZone"] = normalize_time_zone(cfg.get("timeZone"))
     if not bool(cfg.get("onboardingCompleted", True)) and not cfg.get("onboardingStage"):
         cfg["onboardingStage"] = "base"
     try:
@@ -157,7 +174,7 @@ async def load_mobile_config(database: Any, env: Any, user_id: str) -> dict[str,
     # Keep it encrypted at rest and merge it into the existing mobile setting
     # shape expected by the full UI.
     sync_row = await database.prepare(
-        "SELECT encrypted_value FROM user_secrets WHERE user_id=? AND secret_name='github-sync'"
+        "SELECT encrypted_value,updated_at FROM user_secrets WHERE user_id=? AND secret_name='github-sync'"
     ).bind(user_id).first()
     if sync_row is not None:
         raw = await decrypt_text(
@@ -177,7 +194,175 @@ async def load_mobile_config(database: Any, env: Any, user_id: str) -> dict[str,
                 if github.get(field):
                     merged[field] = github[field]
             cfg["cloud"]["github"] = merged
+            # A successful reauthorization refreshes the dedicated token secret,
+            # while an older autoStatus may still say that GitHub needs reconnecting.
+            # Hide only that stale message when the credential is newer than the
+            # settings snapshot; a later sync failure writes a newer config again.
+            status = str(cfg.get("autoStatus") or "")
+            if status.startswith("GitHub 授权需要重新连接") and row is not None:
+                try:
+                    config_updated = datetime.fromisoformat(str(_field(row, "updated_at")).replace("Z", "+00:00"))
+                    credential_updated = datetime.fromisoformat(str(_field(sync_row, "updated_at")).replace("Z", "+00:00"))
+                    if credential_updated > config_updated:
+                        cfg["autoStatus"] = ""
+                except (TypeError, ValueError):
+                    pass
     return cfg
+
+
+async def _complete_unchanged_cloud_upload(
+    database: Any,
+    env: Any,
+    user_id: str,
+    action: str,
+    data: dict[str, Any],
+    job_id: str,
+    *,
+    provider_replies: list[dict[str, Any]] | None = None,
+    expected_revision: str | None = None,
+):
+    """Finish a verified no-op cloud upload without restoring D1 file chunks."""
+    if action not in {"cloud_upload", "cloud_auto_sync"}:
+        return None
+    from bookkeeping.backup_scope import normalize_backup_scope
+    from bookkeeping.gitee_sync import GiteeClient
+    from bookkeeping.github_sync import GITHUB_APP_CLIENT_ID, GitHubClient
+    from model_jobs import ReplayOpener
+
+    root_revision, backup_revision = await D1SnapshotStore(
+        database
+    ).read_backup_content_revision(user_id)
+    if expected_revision and str(expected_revision) != root_revision:
+        raise SnapshotConflict("云端账本已更新；本次备份检查已取消，请刷新后重试。")
+
+    config = await load_mobile_config(database, env, user_id)
+    original_config = copy.deepcopy(config)
+    if action == "cloud_upload":
+        provider = str(data.get("provider", "github")).lower()
+        if provider not in {"github", "gitee"}:
+            return None
+        if not data.get("automatic") and data.get("confirmed") is not True:
+            raise RuntimeError("请确认此操作后重试。")
+        providers = [provider]
+    else:
+        providers = [
+            name for name in ("github", "gitee")
+            if isinstance(config.get("cloud", {}).get(name), dict)
+            and config["cloud"][name].get("token")
+        ]
+        if not providers:
+            return None
+
+    scope_hash = hashlib.sha256(json.dumps(
+        normalize_backup_scope(config.get("scope")), ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    opener = ReplayOpener(list(provider_replies or []), expected_revision or root_revision)
+    for provider in providers:
+        saved = config.get("cloud", {}).get(provider, {})
+        repository = str(saved.get("repository", ""))
+        checkpoint = saved.get("snapshotCheckpoint")
+        if (not saved.get("token") or not repository or not isinstance(checkpoint, dict)
+                or checkpoint.get("repository") != repository
+                or checkpoint.get("backupRevision") != backup_revision
+                or checkpoint.get("scopeHash") != scope_hash
+                or not checkpoint.get("manifestSha")
+                or saved.get("lastSha") != checkpoint.get("manifestSha")):
+            return None
+
+        if provider == "github":
+            client = GitHubClient(
+                str(saved.get("token", "")),
+                refresh_token=str(saved.get("refresh_token", "")),
+                client_id=str(saved.get("client_id") or GITHUB_APP_CLIENT_ID),
+                opener=opener,
+            )
+        else:
+            client = GiteeClient(str(saved.get("token", "")), opener=opener)
+        known_sha = str(checkpoint["manifestSha"])
+        etag = str(checkpoint.get("manifestEtag") or "")
+        _manifest, remote_sha, remote_etag, unchanged = client.read_snapshot_manifest(
+            repository, etag=etag if provider == "github" else None,
+        )
+        if unchanged:
+            remote_sha = known_sha
+        if remote_sha != known_sha:
+            return None
+
+        refreshed = dict(checkpoint)
+        if remote_etag:
+            refreshed["manifestEtag"] = remote_etag
+        saved.update(
+            lastSha=known_sha,
+            token=client.token,
+            refresh_token=getattr(client, "refresh_token", ""),
+            snapshotCheckpoint=refreshed,
+        )
+
+    result = (
+        {"message": "云端备份已是最新，无需上传。", "unchanged": True}
+        if action == "cloud_upload"
+        else {
+            "message": "云端自动备份完成。",
+            "providers": [(name, True, "云端备份已是最新，无需上传。") for name in providers],
+        }
+    )
+    if action == "cloud_auto_sync":
+        config["autoStatus"] = "云端自动备份完成。"
+
+    statements = [database.prepare(
+        "UPDATE app_jobs SET state='done',message='已完成',result_json=?,updated_at=? "
+        "WHERE user_id=? AND operation_id=? AND state='running' AND cancel_requested=0 "
+        "AND EXISTS (SELECT 1 FROM user_state_roots WHERE user_id=? AND revision=?)"
+    ).bind(
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")), _now(),
+        user_id, job_id, user_id, root_revision,
+    )]
+    if action == "cloud_auto_sync":
+        statements.append(database.prepare(
+            "UPDATE auto_sync_queue SET state='done',operation_id=NULL,attempts=0,updated_at=? "
+            "WHERE user_id=? AND operation_id=? AND EXISTS "
+            "(SELECT 1 FROM user_state_roots WHERE user_id=? AND revision=?)"
+        ).bind(_now(), user_id, job_id, user_id, root_revision))
+
+    if config != original_config:
+        encoded_config = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+        encrypted_config = await encrypt_text(
+            encoded_config, str(env.TOKEN_ENCRYPTION_KEY), "user:" + user_id + ":mobile-config",
+        )
+        statements.append(database.prepare(
+            "INSERT INTO user_secrets(user_id,secret_name,encrypted_value,updated_at) "
+            "SELECT ?,'mobile-config',?,? WHERE EXISTS "
+            "(SELECT 1 FROM user_state_roots WHERE user_id=? AND revision=?) "
+            "ON CONFLICT(user_id,secret_name) DO UPDATE SET "
+            "encrypted_value=excluded.encrypted_value,updated_at=excluded.updated_at"
+        ).bind(user_id, encrypted_config, _now(), user_id, root_revision))
+
+        before_github = original_config.get("cloud", {}).get("github", {})
+        current_github = config.get("cloud", {}).get("github", {})
+        credentials_changed = any(
+            before_github.get(key, "") != current_github.get(key, "")
+            for key in ("token", "refresh_token")
+        )
+        if current_github.get("token") and credentials_changed:
+            encrypted_github = await encrypt_text(
+                json.dumps(current_github, ensure_ascii=False, separators=(",", ":")),
+                str(env.TOKEN_ENCRYPTION_KEY), "user:" + user_id + ":github-sync",
+            )
+            statements.append(database.prepare(
+                "INSERT INTO user_secrets(user_id,secret_name,encrypted_value,updated_at) "
+                "SELECT ?,'github-sync',?,? WHERE EXISTS "
+                "(SELECT 1 FROM user_state_roots WHERE user_id=? AND revision=?) "
+                "ON CONFLICT(user_id,secret_name) DO UPDATE SET "
+                "encrypted_value=excluded.encrypted_value,updated_at=excluded.updated_at"
+            ).bind(user_id, encrypted_github, _now(), user_id, root_revision))
+
+    committed = await database.batch(statements)
+    first = committed[0] if committed else None
+    meta = _field(first, "meta") if first is not None else None
+    if int(_field(meta, "changes") if meta is not None else 0) != 1:
+        raise SnapshotConflict("云端账本已更新；本次备份没有覆盖新版本，请刷新后重试。")
+    return result
 
 
 async def first_run_setup_required(database: Any, env: Any, user_id: str) -> bool:
@@ -332,16 +517,34 @@ class WorkerMobileWorkspace(MobileWorkspace):
     def after_write(self, uid):
         self.generations[uid] = self.generations.get(uid, 0) + 1
         self.pending_ledger_changes.extend(read_pending_changes(Path(str(self.db_path(uid)))))
-        try:
-            folder = self.folder(uid) / "backups"
-            from bookkeeping.web_features import today
-            day_stamp = today().replace("-", "")
-            if not any(folder.glob(f"automatic-{day_stamp}-*.zip")):
-                self.backup(uid, "automatic", full=True)
-            for old in sorted(folder.glob("automatic-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)[50:]:
-                old.unlink(missing_ok=True)
-        except Exception:
-            self.auto_status[uid] = "记账已保存，但自动备份失败，请手动备份。"
+
+    def backups(self, uid):
+        """List backup metadata from D1 without loading archive bytes."""
+        if uid != self._uid:
+            raise ValueError("账号隔离校验失败。")
+        import re
+        manifest = getattr(self, "_backup_manifest", {})
+        prefix = f"mobile/{uid}/backups/"
+        rows = []
+        from datetime import datetime
+        from bookkeeping.web_features import JST
+        for path, entry in manifest.items():
+            if not D1SnapshotStore._is_backup_archive(uid, path) or not isinstance(entry, dict):
+                continue
+            name = path[len(prefix):]
+            if not name or "/" in name:
+                continue
+            match = re.search(r"(\d{8}-\d{6})", name)
+            try:
+                stamp = datetime.strptime(match.group(1), "%Y%m%d-%H%M%S").replace(tzinfo=JST) if match else datetime.fromtimestamp(0, JST)
+            except (TypeError, ValueError, OverflowError):
+                stamp = datetime.fromtimestamp(0, JST)
+            rows.append({
+                "name": name,
+                "size": str(int(entry.get("size", 0) or 0)),
+                "date": stamp.isoformat(),
+            })
+        return sorted(rows, key=lambda item: item["date"], reverse=True)[:100]
 
     def public_settings(self, uid):
         value = super().public_settings(uid)
@@ -379,29 +582,46 @@ class WorkerMobileWorkspace(MobileWorkspace):
         from bookkeeping.request_worker import run_isolated_request_result, merge_isolated_database
         from bookkeeping.storage import LedgerError
         from model_jobs import ReplayOpener
+        import re
 
-        agent = str(data.get("agent", "bookkeeping"))
-        if agent not in {"bookkeeping", "food_health"}:
+        requested_agent = str(data.get("agent", "bookkeeping"))
+        if requested_agent not in {"bookkeeping", "food_health", "ledger_query"}:
             raise LedgerError("Agent 无效。")
-        key = (uid, agent)
+        conversation_id = str(data.get("conversationId", "") or "").strip()
+        if requested_agent == "ledger_query" and not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", conversation_id):
+            raise LedgerError("对话版本已更新，请刷新页面后重新发送。")
+        if conversation_id and not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", conversation_id):
+            raise LedgerError("对话编号无效，请刷新页面后重试。")
+
+        def conversation_for(agent_name):
+            saved = self.conversations.get((uid, agent_name), {})
+            if not isinstance(saved, dict):
+                return {}
+            if not conversation_id:
+                return saved
+            # Older saved conversations have no ID. They belong to the one
+            # visible legacy transcript only; a fresh browser session must not
+            # inherit their pending clarification or profile selection.
+            saved_id = str(saved.get("conversationId") or "legacy")
+            return saved if saved_id == conversation_id else {}
+
+        agent = requested_agent
         config = self.config(uid)
-        state = self.conversations.get(key, {})
         incoming = data.get("images", [])
         if not isinstance(incoming, list) or len(incoming) > 5:
             raise LedgerError("最多上传5张图片。")
         use_vision = bool(incoming)
-        profile_id = state.get("profileId") if state.get("pending") else (
-            config["visionAgents" if use_vision else "agents"].get(agent)
+        profile_agent = "bookkeeping" if agent == "ledger_query" else agent
+        key = (uid, agent)
+        state = conversation_for(agent) if agent != "ledger_query" else {}
+        profile_id = state.get("profileId") if state.get("pending") and agent != "ledger_query" else (
+            config["visionAgents" if use_vision else "agents"].get(profile_agent)
         )
         profile = next((item for item in config["profiles"] if item["id"] == profile_id), None)
         if not profile:
             raise LedgerError("请先在设置中配置并分配 Agent 的 API 服务。")
         self._check_endpoint(profile.get("api_url", ""))
 
-        stores = self.stores(uid)
-        skill_store = stores["bookkeeping_skill_store" if agent == "bookkeeping" else "food_skill_store"]
-        loaded = skill_store.load()
-        hints = stores["payment_store"].load().get("profiles", [])
         expected_revision = getattr(self, "_provider_expected_revision", None)
         if not expected_revision:
             raise LedgerError("云端请求缺少账本版本校验；本次操作未写入。")
@@ -443,12 +663,119 @@ class WorkerMobileWorkspace(MobileWorkspace):
                 ) == "1",
             }
             opener = ReplayOpener(replay, expected_revision)
+            query_text = str(data.get("text", ""))[:24000]
+            manager_route = ""
+            usage_parts = []
+            if requested_agent == "ledger_query":
+                from agent_manager import route_assistant_turn
+
+                routed = route_assistant_turn(
+                    client_config,
+                    query_text,
+                    str(data.get("language", "zh-CN")),
+                    data.get("history", []) if isinstance(data.get("history", []), list) else [],
+                    prepared_images,
+                    opener=opener,
+                )
+                manager_route = routed["route"]
+                if routed.get("usage"):
+                    usage_parts.append({
+                        "agent": "bookkeeping", "vision": use_vision,
+                        "usage": routed["usage"],
+                    })
+                if manager_route == "chat":
+                    return {
+                        "answer": routed["reply"], "pending": False,
+                        "transactionIds": [], "usage": routed.get("usage"),
+                        "usageAgent": "bookkeeping", "usageBreakdown": usage_parts,
+                        "agent": "ledger_query", "routedAgent": "chat", "readOnly": True,
+                    }
+                if manager_route == "ledger_query":
+                    from ledger_query import run_ledger_query
+
+                    query_result = run_ledger_query(
+                        str(self.db_path(uid)), client_config, query_text,
+                        str(data.get("language", "zh-CN")), opener=opener,
+                        request_now=(_job or {}).get("request_now"),
+                        cycle_start_day=int(config.get("billingCycleStartDay", 15)),
+                        time_zone=config.get("timeZone"),
+                        history=data.get("history", []) if isinstance(data.get("history", []), list) else [],
+                    )
+                    if query_result.get("usage"):
+                        usage_parts.append({
+                            "agent": "bookkeeping", "vision": False,
+                            "usage": query_result["usage"],
+                        })
+                    return {
+                        "answer": query_result["answer"], "pending": False,
+                        "transactionIds": [], "usage": _merge_agent_usage(usage_parts),
+                        "usageAgent": "bookkeeping", "usageBreakdown": usage_parts,
+                        "agent": "ledger_query", "routedAgent": "ledger_query",
+                        "readOnly": True,
+                    }
+
+                # The router selected an existing write-capable specialist.
+                # Keep its own durable conversation/pending confirmation state,
+                # while the browser presents the unified chat transcript.
+                agent = manager_route
+                key = (uid, agent)
+                state = conversation_for(agent)
+                profile_agent = agent
+                profile_id = state.get("profileId") if state.get("pending") else (
+                    config["visionAgents" if use_vision else "agents"].get(profile_agent)
+                )
+                profile = next((item for item in config["profiles"] if item["id"] == profile_id), None)
+                if not profile:
+                    raise LedgerError("请先在设置中配置并分配该 Agent 的 API 服务。")
+                self._check_endpoint(profile.get("api_url", ""))
+                client_config = {
+                    **profile,
+                    "timeout": 300,
+                    "thinking_enabled": profile.get("thinking_enabled", False),
+                    "reasoning_effort": profile.get("reasoning_effort", "low"),
+                    "show_diagnostic_locations": str(
+                        getattr(getattr(self, "_env", None), "WORKFLOW_LOCAL_INLINE", "")
+                    ) == "1",
+                }
+
+            stores = self.stores(uid)
+            skill_store = stores["bookkeeping_skill_store" if profile_agent == "bookkeeping" else "food_skill_store"]
+            loaded = skill_store.load()
+            hints = stores["payment_store"].load().get("profiles", [])
+            if manager_route and manager_route in {"bookkeeping", "food_health"}:
+                usage_agent = manager_route
+            else:
+                usage_agent = agent
+
+            if agent == "ledger_query":
+                from ledger_query import run_ledger_query
+
+                query_result = run_ledger_query(
+                    str(self.db_path(uid)), client_config, query_text,
+                    str(data.get("language", "zh-CN")), opener=opener,
+                    request_now=(_job or {}).get("request_now"),
+                    cycle_start_day=int(config.get("billingCycleStartDay", 15)),
+                    time_zone=config.get("timeZone"),
+                    history=data.get("history", []) if isinstance(data.get("history", []), list) else [],
+                )
+                return {
+                    "answer": query_result["answer"],
+                    "pending": False,
+                    "transactionIds": [],
+                    "usage": query_result.get("usage"),
+                    "usageAgent": "bookkeeping",
+                    "usageBreakdown": usage_parts,
+                    "agent": agent,
+                    "routedAgent": "ledger_query",
+                    "readOnly": True,
+                }
             status, answer, history, pending, usage = run_isolated_request_result(
                 str(self.db_path(uid)), str(baseline), str(candidate), client_config,
-                str(data.get("text", ""))[:24000], state.get("history", []),
+                query_text, state.get("history", []),
                 state.get("pending"), hints, loaded["content"] if loaded else "",
                 prepared_images, agent, data.get("language", "zh-CN"), opener=opener,
                 request_now=(_job or {}).get("request_now"),
+                time_zone=config.get("timeZone"),
             )
             if status != "ok":
                 raise LedgerError(answer)
@@ -470,6 +797,7 @@ class WorkerMobileWorkspace(MobileWorkspace):
 
             changed = merge_isolated_database(
                 live_path, baseline, candidate,
+                allow_agent_product_memory=True,
                 prepare_live_connection=install_change_tracking,
                 after_live_commit=persist_agent_row_changes,
             )
@@ -498,17 +826,28 @@ class WorkerMobileWorkspace(MobileWorkspace):
                 "history": persisted_history,
                 "pending": pending,
                 "profileId": profile_id,
+                "conversationId": conversation_id or str(state.get("conversationId") or "legacy"),
                 # Cloud mode intentionally does not archive receipt images.
                 "receiptImages": [],
             }
             if changed and not ((_job or {}).get("defer_write")):
                 self.after_write(uid)
+            if usage:
+                usage_parts.append({
+                    "agent": agent,
+                    "vision": use_vision,
+                    "usage": usage,
+                })
+            response_usage = _merge_agent_usage(usage_parts) if requested_agent == "ledger_query" else usage
             return {
                 "answer": answer,
                 "pending": pending is not None,
                 "transactionIds": changed,
-                "usage": usage,
+                "usage": response_usage,
+                "usageAgent": usage_agent,
+                "usageBreakdown": usage_parts,
                 "agent": agent,
+                "routedAgent": manager_route or agent,
             }
 
     def _cloud_remote(self, uid, action, data):
@@ -517,12 +856,11 @@ class WorkerMobileWorkspace(MobileWorkspace):
         from model_jobs import ModelRequestRequired
         from bookkeeping.cloud_pull import CloudPullConflict, PullState, automatic_pull, local_revision
         from bookkeeping.github_sync import (
-            GITHUB_APP_CLIENT_ID, GitHubClient, GitHubSyncConflict,
+            GITHUB_APP_CLIENT_ID, GitHubAuthError, GitHubClient, GitHubSyncConflict,
             sync_bundle_created_at,
         )
-        from bookkeeping.gitee_sync import (
-            GiteeClient, GiteeSyncConflict, MAX_GITEE_SYNC_BUNDLE_BYTES,
-        )
+        from bookkeeping.gitee_sync import GiteeClient, GiteeSyncConflict
+        from bookkeeping.sync_snapshot import build_snapshot
         from bookkeeping.storage import LedgerError
 
         provider = "github" if action == "github_auth" else str(data.get("provider", "github")).lower()
@@ -544,8 +882,25 @@ class WorkerMobileWorkspace(MobileWorkspace):
                     outcomes.append((selected_provider, True, outcome.get("message", "上传完成。")))
                 except ModelRequestRequired:
                     raise
-                except Exception:
-                    outcomes.append((selected_provider, False, "自动备份未完成，请检查网络、授权或云端版本。账目已保存。"))
+                except Exception as exc:
+                    import traceback
+                    frames = traceback.extract_tb(exc.__traceback__)
+                    locations = " -> ".join(
+                        f"{frame.filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.lineno}"
+                        for frame in frames[-5:]
+                    )
+                    print(
+                        f"Automatic cloud backup failed "
+                        f"(provider={selected_provider}, error={type(exc).__name__}, at={locations})."
+                    )
+                    if selected_provider == "github" and isinstance(exc, GitHubAuthError):
+                        failure_message = (
+                            "GitHub 授权需要重新连接。请到“更多 → 设置 → 备份”点击“连接 / 重新授权”，"
+                            "然后上传备份；账目仍保存在网页版云端。"
+                        )
+                    else:
+                        failure_message = "自动备份未完成，请检查网络、授权或云端版本。账目已保存。"
+                    outcomes.append((selected_provider, False, failure_message))
             updated = self.config(uid)
             successful = sum(1 for _provider, ok, _message in outcomes if ok)
             failed = sum(1 for _provider, ok, _message in outcomes if not ok)
@@ -554,7 +909,8 @@ class WorkerMobileWorkspace(MobileWorkspace):
             elif failed and successful:
                 status = "部分云端自动备份未完成，请检查连接状态。账目已保存。"
             elif failed:
-                status = "云端自动备份未完成，请检查网络、授权或云端版本。账目已保存。"
+                messages = [message for _provider, ok, message in outcomes if not ok]
+                status = "；".join(messages) or "云端自动备份未完成，请检查连接状态。账目已保存。"
             else:
                 status = "云端自动备份完成。"
             updated["autoStatus"] = status
@@ -564,10 +920,24 @@ class WorkerMobileWorkspace(MobileWorkspace):
         def make_client(selected_provider, cloud, supplied_token=""):
             token = str(supplied_token or cloud.get("token", ""))
             if selected_provider == "github":
+                repository_for_tokens = str(cloud.get("repository", ""))
+
+                class RuntimeGitHubTokenStore:
+                    """Stage rotated OAuth tokens with the job config, even if a later sync step fails."""
+
+                    def save(_self, access_token, refresh_token=""):
+                        current = self.config(uid)
+                        selected = current.get("cloud", {}).get("github", {})
+                        if selected.get("repository") != repository_for_tokens:
+                            return
+                        selected.update(token=access_token, refresh_token=refresh_token)
+                        self.save_config(uid, current)
+
                 return GitHubClient(
                     token,
                     refresh_token=str(cloud.get("refresh_token", "")),
                     client_id=str(cloud.get("client_id") or GITHUB_APP_CLIENT_ID),
+                    token_store=RuntimeGitHubTokenStore(),
                     opener=opener,
                 )
             return GiteeClient(token, opener=opener)
@@ -580,7 +950,7 @@ class WorkerMobileWorkspace(MobileWorkspace):
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", name):
                 raise LedgerError("仓库名无效。")
             repository, _created = client.ensure_private_repository(str(identity.get("login", "")), name)
-            sha = client.bundle_sha(repository)
+            sha = client.cloud_revision(repository)
             config.setdefault("cloud", {})[provider] = {
                 "token": client.token,
                 "refresh_token": getattr(client, "refresh_token", ""),
@@ -618,6 +988,7 @@ class WorkerMobileWorkspace(MobileWorkspace):
                         raise LedgerError("下载期间云端连接已改变，请重试。")
                     selected.update(lastSha=sha, token=selected_client.token,
                                     refresh_token=getattr(selected_client, "refresh_token", ""))
+                    selected.pop("snapshotCheckpoint", None)
                     self.save_config(uid, updated)
 
                 candidates.append((selected_provider, cloud["repository"], client, persist_remote))
@@ -627,6 +998,7 @@ class WorkerMobileWorkspace(MobileWorkspace):
                     PullState(self.folder(uid) / "cloud_pull_state.json"),
                     lambda body, source: self.restore(uid, body, source)["backup"],
                     stores=self.stores(uid), lock=self.lock(uid), cancelled=lambda: False,
+                    incremental_snapshots=True,
                 )
             except CloudPullConflict:
                 # This is a source-selection decision, not a network failure.
@@ -673,33 +1045,71 @@ class WorkerMobileWorkspace(MobileWorkspace):
         elif action == "cloud_upload":
             if not data.get("automatic"):
                 self._confirmed(data)
-            sync_revision = local_revision(self.db_path(uid), **self.stores(uid))
-            name, body = self.backup(uid, "upload")
-            if provider == "gitee" and len(body) > MAX_GITEE_SYNC_BUNDLE_BYTES:
-                raise LedgerError("备份包超过 Gitee 容量限制。")
-            if data.get("automatic"):
-                # D1 is the live ledger. On return/write, the user asked for
-                # this current web snapshot to be uploaded, so a stale
-                # lastSha must not turn an ordinary background backup into a
-                # restore/download prompt. The provider updates the existing
-                # file as a new commit, retaining its previous versions in
-                # repository history. Read the current file revision inside
-                # upload_bundle and retry brief concurrent writes safely.
-                conflict_types = (GitHubSyncConflict, GiteeSyncConflict)
-                for attempt in range(3):
-                    try:
-                        sha = client.upload_bundle(repository, body)
-                        break
-                    except conflict_types as exc:
-                        if attempt == 2:
-                            raise LedgerError(
-                                "云端文件正在被其他设备连续更新，本次自动备份稍后重试；网页版账本未被更改。"
-                            ) from exc
-            else:
-                sha = client.upload_bundle(
-                    repository, body, expected_sha=client.bundle_sha(repository),
+            from bookkeeping.backup_scope import normalize_backup_scope
+            snapshot_scope = normalize_backup_scope(config.get("scope"))
+            scope_hash = hashlib.sha256(json.dumps(
+                snapshot_scope, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            backup_revision = str(getattr(self, "_backup_content_revision", "") or "")
+            checkpoint = saved.get("snapshotCheckpoint")
+            if not backup_revision:
+                backup_revision = local_revision(self.db_path(uid), **self.stores(uid))
+            if (isinstance(checkpoint, dict)
+                    and checkpoint.get("repository") == repository
+                    and checkpoint.get("backupRevision") == backup_revision
+                    and checkpoint.get("scopeHash") == scope_hash
+                    and checkpoint.get("manifestSha")
+                    and saved.get("lastSha") == checkpoint.get("manifestSha")):
+                previous_sha = str(checkpoint["manifestSha"])
+                previous_etag = str(checkpoint.get("manifestEtag") or "")
+                _remote_manifest, remote_sha, remote_etag, remote_unchanged = client.read_snapshot_manifest(
+                    repository, etag=previous_etag if provider == "github" else None,
                 )
-            result = {"message": "上传完成。", "backup": name}
+                if remote_unchanged:
+                    remote_sha = previous_sha
+                if remote_sha == previous_sha:
+                    previous_selected = copy.deepcopy(saved)
+                    selected = config.setdefault("cloud", {}).setdefault(provider, {})
+                    refreshed_checkpoint = dict(checkpoint)
+                    if remote_etag:
+                        refreshed_checkpoint["manifestEtag"] = remote_etag
+                    selected.update(
+                        lastSha=previous_sha,
+                        token=client.token,
+                        refresh_token=getattr(client, "refresh_token", ""),
+                        snapshotCheckpoint=refreshed_checkpoint,
+                    )
+                    if selected != previous_selected:
+                        self.save_config(uid, config)
+                    return {"message": "云端备份已是最新，无需上传。", "unchanged": True}
+            sync_revision = local_revision(self.db_path(uid), **self.stores(uid))
+            previous_manifest, manifest_sha, manifest_etag, _unchanged = client.read_snapshot_manifest(repository)
+            expected_sha = manifest_sha or client.bundle_sha(repository)
+            stores = self.stores(uid)
+            try:
+                plan = build_snapshot(
+                    self.db_path(uid),
+                    payment_store=stores["payment_store"],
+                    bookkeeping_skill_store=stores["bookkeeping_skill_store"],
+                    food_skill_store=stores["food_skill_store"],
+                    receipt_image_directory=stores["receipt_image_directory"],
+                    include_scope=config.get("scope"),
+                    include_receipt_images=self.receipt_image_archive_enabled(),
+                    previous_manifest=previous_manifest,
+                    created_at=getattr(self, "_backup_created_at", None),
+                )
+                sha = client.upload_snapshot(repository, plan, expected_sha=expected_sha)
+                manifest_etag = getattr(client, "snapshot_manifest_etag", None) or manifest_etag
+            except (GitHubSyncConflict, GiteeSyncConflict) as exc:
+                raise LedgerError(
+                    "云端备份在本次操作期间被其他设备更新；本机账本没有被覆盖，请刷新后再同步。"
+                ) from exc
+            if plan.unchanged:
+                result = {"message": "云端分区备份已是最新。", "unchanged": True}
+            else:
+                result = {"message": "分区备份已上传。", "backup": "分区快照",
+                          "updatedFiles": len(plan.changed), "deletedFiles": len(plan.deleted)}
         else:
             raise LedgerError("备份操作无效。")
 
@@ -709,9 +1119,29 @@ class WorkerMobileWorkspace(MobileWorkspace):
             raise LedgerError("操作期间云端连接已改变；本次设置没有覆盖新连接。")
         selected.update(lastSha=sha, token=client.token,
                         refresh_token=getattr(client, "refresh_token", ""))
+        if action == "cloud_upload":
+            from bookkeeping.backup_scope import normalize_backup_scope
+            snapshot_scope = normalize_backup_scope(updated.get("scope"))
+            scope_hash = hashlib.sha256(json.dumps(
+                snapshot_scope, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            backup_revision = str(getattr(self, "_backup_content_revision", "") or sync_revision)
+            snapshot_checkpoint = {
+                "repository": repository,
+                "backupRevision": backup_revision,
+                "scopeHash": scope_hash,
+                "manifestSha": sha,
+            }
+            if manifest_etag:
+                snapshot_checkpoint["manifestEtag"] = manifest_etag
+            selected["snapshotCheckpoint"] = snapshot_checkpoint
+        else:
+            selected.pop("snapshotCheckpoint", None)
         self.save_config(uid, updated)
         PullState(self.folder(uid) / "cloud_pull_state.json").synced(
-            provider, repository, sha, sync_revision, sync_bundle_created_at(body),
+            provider, repository, sha, sync_revision,
+            plan.created_at if action == "cloud_upload" else sync_bundle_created_at(body),
         )
         return result
 
@@ -827,7 +1257,12 @@ class LedgerWorkspace:
     def workspace(self, config, conversations):
         # WorkerMobileWorkspace deliberately skips MobileWorkspace.__init__,
         # which would start an unsupported thread and create a local key file.
-        return WorkerMobileWorkspace(self.root, self.user_id, config, conversations)
+        workspace = WorkerMobileWorkspace(self.root, self.user_id, config, conversations)
+        workspace._backup_content_revision = (
+            self.store.backup_content_revision or self.revision
+        )
+        workspace._backup_manifest = self.store.manifest
+        return workspace
 
     def files_after(self) -> dict[str, bytes]:
         collected: dict[str, bytes] = {}
@@ -950,9 +1385,22 @@ class LedgerWorkspace:
         no_auto_sync_actions = {
             "cloud_upload", "cloud_auto_sync", "cloud_restore", "cloud_connect",
             "github_auth", "startup_pull", "cloud_disconnect", "keep_local_cloud",
-            "onboarding_save",
-            "settings",
         }
+        auto_sync_providers = (result or {}).get("providers", [])
+        auto_sync_failed = bool(
+            job_action == "cloud_auto_sync"
+            and (
+                any(
+                    isinstance(provider_result, (list, tuple))
+                    and len(provider_result) > 1
+                    and not bool(provider_result[1])
+                    for provider_result in auto_sync_providers
+                )
+                or str((result or {}).get("message", "")).startswith((
+                    "云端自动备份未完成", "部分云端自动备份未完成",
+                ))
+            )
+        )
         committed = await self.store.commit(
             self.user_id, self.revision, old_files, new_files,
             final_statements=build_final_statements if (workspace._config_dirty or persist_conversations) else [],
@@ -960,15 +1408,20 @@ class LedgerWorkspace:
             job_id=job_id, job_result_json=encoded_result,
             queue_auto_sync=(
                 bool(workspace.config(self.user_id).get("autoSync", False))
+                and not bool((result or {}).get("readOnly"))
                 and not (job_id and job_action in no_auto_sync_actions)
             ),
             auto_sync_complete_operation_id=job_id if job_action == "cloud_auto_sync" else None,
+            auto_sync_failed=auto_sync_failed,
             ledger_row_changes=pending_changes if enable_row_storage and not rebase_rows else [],
             ledger_storage_meta={"schemaHash": schema_hash} if enable_row_storage and rebase_rows else None,
             clear_ledger_row_deltas=rebase_rows,
         )
         self.revision = committed
         self.files = new_files
+        workspace._backup_content_revision = (
+            self.store.backup_content_revision or committed
+        )
         self.ledger_rows_enabled = enable_row_storage
         self.ledger_schema_hash = schema_hash if enable_row_storage else self.ledger_schema_hash
         self.ledger_rebase_needed = False
@@ -978,8 +1431,11 @@ class LedgerWorkspace:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-def _bootstrap_payload(db, user, language, transaction_ids=None):
+def _bootstrap_payload(db, user, language, transaction_ids=None, time_zone="Asia/Tokyo"):
     from bookkeeping.web_features import today
+    from bookkeeping.region_time import normalize_time_zone
+    time_zone = normalize_time_zone(time_zone)
+    db.time_zone = time_zone
     account_rows = db.connection.execute(
         "SELECT a.id,a.name,a.account_type,a.currency,a.opening_date,c.minor_digits "
         "FROM accounts a JOIN currencies c ON c.code=a.currency ORDER BY a.name COLLATE NOCASE"
@@ -1025,7 +1481,7 @@ def _bootstrap_payload(db, user, language, transaction_ids=None):
                           "to_amount_minor": str(row["to_amount_minor"]) if row["to_amount_minor"] is not None else None,
                           "account_amount_minor": str(row["account_amount_minor"]) if row["account_amount_minor"] is not None else None}
                          for row in transactions],
-        "serverDate": today(),
+        "serverDate": today(time_zone), "timeZone": time_zone,
     }
     return payload
 
@@ -1041,7 +1497,7 @@ async def bootstrap(database: Any, user: dict[str, str], language: str, env: Any
         workspace = state.workspace(config, await state.load_conversations())
         db = Database(state.root / "ledgers" / f"{user_id}.sqlite3")
         try:
-            payload = _bootstrap_payload(db, user, language)
+            payload = _bootstrap_payload(db, user, language, time_zone=config.get("timeZone"))
         finally:
             db.close()
         payload["user"] = user
@@ -1050,6 +1506,21 @@ async def bootstrap(database: Any, user: dict[str, str], language: str, env: Any
         return serial(payload)
     finally:
         state.cleanup()
+
+
+async def workspace_revision(database: Any, user_id: str, env: Any = None):
+    """Return lightweight cache validators without restoring the workspace."""
+    revision, updated_at = await D1SnapshotStore(database).read_revision(user_id)
+    # The root revision advances for both ledger and settings changes. Reuse it
+    # as the config validator so returning to a tab reads only the one index
+    # row, not user_secrets or a restored workspace. The browser derives the
+    # regional calendar date from this server UTC instant and its cached zone.
+    return {
+        "revision": revision,
+        "updatedAt": updated_at,
+        "configRevision": revision,
+        "serverTime": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
 
 
 async def workspace_snapshot(database: Any, user_id: str, language="zh-CN", report_date=None, env=None, *, bootstrap_user=None):
@@ -1069,7 +1540,7 @@ async def workspace_snapshot(database: Any, user_id: str, language="zh-CN", repo
             # decrypting the same D1 snapshot for a parallel bootstrap request.
             db = Database(state.root / "ledgers" / f"{user_id}.sqlite3")
             try:
-                snapshot["bootstrap"] = _bootstrap_payload(db, bootstrap_user, language)
+                snapshot["bootstrap"] = _bootstrap_payload(db, bootstrap_user, language, time_zone=cfg.get("timeZone"))
             finally:
                 db.close()
         for report in (snapshot, snapshot.get("reports", {})):
@@ -1089,18 +1560,19 @@ async def workspace_snapshot(database: Any, user_id: str, language="zh-CN", repo
 
 def _save_web_account(db, data):
     from bookkeeping.storage import LedgerError, parse_date, to_minor_allow_zero
+    from bookkeeping.region_time import regional_today
     name = str(data.get("name", "")).strip()
     account_type = str(data.get("type", ""))
     currency = str(data.get("currency", "")).upper()
     opening_balance = str(data.get("openingBalance", "0")).strip()
-    opening_date = str(data.get("openingDate", datetime.now(timezone.utc).date().isoformat()))
+    opening_date = str(data.get("openingDate", regional_today(getattr(db, "time_zone", "Asia/Tokyo"))))
     existing = db.connection.execute("SELECT * FROM accounts WHERE name=?", (name,)).fetchone()
     if existing is not None:
         curr = db.currency(currency)
         expected = to_minor_allow_zero(opening_balance, currency, int(curr["minor_digits"]))
         if (str(existing["account_type"]) == account_type and str(existing["currency"]) == currency
                 and int(existing["opening_balance_minor"]) == expected
-                and str(existing["opening_date"]) == parse_date(opening_date).isoformat()):
+                and str(existing["opening_date"]) == parse_date(opening_date, getattr(db, "time_zone", "Asia/Tokyo")).isoformat()):
             return {"accountId": int(existing["id"]), "alreadyExists": True}
         raise LedgerError(f"账户名称“{name}”已存在，请使用不同名称。")
     account_id = db.add_account(
@@ -1240,6 +1712,7 @@ async def apply_sync(
         mobile = state.workspace(config, await state.load_conversations())
         mobile._provider_opener = provider_opener
         db = Database(state.root / "ledgers" / f"{user['id']}.sqlite3")
+        db.time_zone = config.get("timeZone", "Asia/Tokyo")
         # CNY transaction creation needs a daily reference rate. In a Worker,
         # route that HTTP request through the replayable asynchronous fetch
         # boundary instead of urllib's synchronous socket implementation.
@@ -1363,6 +1836,7 @@ async def create_account(database: Any, env: Any, user: dict[str, str], data: di
         mobile = state.workspace(config, await state.load_conversations())
         db = Database(state.root / "ledgers" / f"{user['id']}.sqlite3")
         try:
+            db.time_zone = config.get("timeZone", "Asia/Tokyo")
             result = _save_web_account(db, data)
             db.connection.commit()
             if not result.get("alreadyExists"):
@@ -1370,6 +1844,8 @@ async def create_account(database: Any, env: Any, user: dict[str, str], data: di
         finally:
             db.close()
         await state.commit(mobile)
+        from scheduled import dispatch_queued_backup
+        await dispatch_queued_backup(database, env, user["id"])
         return {"ok": True, **result}
     finally:
         state.cleanup()
@@ -1395,6 +1871,8 @@ async def create_category(database: Any, env: Any, user: dict[str, str], data: d
         mobile = state.workspace(config, await state.load_conversations())
         mobile.after_write(user["id"])
         await state.commit(mobile)
+        from scheduled import dispatch_queued_backup
+        await dispatch_queued_backup(database, env, user["id"])
         return {"ok": True}
     finally:
         state.cleanup()
@@ -1413,7 +1891,8 @@ async def list_transactions(database: Any, env: Any, user_id: str, start: str, e
             rows = db.transactions_between(start_date, end_date)
         finally:
             db.close()
-        mobile = state.workspace(await state.load_config(env), await state.load_conversations())
+        config = await state.load_config(env)
+        mobile = state.workspace(config, await state.load_conversations())
         if state.ledger_rebase_needed or state.legacy_base_changed:
             await state.commit(mobile)
         from bookkeeping.web_features import serial
@@ -1437,15 +1916,13 @@ async def read_backup(database: Any, env: Any, user_id: str, name: str) -> bytes
     import re
     if not re.fullmatch(r"[\w.-]+\.zip", name):
         raise ValueError("备份文件名无效。")
-    state = await LedgerWorkspace.open(database, user_id)
+    path = f"mobile/{user_id}/backups/{name}"
     try:
-        mobile = state.workspace(await state.load_config(env), await state.load_conversations())
-        path = mobile.folder(user_id) / "backups" / name
-        if path.is_symlink() or not path.is_file():
-            raise FileNotFoundError("找不到此备份。")
-        return path.read_bytes()
-    finally:
-        state.cleanup()
+        return await D1SnapshotStore(database).read_file(user_id, path)
+    except SnapshotError as exc:
+        if "找不到这份云端备份" in str(exc):
+            raise FileNotFoundError("找不到此备份。") from exc
+        raise
 
 
 async def export_ledger(database: Any, user_id: str):
@@ -1470,6 +1947,8 @@ async def restore_bundle(database: Any, env: Any, user: dict[str, str], body: by
         mobile._env = env
         result = mobile.restore(user["id"], body, provider="local")
         await state.commit(mobile, result=result, persist_conversations=True)
+        from scheduled import dispatch_queued_backup
+        await dispatch_queued_backup(database, env, user["id"])
         return result
     finally:
         state.cleanup()
@@ -1542,6 +2021,8 @@ async def import_ledger(database: Any, env: Any, user: dict[str, str], body: byt
         mobile.after_write(user["id"])
         result = {"ok": True, "accounts": account_count, "transactions": transaction_count}
         await state.commit(mobile, result=result)
+        from scheduled import dispatch_queued_backup
+        await dispatch_queued_backup(database, env, user["id"])
         return result
     finally:
         state.cleanup()
@@ -1566,7 +2047,11 @@ async def process_scheduled_entries(
     try:
         if expected_revision is not None and state.revision != expected_revision:
             raise SnapshotConflict("等待外部服务期间云端账本已更新；自动计划未执行，请稍后重试。")
-        mobile = state.workspace(await state.load_config(env), await state.load_conversations())
+        config = await state.load_config(env)
+        mobile = state.workspace(config, await state.load_conversations())
+        time_zone = config.get("timeZone", "Asia/Tokyo")
+        from bookkeeping.region_time import regional_now
+        current_time = regional_now(time_zone)
         if provider_opener is None:
             # Cron first attempts a replayable, cache-only pass. If the ledger
             # needs a fresh FX observation, this opener yields to a Workflow.
@@ -1577,8 +2062,10 @@ async def process_scheduled_entries(
         db.external_opener = provider_opener
         try:
             db.initialize()
-            credit = process_due_credit_repayments(db, today())
-            recurring = process_due_recurring_transactions(db, today())
+            db.time_zone = time_zone
+            local_date = current_time.date().isoformat()
+            credit = process_due_credit_repayments(db, local_date, current_time.strftime("%H:%M"))
+            recurring = process_due_recurring_transactions(db, local_date)
         finally:
             db.close()
         if any(item.get("transaction_id") for item in credit + recurring):
@@ -1627,6 +2114,14 @@ async def execute_action(
             job_id=job_id,
         )
 
+    unchanged_backup = await _complete_unchanged_cloud_upload(
+        database, env, user_id, action, data, job_id,
+        provider_replies=provider_replies,
+        expected_revision=expected_revision,
+    )
+    if unchanged_backup is not None:
+        return unchanged_backup
+
     state = await LedgerWorkspace.open(database, user_id)
     try:
         if expected_revision is not None and state.revision != expected_revision:
@@ -1664,6 +2159,15 @@ async def execute_action(
                 list(provider_replies or []), expected_revision or state.revision,
             )
             result = mobile._cloud_remote(user_id, action, data)
+        elif action == "restore_local":
+            mobile._confirmed(data)
+            name = str(data.get("name", ""))
+            if not re.fullmatch(r"[\w.-]+\.zip", name):
+                raise ValueError("备份文件名无效。")
+            body = await state.store.read_file(
+                user_id, f"mobile/{user_id}/backups/{name}",
+            )
+            result = mobile.restore(user_id, body)
         else:
             # Other existing feature actions can also need FX data (for
             # reconciliation, recurring entries, or editing a CNY transaction).
@@ -1674,7 +2178,7 @@ async def execute_action(
             result = mobile._action(user_id, action, data)
         from bookkeeping.web_features import serial
         result = serial(result or {"ok": True})
-        if action == "agent_prepare":
+        if action == "agent_prepare" and not result.get("readOnly"):
             from ledger_row_deltas import read_pending_changes, write_pending_changes
             changes = read_pending_changes(state.root / "ledgers" / f"{user_id}.sqlite3")
             change_bytes = sum(len(str(item.get("row_json") or "").encode("utf-8")) for item in changes)
@@ -1695,6 +2199,7 @@ async def execute_action(
                 try:
                     bootstrap_preview = _bootstrap_payload(
                         db_for_preview, {"id": user_id}, language, result.get("transactionIds", []),
+                        time_zone=mobile.config(user_id).get("timeZone"),
                     )
                 finally:
                     db_for_preview.close()

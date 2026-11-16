@@ -1,5 +1,12 @@
 # Changelog / 更新履歴 / 更新日志
 
+## 0.2.3 — 2026-11-16 — Region-aware schedules and unified smart assistant / 地域別スケジュールと統合スマートアシスタント / 地区时区与统一智能助手
+
+- **English:** Add region-based date and schedule handling, including a configurable local time for credit repayment posting (default 09:00). Add one smart assistant entry that routes general chat, read-only ledger questions, bookkeeping, and food guidance to their existing specialist flows without sharing unrelated conversation context. Improve product categorization with account-local learned corrections, prior transaction retrieval, and privacy-limited web lookup for uncertain items. Hide deleted repayment plans and aggregate usage costs across the model calls made in one assistant turn. Bundle Windows time-zone data and update the first-run guide.
+- **日本語：** 地域設定に基づく日付・スケジュール処理を追加し、クレジットカード返済の自動記帳時刻を設定可能にしました（初期値09:00）。通常会話、読み取り専用の台帳検索、記帳、食事相談を既存の専門Agentへ振り分けるスマートアシスタントを追加し、無関係な会話履歴を共有しないようにしました。商品分類はこの台帳で学習した訂正、過去取引の検索、不確かな商品に限るプライバシー配慮型Web検索を利用します。削除済み返済予定を非表示にし、1回の処理で行った複数モデル呼び出しの費用を合算します。Windows用タイムゾーンデータと初回ガイドも更新しました。
+- **简体中文：** 新增所在地区时区处理，日期、定期项目和信用卡自动记账时间按所选地区运行；还款时间可设置，默认早上 09:00。新增统一智能助手入口，由现有专用流程处理闲聊、只读自然语言查账、记账和饮食咨询，并隔离不同能力的对话上下文。商品分类优先使用本账本的人工纠正记忆和历史流水；仍不确定时才进行仅查询商品/品牌名的联网检索。删除的还款计划不再显示；一次对话中多个模型调用的费用会合并计算。补齐 Windows 时区数据和新手教程的地区设置说明。
+- **Scope note / 対象範囲 / 范围说明:** Browser OAuth, IndexedDB, D1, and Cloudflare durable tasks remain web-only infrastructure. The desktop uses local SQLite, its own API profiles and backup queue. Product lookups send only the candidate product or brand name, not the transaction amount, account, or ledger.
+
 ## 0.2.2 — 2026-11-04 — Desktop feature parity and safer background sync / デスクトップ版の機能統合と同期改善 / 桌面版功能补齐与后台同步改进
 
 - **English:** Bring the desktop app closer to the current web app: add USD and configurable main-currency reporting, account renaming, optional credit-limit difference entries, CNY-estimated model usage, whole-chat image drop, Ctrl+Enter sending, and a replayable first-run guide. Reorder settings into General, Agent, Categories, and Backup; move the monthly start-day control under Categories; improve budget charts. Queue successful account, balance, category, budget, recurring, credit, food, fixed-asset, payment-rule, transaction, Skill, backup-scope, and receipt-image backup changes for background cloud upload. Keep API profiles and keys, interface language, and appearance on the device; preserve cloud conflict checks.

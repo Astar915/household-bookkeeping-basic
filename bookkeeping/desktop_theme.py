@@ -380,16 +380,21 @@ class RoundedPanel(tk.Frame):
     Content uses regular Tk widgets, retaining keyboard, focus, selection and
     existing scroll bindings. No image is generated on scroll or on keypress.
     """
-    def __init__(self, master: tk.Misc, *, padding: int = 18, radius: int = 22,
+    def __init__(self, master: tk.Misc, *, padding: int | tuple[int, int] = 18, radius: int = 22,
                  surface: str | None = None, **kwargs):
         super().__init__(master, bg=PALETTE["background"], bd=0, **kwargs)
         self.surface = surface or PALETTE["surface"]
         self.padding, self.radius = padding, radius
+        if isinstance(padding, tuple):
+            horizontal_padding, vertical_padding = padding
+        else:
+            horizontal_padding = vertical_padding = padding
+        self._vertical_padding = vertical_padding
         self.canvas = tk.Canvas(self, bg=PALETTE["background"], bd=0, highlightthickness=0)
         self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.body = tk.Frame(self, bg=self.surface, bd=0)
-        self.body.place(x=padding, y=padding, relwidth=1, relheight=1,
-                        width=-2*padding, height=-2*padding)
+        self.body.place(x=horizontal_padding, y=vertical_padding, relwidth=1, relheight=1,
+                        width=-2*horizontal_padding, height=-2*vertical_padding)
         self.body.bind("<Configure>", self._request_height, add="+")
         self.bind("<Configure>", self._paint, add="+")
         self._image = None
@@ -401,7 +406,7 @@ class RoundedPanel(tk.Frame):
         if defer_during_interactive_resize(
                 self, (self, "rounded-panel-height"), self._request_height):
             return
-        wanted = self.body.winfo_reqheight() + 2*self.padding
+        wanted = self.body.winfo_reqheight() + 2*self._vertical_padding
         if int(self.cget("height")) != wanted:
             self.configure(height=wanted)
 

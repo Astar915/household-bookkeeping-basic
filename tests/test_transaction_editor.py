@@ -34,7 +34,7 @@ class TransactionEditorTests(unittest.TestCase):
         self.root.report_callback_exception = lambda *error: self.callback_errors.append(error)
         self.info = self.enterContext(patch("bookkeeping.gui.messagebox.showinfo"))
         self.error = self.enterContext(patch("bookkeeping.gui.messagebox.showerror"))
-        self.enterContext(patch("bookkeeping.gui._today_japan", return_value="2026-10-26"))
+        self.enterContext(patch("bookkeeping.gui.regional_today", return_value="2026-10-26"))
         self.database_path = Path(self.folder.name) / "ledger.sqlite3"
         self.window = object.__new__(BookkeepingWindow)
         self.window.root = self.root

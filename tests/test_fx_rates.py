@@ -4,6 +4,7 @@ import tempfile
 import importlib.util
 import json
 import sys
+import types
 import unittest
 from contextlib import redirect_stdout
 from decimal import Decimal
@@ -93,7 +94,12 @@ class FxRateTests(unittest.TestCase):
             spec.loader.exec_module(module)
             return module
 
-        worker_fx = load_module("worker_fx_rates_under_test", worker_src / "bookkeeping" / "fx_rates.py")
+        package_name = "worker_bookkeeping_under_test"
+        package = types.ModuleType(package_name)
+        package.__path__ = [str(worker_src / "bookkeeping")]
+        sys.modules[package_name] = package
+        load_module(f"{package_name}.region_time", worker_src / "bookkeeping" / "region_time.py")
+        worker_fx = load_module(f"{package_name}.fx_rates", worker_src / "bookkeeping" / "fx_rates.py")
         worker_jobs = load_module("worker_model_jobs_under_test", worker_src / "model_jobs.py")
         first = worker_jobs.ReplayOpener([], "stable-ledger-revision")
         self.db.external_opener = first

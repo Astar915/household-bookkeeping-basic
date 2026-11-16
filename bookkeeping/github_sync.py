@@ -1268,7 +1268,8 @@ def _restore_skill(
 ) -> None:
     archived = extracted / "skills" / filename
     if not archived.exists():
-        store.clear()
+        # Older or partial backups may omit Skills. Keep the locally selected
+        # Skill instead of turning a missing archive entry into an uninstall.
         return
     content = archived.read_text(encoding="utf-8")
     destination = (destination_directory or _app_data_dir() / f"{provider}_synced_skills") / filename

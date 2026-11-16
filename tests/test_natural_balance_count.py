@@ -49,7 +49,7 @@ class NaturalBalanceCountTests(unittest.TestCase):
         self.db.add_account(name="人民币钱包", account_type="wallet", currency="CNY",
                             opening_balance="100.00", opening_date="2026-01-01")
         self.now = datetime(2026, 10, 27, 12, 0, tzinfo=timezone(timedelta(hours=9)))
-        self.enterContext(patch("bookkeeping.natural_language._now_japan", return_value=self.now))
+        self.enterContext(patch("bookkeeping.natural_language.regional_now", return_value=self.now))
         self.session = NaturalLanguageSession(self.db, NoModel())
 
     def transactions(self):

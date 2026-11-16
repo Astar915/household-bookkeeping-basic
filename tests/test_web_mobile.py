@@ -210,7 +210,7 @@ class MobileWorkspaceTests(unittest.TestCase):
     def test_credit_plan_and_reconcile(self):
         self.action("credit_plan", {"card": "Test card", "source": "Test bank", "date": "2099-01-01", "amount": "500"})
         self.action("credit_plan_toggle", {"card": "Test card", "enabled": False})
-        self.assertEqual(self.ws.snapshot(self.uid)["repaymentPlans"][0]["enabled"], "0")
+        self.assertEqual(self.ws.snapshot(self.uid)["repaymentPlans"], [])
         self.action("reconcile", {"date": "2026-10-22", "amounts": {"Test bank": "19000"}, "postDifferences": True})
         self.assertEqual(len(self.ws.snapshot(self.uid)["transactions"]), 1)
 

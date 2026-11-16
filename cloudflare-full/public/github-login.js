@@ -82,6 +82,10 @@ async function startGithubLogin(mode="login") {
   }catch(error){if(currentUser)showCloudBootstrapBlocked(error.message);else setAuthMessage(error.message,true);showToast(error.message,true);}
   finally{githubStarting=false;renderGithubLogin();}
 }
+// The backup settings page must obtain a fresh GitHub device-flow token.
+// Do not route reauthorization through the long-running ledger backup job,
+// which only tries to refresh the already-invalid token.
+window.startGithubBackupReauth=()=>startGithubLogin("link");
 async function pollGithubLogin() {
   if(githubPolling||!githubLoginFlow)return;
   clearTimeout(githubTimer);githubPolling=true;
@@ -149,7 +153,7 @@ $("#restoreCloudAfterConflict").onclick=async()=>{
     $("#cloudBootstrapError").textContent=ghText("restoringCloud");
     await runAction("cloud_restore",{provider:"github",confirmed:true},null,false);
     if(currentUser?.id!==owner)return;
-    for(const agent of ["bookkeeping","food_health"])await cacheSet("chat:"+owner+":"+agent,[]);
+    for(const agent of ["bookkeeping","food_health","ledger_query"])await cacheSet("chat:"+owner+":"+agent,[]);
     window.onCloudLedgerRestored?.();
     await establishSession(currentUser);
     if(cloudBootstrapFailed)throw new Error($("#cloudBootstrapError").textContent);
