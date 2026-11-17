@@ -194,6 +194,7 @@ class MobileWorkspace:
 
     def public_settings(self, uid):
         cfg = deepcopy(self.config(uid))
+        cfg["pointRewardRules"] = []
         for profile in cfg["profiles"]:
             profile["keyPresent"] = bool(profile.pop("api_key", ""))
         for cloud in cfg["cloud"].values():
@@ -240,6 +241,42 @@ class MobileWorkspace:
                             ):
                                 purpose = purpose.replace(previous_name, current_name)
                             profile["purpose"] = purpose
+                    point_rules = []
+                    try:
+                        configured_point_rules = json.loads(db.get_setting("point_reward_rules_v1", "[]"))
+                    except (TypeError, ValueError):
+                        configured_point_rules = []
+                    if isinstance(configured_point_rules, list):
+                        for rule in configured_point_rules:
+                            if not isinstance(rule, dict):
+                                continue
+                            try:
+                                payment_id = int(rule.get("payment_account_id"))
+                                points_id = int(rule.get("points_account_id"))
+                                rate_bps = int(rule.get("rate_bps"))
+                            except (TypeError, ValueError, OverflowError):
+                                continue
+                            payment = db.connection.execute(
+                                "SELECT id,name,account_type,currency FROM accounts WHERE id=?",
+                                (payment_id,),
+                            ).fetchone()
+                            points = db.connection.execute(
+                                "SELECT id,name,account_type,currency FROM accounts WHERE id=?",
+                                (points_id,),
+                            ).fetchone()
+                            if (payment is None or payment["account_type"] == "points"
+                                    or points is None or points["account_type"] != "points"
+                                    or points["currency"] != "JPY" or not 1 <= rate_bps <= 10000):
+                                continue
+                            point_rules.append({
+                                "payment_account_id": payment_id,
+                                "payment_account_name": str(payment["name"]),
+                                "points_account_id": points_id,
+                                "points_account_name": str(points["name"]),
+                                "rate_bps": rate_bps,
+                                "enabled": rule.get("enabled", True) is not False,
+                            })
+                    cfg["pointRewardRules"] = point_rules
             finally:
                 db.close()
         cfg["paymentRules"] = payment_profiles
@@ -271,6 +308,15 @@ class MobileWorkspace:
                 setting_rows = db.connection.execute(
                     "SELECT key,value FROM settings WHERE key NOT LIKE 'web_%'"
                 ).fetchall()
+                settings = {row["key"]: row["value"] for row in setting_rows}
+                try:
+                    investments = json.loads(settings.pop("investment_positions_v1", "[]"))
+                    if not isinstance(investments, list):
+                        investments = []
+                    investments = [row for row in investments if isinstance(row, dict)]
+                except (TypeError, ValueError):
+                    investments = []
+                settings.pop("point_reward_rules_v1", None)
                 bills = db.transactions_between("1900-01-01", "2199-12-31")
                 food = db.connection.execute(
                     "SELECT * FROM food_purchase_items ORDER BY purchase_date DESC,id DESC LIMIT 500"
@@ -292,12 +338,13 @@ class MobileWorkspace:
                     "repaymentPlans": credit_repayment_schedules(db),
                     "recurring": list_recurring_schedules(db),
                     "assets": db.list_fixed_assets(),
+                    "investments": investments,
                     "balanceSheet": build_balance_sheet(db, current_date),
                     "profit": build_profit_statement(db, current_date, cycle_start_day),
                     "reports": {"date": report_date,
                         "balanceSheet": build_balance_sheet(db, report_date),
                         "profit": build_profit_statement(db, report_date, cycle_start_day)},
-                    "settings": {row["key"]: row["value"] for row in setting_rows},
+                    "settings": settings,
                     "food": food, "eaten": eaten, "foodGroups": FOOD_GROUP_LABELS,
                     "foodReview": build_food_review_answer(db, "最近20天吃了什么", local_now.date()),
                     "transactions": bills[:2000],
@@ -591,6 +638,55 @@ class MobileWorkspace:
                 db.close()
             self.after_write(uid)
             return {"message": "付款规则已保存。"}
+        if action == "point_rewards":
+            if any(key[0] == uid for key in self.locks):
+                raise LedgerError("请先等待当前 Agent 请求完成。")
+            rules = data.get("rules", [])
+            if not isinstance(rules, list) or len(rules) > 100:
+                raise LedgerError("积分返还规则无效，最多可设置100条。")
+            db = Database(self.db_path(uid))
+            try:
+                db.initialize()
+                accounts = {
+                    int(row["id"]): row for row in db.connection.execute(
+                        "SELECT id,name,account_type,currency FROM accounts"
+                    ).fetchall()
+                }
+                normalized = []
+                payment_ids = set()
+                for rule in rules:
+                    if not isinstance(rule, dict):
+                        raise LedgerError("积分返还规则格式无效，请刷新页面后重试。")
+                    values = (rule.get("payment_account_id"), rule.get("points_account_id"), rule.get("rate_bps"))
+                    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+                        raise LedgerError("请为每条规则选择付款账户、积分账户和返还比例。")
+                    payment_id, points_id, rate_bps = values
+                    payment = accounts.get(payment_id)
+                    points = accounts.get(points_id)
+                    if payment is None or payment["account_type"] == "points":
+                        raise LedgerError("请选择有效的普通付款账户。")
+                    if points is None or points["account_type"] != "points" or points["currency"] != "JPY":
+                        raise LedgerError("返还积分必须存入已设置的积分账户。")
+                    if not 1 <= rate_bps <= 10000:
+                        raise LedgerError("返还比例必须大于0且不超过100%。")
+                    if payment_id in payment_ids:
+                        raise LedgerError("同一个付款账户只能设置一条返还规则。")
+                    payment_ids.add(payment_id)
+                    normalized.append({
+                        "payment_account_id": payment_id,
+                        "points_account_id": points_id,
+                        "rate_bps": rate_bps,
+                        "enabled": rule.get("enabled", True) is not False,
+                    })
+                db.set_setting(
+                    "point_reward_rules_v1",
+                    json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
+                    "Automatic points rewards by payment account",
+                )
+            finally:
+                db.close()
+            self.after_write(uid)
+            return {"message": "积分返还规则已保存。", "count": len(normalized)}
         if action == "agent_reset":
             agent = str(data.get("agent", "bookkeeping"))
             if agent == "ledger_query":
@@ -812,6 +908,60 @@ class MobileWorkspace:
                     db.set_setting(key, json.dumps({"items": items}, ensure_ascii=False))
                 if data.get("goal") is not None:
                     db.set_setting("savings_goal_jpy", str(to_minor_allow_zero(str(data["goal"]), "JPY", 0)))
+            elif action == "investment_save":
+                positions = data.get("positions")
+                if not isinstance(positions, list) or len(positions) > 200:
+                    raise LedgerError("投资持仓资料无效，最多保存200项。")
+                normalized = []
+                seen_ids = set()
+                allowed_kinds = {"fund", "jp_stock", "us_stock", "other"}
+                allowed_currencies = {"JPY", "CNY", "USD"}
+                time_zone = self.config(uid).get("timeZone", DEFAULT_TIME_ZONE)
+                for row in positions:
+                    if not isinstance(row, dict):
+                        raise LedgerError("投资持仓资料无效，请重新填写。")
+                    name = str(row.get("name") or "").strip()
+                    if not name or len(name) > 120:
+                        raise LedgerError("请填写产品名称（最多120个字）。")
+                    kind = str(row.get("kind") or "other")
+                    if kind not in allowed_kinds:
+                        raise LedgerError("请选择有效的投资类型。")
+                    currency = str(row.get("currency") or "JPY").upper()
+                    if currency not in allowed_currencies:
+                        raise LedgerError("投资币种目前支持 JPY、CNY 和 USD。")
+                    digits = int(db.currency(currency)["minor_digits"])
+                    cost_minor = to_minor_allow_zero(str(row.get("cost") or ""), currency, digits)
+                    value_text = row.get("value")
+                    if value_text is None or str(value_text).strip() == "":
+                        value_text = row.get("cost")
+                    value_minor = to_minor_allow_zero(str(value_text or ""), currency, digits)
+                    if cost_minor <= 0:
+                        raise LedgerError("累计投入金额必须大于0。")
+                    position_id = str(row.get("id") or uuid.uuid4().hex).strip()
+                    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", position_id) or position_id in seen_ids:
+                        raise LedgerError("投资持仓编号无效或重复，请刷新后重试。")
+                    seen_ids.add(position_id)
+                    quantity = str(row.get("quantity") or "").strip()
+                    if quantity and (len(quantity) > 32 or not re.fullmatch(r"\d{1,16}(?:\.\d{1,8})?", quantity)):
+                        raise LedgerError("数量请填写非负数字，最多支持8位小数。")
+                    fund_code = str(row.get("fundCode", row.get("fund_code", "")) or "").strip()
+                    if fund_code and (kind != "fund" or not re.fullmatch(r"\d{6}", fund_code)):
+                        raise LedgerError("自动估值目前只支持三菱UFJ资管基金的6位基金代码。")
+                    if fund_code and (not quantity or float(quantity) <= 0):
+                        raise LedgerError("填写基金代码后，持有口数必须大于0。")
+                    updated_on = parse_date(str(row.get("updatedOn") or self.local_today(uid)), time_zone).isoformat()
+                    normalized.append({
+                        "id": position_id, "name": name, "kind": kind, "currency": currency,
+                        "minor_digits": digits, "cost_minor": str(cost_minor), "value_minor": str(value_minor),
+                        "quantity": quantity, "fund_code": fund_code, "updated_on": updated_on,
+                    })
+                db.set_setting(
+                    "investment_positions_v1",
+                    json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
+                    "Manual investment holdings; excluded from account ledger totals",
+                )
+                result["message"] = "投资持仓已保存。"
+                result["count"] = len(normalized)
             elif action == "food_preference":
                 db.set_setting("food_review_purchases_count_as_eaten", "1" if data["enabled"] else "0")
             else:

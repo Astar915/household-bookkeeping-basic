@@ -1,7 +1,7 @@
 // Keep this version in sync with the asset query strings in index.html. This
 // forces installed clients to discard cached authorization and app scripts.
-const CACHE = "household-ledger-mobile-v102";
-const asset = path => path + "?v=102";
+const CACHE = "household-ledger-mobile-v112";
+const asset = path => path + "?v=112";
 const SHELL = ["/", ...[
   "/style.css", "/mobile.css", "/app.js", "/mobile.js", "/github-login.js",
   "/gitee-login.js", "/appearance.js", "/manifest.webmanifest", "/icon.svg",

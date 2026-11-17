@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 import json
+import hashlib
 import os
 from pathlib import Path
 import sqlite3
@@ -11,10 +12,15 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from bookkeeping.cloud_pull import PullState, automatic_pull, local_revision
-from bookkeeping.github_sync import create_sync_bundle, restore_sync_bundle
+from bookkeeping.github_sync import GitHubClient, create_sync_bundle, restore_sync_bundle
 from bookkeeping.payment_preferences import PaymentPromptStore
 from bookkeeping.skill_settings import BookkeepingSkillStore, FoodHealthSkillStore
 from bookkeeping.storage import Database, LedgerError
+from bookkeeping.sync_snapshot import (
+    SNAPSHOT_ROOT,
+    plan_from_legacy_bundle,
+    snapshot_manifest_bytes,
+)
 
 
 class CloudPullTests(unittest.TestCase):
@@ -98,6 +104,70 @@ class CloudPullTests(unittest.TestCase):
         self.assertEqual(db.connection.execute('SELECT name FROM accounts').fetchone()[0], 'Local')
         db.close()
 
+    def test_folder_snapshot_download_materializes_a_local_restore_bundle(self):
+        plan = plan_from_legacy_bundle(self.bundle())
+        manifest_body = snapshot_manifest_bytes(plan.manifest)
+        revision = hashlib.sha1(
+            f'blob {len(manifest_body)}\0'.encode('ascii') + manifest_body
+        ).hexdigest()
+        archive_body = BytesIO()
+        prefix = f'owner-repo-main/{SNAPSHOT_ROOT}/'
+        with zipfile.ZipFile(archive_body, 'w', zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(prefix + 'manifest.json', manifest_body)
+            for relative, body in plan.files.items():
+                archive.writestr(prefix + relative, body)
+
+        client = GitHubClient('ghu_test-token')
+        client.read_snapshot_manifest = Mock(return_value=(plan.manifest, revision, None, False))
+        client.cloud_revision = Mock(return_value=revision)
+        client.request_raw = Mock(return_value=archive_body.getvalue())
+
+        bundle, downloaded_revision = client.download_bundle_with_revision('owner/repo')
+
+        self.assertEqual(downloaded_revision, revision)
+        self.assertEqual(client.request_raw.call_count, 1)
+        with zipfile.ZipFile(BytesIO(bundle)) as restored:
+            self.assertIn('ledger.sqlite3', restored.namelist())
+            manifest = json.loads(restored.read('manifest.json'))
+            self.assertEqual(manifest['version'], 3)
+
+    def test_local_zip_upload_is_converted_to_the_shared_folder_snapshot(self):
+        client = GitHubClient('ghu_test-token')
+        client.read_snapshot_manifest = Mock(return_value=(None, None, None, False))
+        client._legacy_bundle_sha = Mock(return_value=None)
+        client.upload_snapshot = Mock(return_value='folder-revision')
+
+        result = client.upload_bundle('owner/repo', self.bundle(), expected_sha=None)
+
+        self.assertEqual(result, 'folder-revision')
+        client.upload_snapshot.assert_called_once()
+        uploaded_plan = client.upload_snapshot.call_args.args[1]
+        self.assertIn('meta/schema.json', uploaded_plan.files)
+        self.assertEqual(client.upload_snapshot.call_args.kwargs['expected_sha'], None)
+
+    def test_folder_snapshot_delta_uses_local_files_and_checks_manifest_revision(self):
+        plan = plan_from_legacy_bundle(self.bundle())
+        manifest_body = snapshot_manifest_bytes(plan.manifest)
+        revision = hashlib.sha1(
+            f'blob {len(manifest_body)}\0'.encode('ascii') + manifest_body
+        ).hexdigest()
+        client = GitHubClient('ghu_test-token')
+        client.cloud_revision = Mock(return_value=revision)
+
+        def fetch_file(path, **_kwargs):
+            relative = path.split(f'/{SNAPSHOT_ROOT}/', 1)[1]
+            return plan.files[relative]
+
+        client.request_raw = Mock(side_effect=fetch_file)
+        bundle, downloaded_revision = client.download_snapshot_delta_with_revision(
+            'owner/repo', {}, expected_sha=revision, manifest=plan.manifest,
+        )
+
+        self.assertEqual(downloaded_revision, revision)
+        self.assertEqual(client.request_raw.call_count, len(plan.files))
+        with zipfile.ZipFile(BytesIO(bundle)) as restored:
+            self.assertIn('ledger.sqlite3', restored.namelist())
+
     def test_restore_falls_back_to_sqlite_backup_when_windows_blocks_replace(self):
         body = self.bundle()
         reader = sqlite3.connect(self.path)
@@ -141,8 +211,8 @@ class CloudPullTests(unittest.TestCase):
     def test_same_sha_does_not_download_or_overwrite_unsent_local_changes(self):
         candidate = self.candidate(self.bundle())
         self.pull([candidate]); self.edit()
-        result = self.pull([candidate])
-        self.assertFalse(result['restored'])
+        with self.assertRaisesRegex(LedgerError, '不能确认云端已同步'):
+            self.pull([candidate])
         self.assertIn('Unsent', self.names())
         self.assertEqual(candidate[2].download_bundle_with_revision.call_count, 1)
 
@@ -184,14 +254,15 @@ class CloudPullTests(unittest.TestCase):
         candidate = self.candidate(self.bundle())
         self.state.synced('github', 'owner/repo', 'v1', local_revision(self.path, **self.stores))
         self.edit()
-        result = self.pull([candidate])
-        self.assertFalse(result['restored'])
+        with self.assertRaisesRegex(LedgerError, '不能确认云端已同步'):
+            self.pull([candidate])
         self.assertIn('Unsent', self.names())
 
-    def test_unchanged_etag_skips_bundle_download_and_local_revision_scan(self):
+    def test_unchanged_etag_skips_bundle_download_but_verifies_local_revision(self):
         etag = '"etag-1"'
         created = '2026-10-23T01:00:00+00:00'
-        self.state.synced('github', 'owner/repo', 'v1', 'baseline', created, etag)
+        self.state.synced('github', 'owner/repo', 'v1',
+                          local_revision(self.path, **self.stores), created, etag)
 
         class ConditionalClient:
             def bundle_snapshot_with_etag(self, repository, cached_etag=None):
@@ -202,11 +273,20 @@ class CloudPullTests(unittest.TestCase):
                 raise AssertionError('unchanged bundle must not be downloaded')
 
         client = ConditionalClient()
-        with patch('bookkeeping.cloud_pull.local_revision', side_effect=AssertionError('must not scan ledger')):
-            result = self.pull([('github', 'owner/repo', client, self.saved.append)])
+        result = self.pull([('github', 'owner/repo', client, self.saved.append)])
 
         self.assertEqual(result['status'], 'current')
+        self.assertEqual(result['provider'], 'github')
+        self.assertEqual(result['created_at'], created)
         self.assertEqual(client.cached_etag, etag)
+
+    def test_same_cloud_version_without_local_baseline_is_not_marked_synced(self):
+        candidate = self.candidate(self.bundle())
+        self.state.synced('github', 'owner/repo', 'v1', '')
+        result = self.pull([candidate])
+        self.assertEqual(result['status'], 'unverified')
+        self.assertEqual(result['provider'], 'github')
+        self.assertFalse(result['restored'])
 
     def test_github_metadata_body_is_reused_instead_of_downloading_bundle_twice(self):
         body = self.bundle()

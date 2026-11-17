@@ -9,16 +9,16 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="家庭记账">
   <title>家庭记账</title>
-  <link rel="manifest" href="/manifest.webmanifest?v=102">
-  <link rel="icon" href="/icon.svg?v=102" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=102">
-  <script src="/appearance.js?v=102"></script>
-  <link rel="stylesheet" href="/style.css?v=102">
-  <link rel="stylesheet" href="/mobile.css?v=102">
-  <script defer src="/app.js?v=102"></script>
-  <script defer src="/mobile.js?v=102"></script>
-  <script defer src="/github-login.js?v=102"></script>
-  <script defer src="/gitee-login.js?v=102"></script>
+  <link rel="manifest" href="/manifest.webmanifest?v=112">
+  <link rel="icon" href="/icon.svg?v=112" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=112">
+  <script src="/appearance.js?v=112"></script>
+  <link rel="stylesheet" href="/style.css?v=112">
+  <link rel="stylesheet" href="/mobile.css?v=112">
+  <script defer src="/app.js?v=112"></script>
+  <script defer src="/mobile.js?v=112"></script>
+  <script defer src="/github-login.js?v=112"></script>
+  <script defer src="/gitee-login.js?v=112"></script>
 </head>
 <body>
   <header class="topbar">
@@ -95,6 +95,7 @@
         <div><p class="eyebrow" data-i18n="overview">总览</p><h1 data-i18n="yourLedger">你的家庭账本</h1></div>
         <div id="syncSummary" class="sync-summary"></div>
       </div>
+      <div id="githubBackupWarning" class="github-backup-warning hidden" role="status" aria-live="polite"></div>
       <div id="offlineBanner" class="offline-banner hidden"></div>
       <section class="panel accounts-panel">
         <div class="section-heading"><div><h2 data-i18n="accounts">账户</h2><p data-i18n="accountsHint">余额按已入账流水计算，离线暂存记录单独显示。</p></div><button id="showAccountForm" class="button secondary" data-i18n="addAccount">＋ 添加账户</button></div>

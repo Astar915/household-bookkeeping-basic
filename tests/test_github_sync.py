@@ -51,6 +51,9 @@ class GitHubSyncSettingsStoreTests(unittest.TestCase):
 class GitHubSnapshotRevisionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = GitHubClient("ghu_test-token")
+        # These cases exercise the legacy ZIP endpoint; keep the new folder
+        # manifest lookup isolated from the GitHub API.
+        self.client.read_snapshot_manifest = Mock(return_value=(None, None, None, False))  # type: ignore[method-assign]
 
     def test_auto_upload_refuses_to_replace_a_newer_cloud_snapshot(self) -> None:
         self.client.request = Mock(return_value={"sha": "newer-sha"})  # type: ignore[method-assign]

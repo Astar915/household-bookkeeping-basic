@@ -7,6 +7,8 @@ const icons = {
   home:'<path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z"/>',
   chat:'<path d="M21 11a8 8 0 0 1-8 8H7l-4 3v-9a9 9 0 0 1 18-2Z"/><path d="M7 10h10M7 14h6"/>',
   book:'<path d="M5 3h14v18H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"/><path d="M7 3v18M11 8h5M11 12h5"/>',
+  investment:'<path d="M3 20h18M5 17l5-5 4 3 6-8"/><path d="M15 7h5v5"/>',
+  points:'<circle cx="12" cy="12" r="9"/><path d="m12 6 1.8 3.8 4.2.4-3.1 2.7.9 4.1-3.8-2.1-3.8 2.1.9-4.1L6 10.2l4.2-.4Z"/>',
   wallet:'<rect x="3" y="5" width="18" height="15" rx="4"/><path d="M16 11h5v5h-5a2.5 2.5 0 0 1 0-5ZM4 6l12-3"/>',
   more:'<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
   search:'<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/>',
@@ -27,7 +29,7 @@ const icons = {
 };
 const icon = name => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+(icons[name]||icons.book)+'</svg>';
 const b = (action, text, id="", cls="button secondary") => {
-  const names={privacy:m("显示或隐藏金额","金額表示の切替","Show or hide amounts"),refresh:m("刷新","更新","Refresh"),"hero-mode-toggle":heroProfitMode?m("切换到主要记账货币余额","メイン通貨の残高に切替","Switch to main-currency balance"):m("切换到当期纯利润","当期純利益に切替","Switch to current net profit"),"budget-edit":m("编辑预算","予算編集","Edit budget"),"add-card":m("添加信用卡","カード追加","Add credit card"),"asset-edit":m("登记资产","資産を登録","Register asset"),"profile-add":m("添加 API 服务","APIを追加","Add API service"),backup:m("创建备份","バックアップ作成","Create backup"),"order-up":m("上移","上へ","Move up"),"order-down":m("下移","下へ","Move down"),"order-remove":m("移除扣款来源","引落元を削除","Remove funding source"),"favorites-edit":m("编辑常用功能","ショートカットを編集","Edit shortcuts"),"favorites-add":m("添加常用功能","ショートカットを追加","Add shortcut"),"favorite-remove":m("移除此常用功能","ショートカットを削除","Remove shortcut")};
+  const names={privacy:m("显示或隐藏金额","金額表示の切替","Show or hide amounts"),refresh:m("刷新","更新","Refresh"),"hero-mode-toggle":heroProfitMode?m("切换到主要记账货币余额","メイン通貨の残高に切替","Switch to main-currency balance"):m("切换到当期纯利润","当期純利益に切替","Switch to current net profit"),"budget-edit":m("编辑预算","予算編集","Edit budget"),"add-card":m("添加信用卡","カード追加","Add credit card"),"asset-edit":m("登记资产","資産を登録","Register asset"),"investment-add":m("添加投资持仓","投資保有情報を追加","Add investment holding"),"investment-edit":m("修改投资持仓","投資保有情報を編集","Edit investment holding"),"investment-delete":m("删除投资持仓","投資保有情報を削除","Delete investment holding"),"profile-add":m("添加 API 服务","APIを追加","Add API service"),backup:m("创建备份","バックアップ作成","Create backup"),"order-up":m("上移","上へ","Move up"),"order-down":m("下移","下へ","Move down"),"order-remove":m("移除扣款来源","引落元を削除","Remove funding source"),"favorites-edit":m("编辑常用功能","ショートカットを編集","Edit shortcuts"),"favorites-add":m("添加常用功能","ショートカットを追加","Add shortcut"),"favorite-remove":m("移除此常用功能","ショートカットを削除","Remove shortcut")};
   return '<button type="button" class="'+cls+'" data-action="'+action+'" data-id="'+e(id)+'"'+(names[action]?' aria-label="'+e(names[action])+'"':"")+'>'+text+'</button>';
 };
 const money = (value, currency="JPY", digits=null, accountType="") => hiddenAmounts ? "••••••" : formatMinor(value || "0", currency, digits === null ? currencyMinorDigits(currency, 0) : digits, accountType);
@@ -63,6 +65,9 @@ let heroProfitMode = true;
 let hiddenAmounts = localStorage.getItem("hh-hide-amounts") === "1";
 let chatAgent = "ledger_query", chats = {bookkeeping:[], food_health:[], ledger_query:[]}, attachments=[], currentUsageVision=false;
 let modelBalances = {}, modelBalanceRequests = {}, modelBalanceCheckedAt = {}, modelBalanceSpend = {};
+let investmentQuotes = new Map(), investmentQuoteRequest = 0, mufgFundCatalogPromise = null;
+let paymentRulesDraft = null;
+let pointRewardsDraft = null;
 let activeJob = "", activeJobAgent = "", loadingJob = false, selectedHistory = null, agentSubmitting = false;
 let jobRecoveryOwner = "", settingsDraft = null, settingsInlineCapture = null, visibilityRefreshRunning = false;
 const sleepMobile = ms => new Promise(resolve => setTimeout(resolve,ms));
@@ -173,17 +178,18 @@ function mountMobile() {
   const accounts=$(".accounts-panel"), entry=$(".entry-panel"), queue=$(".queue-panel"), history=$(".history-panel");
   $(".table-scroll",history).classList.add("legacy-table");
   const legacyNote=$(".privacy-note",app); legacyNote?.remove();
-  app.replaceChildren(...[heading,$("#githubLinkBanner"),banner].filter(Boolean));
+  app.replaceChildren(...[heading,$("#githubBackupWarning"),$("#githubLinkBanner"),banner].filter(Boolean));
   heading.classList.add("mobile-heading");
   heading.querySelector("h1").removeAttribute("data-i18n");
   const tools=document.createElement("div"); tools.className="heading-tools";
   tools.innerHTML=b("privacy",icon("eye"),"","icon-button")+b("refresh",icon("repeat"),"","icon-button");
   heading.append(tools);
-  for(const name of ["home","entry","ledger","assets","more"]) {
+  for(const name of ["home","entry","ledger","investment","assets","more"]) {
     const section=document.createElement("section"); section.id="page-"+name; section.className="mobile-page";
     section.dataset.page=name; app.append(section);
   }
   $("#page-entry").innerHTML='<div id="agentPanel" class="panel chat-panel"></div><details class="panel manual-entry"><summary>'+m("手动记一笔","手入力で記帳","Manual entry")+'</summary></details>';
+  $("#page-investment").innerHTML='<div id="investmentPanel"></div>';
   $(".manual-entry").append(entry);
   $("#page-assets").innerHTML='<div id="assetTabs" class="mode-pills"></div><div id="creditPanel"></div><div id="fixedPanel"></div>';
   $("#page-assets").append(accounts);
@@ -224,11 +230,13 @@ function mountMobile() {
 }
 
 function renderNavigation() {
-  const labels={home:m("总览","概要","Today"),entry:m("记账","記帳","Record"),ledger:m("账单","明細","Ledger"),assets:m("余额","残高","Balances"),more:m("更多","その他","More")};
-  $("#bottomNav").innerHTML=Object.keys(labels).map((name,index)=>'<button data-action="page" data-id="'+name+'" class="nav-item '+(selectedPage===name?"active":"")+'" aria-current="'+(selectedPage===name?"page":"false")+'">'+icon(["home","chat","book","wallet","more"][index])+'<span>'+labels[name]+'</span></button>').join("");
+  const labels={home:m("总览","概要","Today"),entry:m("记账","記帳","Record"),ledger:m("账单","明細","Ledger"),investment:m("投资","投資","Invest"),assets:m("余额","残高","Balances"),more:m("更多","その他","More")};
+  const iconsByPage={home:"home",entry:"chat",ledger:"book",investment:"investment",assets:"wallet",more:"more"};
+  $("#bottomNav").innerHTML=Object.keys(labels).map(name=>'<button data-action="page" data-id="'+name+'" class="nav-item '+(selectedPage===name?"active":"")+'" aria-current="'+(selectedPage===name?"page":"false")+'">'+icon(iconsByPage[name])+'<span>'+labels[name]+'</span></button>').join("");
   for(const page of $$(".mobile-page"))page.classList.toggle("hidden",page.dataset.page!==selectedPage);
-  $(".page-heading h1").textContent=labels[selectedPage];
-  $(".page-heading .eyebrow").textContent=m("生活，有迹可循","暮らしを、ていねいに","A little more clarity");
+  const pageTitle=$(".page-heading h1"),pageEyebrow=$(".page-heading .eyebrow");
+  if(pageTitle)pageTitle.textContent=labels[selectedPage];
+  if(pageEyebrow)pageEyebrow.textContent=m("生活，有迹可循","暮らしを、ていねいに","A little more clarity");
 }
 function renderAccountViewControls() {
   const grid=$("#accountGrid");
@@ -242,10 +250,11 @@ function renderAccountViewControls() {
     button.title=labels[button.dataset.id]||"";
   });
 }
-function resetMorePageState(){settingsInlineCapture?.();settingsInlineCapture=null;moreTab="";favoritesEditing=false;settingsTab="general";}
+function resetMorePageState(){settingsInlineCapture?.();settingsInlineCapture=null;paymentRulesDraft=null;pointRewardsDraft=null;moreTab="";favoritesEditing=false;settingsTab="general";}
 function navigate(page) {
   if(selectedPage==="more"&&(page!=="more"||(page==="more"&&moreTab)))resetMorePageState();
   selectedPage=page;renderNavigation();window.scrollTo({top:0,behavior:"instant"});if(page==="more")renderMore();
+  if(page==="investment")void refreshInvestmentQuotes();
 }
 function workspaceLoadError(error) {
   if(error?.status===401)return m("登录已过期，请退出后重新登录。","ログインの有効期限が切れました。再ログインしてください。","Your session expired. Sign out and sign in again.");
@@ -323,9 +332,9 @@ function applyQueuedTransaction(item,pending=true){
     cachedBootstrap.transactions=[...bootstrapRows.values()].sort((a,b)=>String(b.occurred_on||"").localeCompare(String(a.occurred_on||""))||((a.pendingSync===b.pendingSync)?Number(b.id||0)-Number(a.id||0):a.pendingSync?-1:1)).slice(0,100);
   }
 }
-const LOCAL_FIRST_ACTIONS=new Set(["settings","onboarding_save","payment_rules","edit_transaction","review_transaction","delete_account","rename_account","reconcile","asset","asset_toggle","delete_asset","recurring","recurring_toggle","delete_recurring","budget","credit_plan","credit_plan_toggle","credit_plan_delete","credit_repay","credit_snapshot","restore_credit","food_purchase","food_eaten","food_group","food_preference","delete_food","category","category_translation","run_due"]);
+const LOCAL_FIRST_ACTIONS=new Set(["settings","onboarding_save","payment_rules","point_rewards","edit_transaction","review_transaction","delete_account","rename_account","reconcile","asset","asset_toggle","delete_asset","recurring","recurring_toggle","delete_recurring","budget","credit_plan","credit_plan_toggle","credit_plan_delete","credit_repay","credit_snapshot","restore_credit","food_purchase","food_eaten","food_group","food_preference","delete_food","category","category_translation","investment_save","run_due"]);
 function pendingActionLabel(action,data={}){
-  const labels={settings:m("设置更改","設定変更","Settings change"),onboarding_save:m("新手设置","初期設定","Initial setup"),payment_rules:m("支付规则","支払ルール","Payment rules"),edit_transaction:m("修改账目","取引の編集","Edit transaction"),review_transaction:m("核对账目","取引の確認","Review transaction"),delete_account:m("删除账户","口座の削除","Delete account"),rename_account:m("更改账户称呼","口座名の変更","Rename account"),reconcile:m("核对余额","残高の照合","Reconcile balance"),asset:m("固定资产更改","固定資産の変更","Asset change"),asset_toggle:m("固定资产更改","固定資産の変更","Asset change"),delete_asset:m("删除固定资产","固定資産の削除","Delete asset"),recurring:m("定期账目更改","定期取引の変更","Recurring entry change"),recurring_toggle:m("定期账目更改","定期取引の変更","Recurring entry change"),delete_recurring:m("删除定期账目","定期取引の削除","Delete recurring entry"),budget:m("预算更改","予算の変更","Budget change"),credit_plan:m("信用卡计划更改","カード返済予定の変更","Credit plan change"),credit_plan_toggle:m("信用卡计划更改","カード返済予定の変更","Credit plan change"),credit_plan_delete:m("删除信用卡计划","カード返済予定の削除","Delete credit plan"),credit_repay:m("信用卡还款记录","カード返済記録","Credit repayment"),credit_snapshot:m("额度记录","利用枠の記録","Credit snapshot"),restore_credit:m("恢复额度记录","利用枠の復元","Restore credit snapshot"),food_purchase:m("食品采购记录","食品購入記録","Food purchase"),food_eaten:m("饮食记录","食事記録","Meal record"),food_group:m("食品分类更改","食品分類の変更","Food group change"),food_preference:m("饮食设置更改","食生活設定の変更","Food settings change"),delete_food:m("删除食品记录","食品記録の削除","Delete food record"),category_translation:m("类别名称更改","カテゴリ名の変更","Category name change"),run_due:m("处理到期项目","期日の処理","Process due entries"),agent_reset:m("新对话设置","新しい会話","New conversation")};
+  const labels={settings:m("设置更改","設定変更","Settings change"),onboarding_save:m("新手设置","初期設定","Initial setup"),payment_rules:m("支付规则","支払ルール","Payment rules"),point_rewards:m("积分返还规则","ポイント還元ルール","Points reward rules"),edit_transaction:m("修改账目","取引の編集","Edit transaction"),review_transaction:m("核对账目","取引の確認","Review transaction"),delete_account:m("删除账户","口座の削除","Delete account"),rename_account:m("更改账户称呼","口座名の変更","Rename account"),reconcile:m("核对余额","残高の照合","Reconcile balance"),asset:m("固定资产更改","固定資産の変更","Asset change"),asset_toggle:m("固定资产更改","固定資産の変更","Asset change"),delete_asset:m("删除固定资产","固定資産の削除","Delete asset"),recurring:m("定期账目更改","定期取引の変更","Recurring entry change"),recurring_toggle:m("定期账目更改","定期取引の変更","Recurring entry change"),delete_recurring:m("删除定期账目","定期取引の削除","Delete recurring entry"),budget:m("预算更改","予算の変更","Budget change"),credit_plan:m("信用卡计划更改","カード返済予定の変更","Credit plan change"),credit_plan_toggle:m("信用卡计划更改","カード返済予定の変更","Credit plan change"),credit_plan_delete:m("删除信用卡计划","カード返済予定の削除","Delete credit plan"),credit_repay:m("信用卡还款记录","カード返済記録","Credit repayment"),credit_snapshot:m("额度记录","利用枠の記録","Credit snapshot"),restore_credit:m("恢复额度记录","利用枠の復元","Restore credit snapshot"),food_purchase:m("食品采购记录","食品購入記録","Food purchase"),food_eaten:m("饮食记录","食事記録","Meal record"),food_group:m("食品分类更改","食品分類の変更","Food group change"),food_preference:m("饮食设置更改","食生活設定の変更","Food settings change"),delete_food:m("删除食品记录","食品記録の削除","Delete food record"),category_translation:m("类别名称更改","カテゴリ名の変更","Category name change"),investment_save:m("投资持仓更改","投資保有情報の変更","Investment holding change"),run_due:m("处理到期项目","期日の処理","Process due entries"),agent_reset:m("新对话设置","新しい会話","New conversation")};
   const row=action==="edit_transaction"?findTransactionById(data.id):null;
   return action==="delete_account"&&data.name?labels[action]+" · "+data.name:action==="rename_account"&&data.oldName?labels[action]+" · "+data.oldName+" → "+data.name:action==="edit_transaction"&&row?labels[action]+" · "+row.description:labels[action]||m("账本更改","台帳の変更","Ledger change");
 }
@@ -337,9 +346,10 @@ function safeSettingsPreview(value){
 }
 function buildPendingActionPreview(action,data,opId){
   let previewData=deepCopy(data||{});const previous={};
+  if(action==="investment_save")previous.investments=deepCopy(workspace?.investments||[]);
   if(action==="settings"){previewData=safeSettingsPreview(data);previous.preferences=deepCopy(workspace?.preferences||{});previous.settings=deepCopy(workspace?.settings||{});}
   if(action==="onboarding_save"){previewData.settings=safeSettingsPreview(data.settings||{});previous.preferences=deepCopy(workspace?.preferences||{});previous.settings=deepCopy(workspace?.settings||{});}
-  if(["payment_rules","budget","food_preference"].includes(action)){previous.preferences=deepCopy(workspace?.preferences||{});previous.settings=deepCopy(workspace?.settings||{});}
+  if(["payment_rules","point_rewards","budget","food_preference"].includes(action)){previous.preferences=deepCopy(workspace?.preferences||{});previous.settings=deepCopy(workspace?.settings||{});}
   if(["edit_transaction","review_transaction"].includes(action)){const id=String(data.id);previewData.transactionId=id;previous.transaction=deepCopy((workspace?.transactions||[]).find(row=>String(row.id)===id)||null);previous.bootstrapTransaction=deepCopy((cachedBootstrap?.transactions||[]).find(row=>String(row.id)===id)||null);previous.rangeTransaction=deepCopy((ledgerRangeRows||[]).find(row=>String(row.id)===id)||null);}
   if(["credit_snapshot","credit_repay","credit_plan","credit_plan_toggle","credit_plan_delete","restore_credit"].includes(action)){
     const requestedCardId=String(data.accountId||"");
@@ -420,6 +430,7 @@ function applyPendingActionPreview(item,pending=true,rollback=false){
   const {action,data={},previous={}}=item.preview;
   const previewCardId=String(data.cardAccountId||data.accountId||""),previewCardName=String(data.cardName||data.account||data.card||"");
   if(rollback){
+    if(action==="investment_save"&&Array.isArray(previous.investments))workspace.investments=deepCopy(previous.investments);
     if(previous.preferences)workspace.preferences=deepCopy(previous.preferences);
     if(previous.settings)workspace.settings=deepCopy(previous.settings);
     if(["credit_snapshot","credit_repay","credit_plan","credit_plan_toggle","credit_plan_delete","restore_credit"].includes(action)){
@@ -457,11 +468,15 @@ function applyPendingActionPreview(item,pending=true,rollback=false){
     if(action==="onboarding_save"&&cachedBootstrap?.accounts)cachedBootstrap.accounts=cachedBootstrap.accounts.filter(row=>!String(row.id||"").startsWith("pending-"+item.opId));
     return;
   }
-  if(action==="settings"||action==="onboarding_save"){
+  if(action==="investment_save"){
+    investmentQuotes.clear();
+    workspace.investments=(data.positions||[]).map(row=>{const currency=String(row.currency||"JPY"),digits=currencyMinorDigits(currency,0);return {...row,currency,fund_code:String(row.fundCode||row.fund_code||""),minor_digits:digits,cost_minor:parseMinorPreview(row.cost,currency,digits),value_minor:parseMinorPreview(row.value??row.cost,currency,digits),updated_on:String(row.updatedOn||workspace.date||""),pendingSync:pending,pendingActionOpId:pending?item.opId:""};});
+  }else if(action==="settings"||action==="onboarding_save"){
     const cfg=data.settings||data;workspace.preferences={...(workspace.preferences||{}),...safeSettingsPreview(cfg)};
     if(cfg.timeZone){workspace.preferences.timeZone=cfg.timeZone;workspace.preferences.timeZoneConfigured=true;if(cachedBootstrap)cachedBootstrap.timeZone=cfg.timeZone;}
     workspace.settings={...(workspace.settings||{})};if(cfg.baseCurrency)workspace.settings.base_currency=cfg.baseCurrency;if(cfg.billingCycleStartDay)workspace.settings.billing_cycle_start_day=cfg.billingCycleStartDay;
   }else if(action==="payment_rules")workspace.preferences={...(workspace.preferences||{}),paymentRules:deepCopy(data.profiles||[])};
+  else if(action==="point_rewards")workspace.preferences={...(workspace.preferences||{}),pointRewardRules:(data.rules||[]).map(rule=>({payment_account_id:Number(rule.payment_account_id),points_account_id:Number(rule.points_account_id),rate_bps:Number(rule.rate_bps),enabled:true}))};
   else if(action==="budget"){workspace.settings={...(workspace.settings||{}),monthly_jpy_budget_minor:String(data.total||"0"),savings_goal_jpy:String(data.goal||"0"),["savings_plan:"+(workspace.profit?.start||workspace.date||"")]:JSON.stringify({items:data.items||{}})};}
   else if(action==="credit_snapshot"){
     const card=(workspace.cards||[]).find(row=>String(row.account_id)===previewCardId)
@@ -700,7 +715,7 @@ window.onPendingActionFinished=async(item,succeeded,message="",result={})=>{
       const pendingId="pending-"+item.opId,serverId=String(result.transaction_id);
       for(const rows of [workspace?.transactions,cachedBootstrap?.transactions,ledgerRangeRows,workspace?.creditHistory?.[String(item.preview?.data?.cardAccountId)]?.transactions])if(Array.isArray(rows))for(const row of rows)if(String(row.id)===pendingId)row.id=serverId;
     }
-    clearPending(workspace?.transactions);clearPending(cachedBootstrap?.transactions);clearPending(ledgerRangeRows);
+    clearPending(workspace?.transactions);clearPending(cachedBootstrap?.transactions);clearPending(ledgerRangeRows);clearPending(workspace?.investments);
     for(const rows of [workspace?.cards,workspace?.cash,workspace?.repaymentPlans,cachedBootstrap?.accounts])for(const row of rows||[])if(row.pendingActionOpId===item.opId){delete row.pendingActionOpId;delete row.pendingSync;}
     for(const entry of Object.values(workspace?.creditHistory||{}))for(const rows of [entry.snapshots,entry.transactions])for(const row of rows||[])if(row.pendingActionOpId===item.opId){delete row.pendingActionOpId;delete row.pendingSync;}
     const targetId=String(item.preview?.data?.id||"");
@@ -818,6 +833,7 @@ async function loadWorkspace(force=false) {
     renderMobile();
     resumeJob();
     if(workspace&&workspaceOwner===owner&&!workspaceError&&navigator.onLine)void syncQueue();
+    if(selectedPage==="investment")void refreshInvestmentQuotes();
   }
   })().finally(()=>{if(workspaceLoading===request)workspaceLoading=null;});
   return request.promise;
@@ -871,6 +887,7 @@ const tutorialTourSteps=[
   {action:"page",id:"home",selector:'#bottomNav [data-action="page"][data-id="home"]',title:m("总览","概要","Overview"),description:m("查看本期收支、净利润、预算和最近流水。","当期の収支、純利益、予算、最近の取引を確認できます。","See this period's income, expenses, profit, budget, and recent entries."),prompt:m("请点击底部“总览”。","下部の「概要」を押してください。","Tap Overview below.")},
   {action:"page",id:"entry",selector:'#bottomNav [data-action="page"][data-id="entry"]',title:m("记账","記帳","Record"),description:m("用文字或小票图片记账，也可切换饮食助手。","文字やレシート画像で記帳できます。食事アシスタントにも切り替えられます。","Record by text or receipt image, or switch to the food assistant."),prompt:m("请点击底部“记账”。","下部の「記帳」を押してください。","Tap Record below.")},
   {action:"page",id:"ledger",selector:'#bottomNav [data-action="page"][data-id="ledger"]',title:m("账单","明細","Ledger"),description:m("按日期查找流水，可查看、编辑或删除。","日付順に取引を確認し、表示・編集・削除できます。","Find entries by date, then view, edit, or delete them."),prompt:m("请点击底部“账单”。","下部の「明細」を押してください。","Tap Ledger below.")},
+  {action:"page",id:"investment",selector:'#bottomNav [data-action="page"][data-id="investment"]',title:m("投资","投資","Investments"),description:m("手动记录基金和股票，按币种查看投入、估值和盈亏；不会影响日常余额。","投資信託や株式を手動で記録し、通貨ごとに投資額・評価額・損益を確認できます。日常の残高には影響しません。","Manually track funds and stocks by currency. Holdings, value, and profit or loss stay separate from everyday balances."),prompt:m("请点击底部“投资”。","下部の「投資」を押してください。","Tap Investments below.")},
   {action:"page",id:"assets",selector:'#bottomNav [data-action="page"][data-id="assets"]',title:m("余额","残高","Balances"),description:m("查看各个账户里有多少钱，也可以添加或修改账户。","口座ごとの残高を確認し、追加・変更できます。","See how much is in each account, and add or update accounts."),prompt:m("请点击底部“余额”。","下部の「残高」を押してください。","Tap Balances below.")},
   {action:"page",id:"more",selector:'#bottomNav [data-action="page"][data-id="more"]',title:m("更多","その他","More"),description:m("报表、预算、定期收支和设置都在这里。","レポート、予算、定期取引、設定はこちらです。","Find reports, budgets, recurring entries, and settings here."),prompt:m("请点击底部“更多”。","下部の「その他」を押してください。","Tap More below.")},
   {action:"module",id:"settings",selector:'#moreMenu .module-row[data-id="settings"]',title:m("打开设置","設定を開く","Open Settings"),description:m("这里管理账本、备份、外观和 Agent。","台帳、バックアップ、外観、Agentを管理します。","Manage the ledger, backups, appearance, and Agents here."),prompt:m("请点击列表中的“设置”。","一覧の「設定」を押してください。","Tap Settings in the list.")},
@@ -1519,9 +1536,31 @@ $("#accountForm")?.addEventListener("submit",event=>{
   }).finally(()=>{delete form.dataset.onboardingSaving;if(submit)submit.disabled=false;});
 },true);
 function renderMobile() {
-  renderNavigation();renderDashboard();renderAssetTabs();renderCredits();renderAssets();renderMore();renderCloud();renderMobileTransactions();
-  if(!$("#editorDialog").open){$("#editorCancel").textContent=t("cancel");$("#editorSave").textContent=m("保存","保存","Save");}
+  renderNavigation();renderDashboard();renderBackupWarning();renderAssetTabs();renderCredits();renderAssets();renderInvestment();renderMore();renderCloud();renderMobileTransactions();
+  const editorDialog=$("#editorDialog"),editorCancel=$("#editorCancel"),editorSave=$("#editorSave");
+  if(editorDialog&&!editorDialog.open){if(editorCancel)editorCancel.textContent=t("cancel");if(editorSave)editorSave.textContent=m("保存","保存","Save");}
   syncFirstRunSetup();if(tutorialTour){renderTutorialTour();renderTutorialDraftNotice();}
+}
+function renderBackupWarning() {
+  const root=$("#githubBackupWarning");if(!root)return;
+  root.replaceChildren();
+  const preferences=workspace?.preferences||{};
+  const status=String(preferences.autoStatus||"").trim();
+  let kind=String(preferences.autoStatusKind||"");
+  if(!kind&&status){
+    if(/授权需要重新连接|授权已失效|授权需要更新|重新连接 GitHub|重新授权/.test(status))kind="reauthorize";
+    else if(/内部错误|联系管理员/.test(status))kind="internal_error";
+    else if(/备份未完成|上传失败|上传暂时失败|同步失败/.test(status))kind="provider_error";
+  }
+  if(!status||!["reauthorize","internal_error","conflict","provider_error","temporary"].includes(kind)){
+    root.classList.add("hidden");return;
+  }
+  const message=document.createElement("span");message.className="github-backup-warning-message";message.textContent=status;root.append(message);
+  if(kind==="reauthorize"){
+    const action=document.createElement("button");action.type="button";action.className="text-button";action.dataset.action="backup-warning-reauthorize";
+    action.textContent=m("重新授权","再認証","Reauthorize");root.append(action);
+  }
+  root.classList.remove("hidden");
 }
 function metric(label,value,extra="",cls="") {
   return '<article class="metric '+cls+'"><span>'+label+'</span><strong>'+value+'</strong>'+(extra?'<small>'+extra+'</small>':"")+'</article>';
@@ -1602,10 +1641,10 @@ function renderMobileTransactions() {
   let rows=(ledgerRangeRows&&($("#historyStart").value||$("#historyEnd").value)?ledgerRangeRows:null)||workspace?.transactions||cachedBootstrap?.transactions||[];
   const query=$("#historySearch").value.trim().toLocaleLowerCase(),start=$("#historyStart").value,end=$("#historyEnd").value;
   rows=rows.filter(row=>(!start||row.occurred_on>=start)&&(!end||row.occurred_on<=end)&&(!query||[row.description,row.account_name,row.to_account_name,row.category_name,row.amount_minor].join(" ").toLocaleLowerCase().includes(query)));
-  $("#transactionCount").textContent=rows.length+"";
+  const transactionCount=$("#transactionCount");if(transactionCount)transactionCount.textContent=rows.length+"";
   node.innerHTML=rows.map(txCard).join("")||empty(t("noTransactions"));
-  $(".history-panel .section-heading p").removeAttribute("data-i18n");
-  $(".history-panel .section-heading p").textContent=m("按日期、账户或说明查找最近2000条记录","最近2000件を日付・口座・内容で検索","Search the latest 2,000 entries by date, account or description");
+  const historyHint=$(".history-panel .section-heading p");
+  if(historyHint){historyHint.removeAttribute("data-i18n");historyHint.textContent=m("按日期、账户或说明查找最近2000条记录","最近2000件を日付・口座・内容で検索","Search the latest 2,000 entries by date, account or description");}
 }
 function renderAssetTabs() {
   $("#assetTabs").innerHTML=[["cash",m("账户余额","口座残高","Account balances")],["credit",m("信用卡","カード","Credit")],["fixed",m("固定资产","固定資産","Property")]].map(([id,label])=>b("asset-tab",label,id,"pill "+(assetTab===id?"selected":""))).join("");
@@ -1630,8 +1669,111 @@ function renderAssets() {
   $("#fixedPanel").innerHTML='<div class="section-heading"><h2>'+m("固定资产","固定資産","Fixed assets")+'</h2>'+b("asset-edit",icon("plus"),"","icon-button")+'</div>'+
     (workspace?.assets||[]).map(asset=>{const row=balanceRows.find(item=>String(item.asset_id)===String(asset.id));const original=row?.original_cost_minor??asset.cost_minor;const depreciation=BigInt(row?.accumulated_depreciation_minor||"0");return '<article class="panel asset-card"><div class="spread"><h3>'+e(asset.name)+'</h3>'+b("asset-edit",m("编辑","編集","Edit"),asset.id,"text-button accent")+'</div><strong class="asset-price">'+money(original,asset.currency)+'</strong><p class="muted asset-depreciation">'+m("累计折旧","累計減価償却","Accumulated depreciation")+' <strong>'+(depreciation>0n?"−":"")+money(depreciation.toString(),asset.currency)+'</strong></p><div class="button-row">'+b("asset-toggle",asset.include_in_balance_sheet==="1"?m("已计入报表","集計対象","Included"):m("未计入报表","集計対象外","Excluded"),asset.id)+b("asset-delete",m("删除","削除","Delete"),asset.id,"button danger-text")+'</div></article>';}).join("");
 }
+const MUFG_FUND_API="https://developer.am.mufg.jp";
+async function getMufgFundQuote(fundCode,quantity){
+  const code=String(fundCode||"").trim();
+  if(!/^\d{6}$/.test(code))throw new Error("unsupported_fund_code");
+  const quantityText=String(quantity||"").trim(),match=quantityText.match(/^(\d{1,16})(?:\.(\d{1,8}))?$/);
+  if(!match)throw new Error("invalid_fund_quantity");
+  const whole=BigInt(match[1]),fraction=BigInt((match[2]||"").padEnd(8,"0")||"0"),quantityAtoms=whole*100000000n+fraction;
+  if(quantityAtoms<=0n)throw new Error("invalid_fund_quantity");
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),9000);
+  try{
+    const response=await fetch(MUFG_FUND_API+"/fund_information_latest/fund_cd/"+code,{method:"GET",mode:"cors",credentials:"omit",cache:"no-cache",headers:{Accept:"application/json"},signal:controller.signal});
+    if(!response.ok)throw new Error("quote_unavailable");
+    const payload=await response.json(),item=payload?.datasets?.[0],nav=String(item?.nav||""),baseDate=String(item?.base_date||"");
+    if(Number(payload?.result?.status)!==200||String(item?.fund_cd||"")!==code||!/^\d+$/.test(nav)||BigInt(nav)<=0n||!/^\d{8}$/.test(baseDate))throw new Error("quote_unavailable");
+    // Japanese public NAVs are quoted per 10,000 units. Use integer arithmetic
+    // and round down to whole yen, matching the displayed indicative value.
+    const valueMinor=(BigInt(nav)*quantityAtoms)/(10000n*100000000n);
+    return {fundCode:code,fundName:String(item.fund_name||""),nav,baseDate:baseDate.slice(0,4)+"-"+baseDate.slice(4,6)+"-"+baseDate.slice(6),valueMinor:valueMinor.toString()};
+  }finally{clearTimeout(timer);}
+}
+async function refreshInvestmentQuotes(){
+  if(!workspace||workspaceOwner!==currentUser?.id)return;
+  const request=++investmentQuoteRequest,owner=currentUser?.id;
+  const positions=(workspace.investments||[]).filter(row=>row.kind==="fund"&&/^\d{6}$/.test(String(row.fund_code||""))&&String(row.quantity||"").trim());
+  investmentQuotes=new Map(positions.map(row=>[String(row.id),{status:"loading"}]));
+  if(selectedPage==="investment")renderInvestment();
+  let index=0;
+  const workers=Array.from({length:Math.min(4,positions.length)},async()=>{
+    while(index<positions.length){
+      const row=positions[index++];
+      try{const quote=await getMufgFundQuote(row.fund_code,row.quantity);if(request===investmentQuoteRequest)investmentQuotes.set(String(row.id),{status:"ready",...quote});}
+      catch{if(request===investmentQuoteRequest)investmentQuotes.set(String(row.id),{status:"error"});}
+    }
+  });
+  await Promise.all(workers);
+  if(request===investmentQuoteRequest&&owner===currentUser?.id&&selectedPage==="investment")renderInvestment();
+}
+async function loadMufgFundCatalog(){
+  if(!mufgFundCatalogPromise){
+    mufgFundCatalogPromise=(async()=>{
+      const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),9000);
+      try{
+        const response=await fetch(MUFG_FUND_API+"/fund_information_all_latest",{method:"GET",mode:"cors",credentials:"omit",cache:"default",headers:{Accept:"application/json"},signal:controller.signal});
+        if(!response.ok)throw new Error("catalog_unavailable");
+        const text=await response.text();if(new Blob([text]).size>2*1024*1024)throw new Error("catalog_too_large");
+        const payload=JSON.parse(text),rows=payload?.datasets;
+        if(Number(payload?.result?.status)!==200||!Array.isArray(rows)||rows.length>2000)throw new Error("catalog_unavailable");
+        return rows.filter(row=>/^\d{6}$/.test(String(row?.fund_cd||""))&&String(row?.fund_name||"").trim()).map(row=>({fundCode:String(row.fund_cd),name:String(row.fund_name),nav:String(row.nav||""),baseDate:String(row.base_date||"")}));
+      }finally{clearTimeout(timer);}
+    })().catch(error=>{mufgFundCatalogPromise=null;throw error;});
+  }
+  return mufgFundCatalogPromise;
+}
+function installFundNameSearch(){
+  const nameInput=$("#edit-name"),kindInput=$("#edit-kind"),currencyInput=$("#edit-currency"),codeInput=$("#edit-fundCode");
+  if(!nameInput||!kindInput||!currencyInput||!codeInput)return;
+  const fieldLabel=nameInput.closest(".field"),codeLabel=codeInput.closest(".field"),results=document.createElement("div");
+  results.className="investment-fund-results";results.setAttribute("role","listbox");results.hidden=true;fieldLabel?.after(results);
+  let timer=0,sequence=0;
+  const updateVisibility=()=>{const isFund=kindInput.value==="fund";if(codeLabel)codeLabel.hidden=!isFund;if(!isFund){results.hidden=true;results.replaceChildren();}};
+  const search=async()=>{
+    const query=String(nameInput.value||"").trim().normalize("NFKC").toLocaleLowerCase();
+    const current=++sequence;
+    if(kindInput.value!=="fund"||query.length<2){results.hidden=true;results.replaceChildren();return;}
+    results.hidden=false;results.innerHTML='<p class="investment-fund-search-status">'+m("正在查找三菱UFJ基金…","三菱UFJの投資信託を検索中…","Searching MUFG funds…")+'</p>';
+    try{
+      const catalog=await loadMufgFundCatalog();if(current!==sequence)return;
+      const matches=catalog.filter(item=>(item.name+" "+item.fundCode).normalize("NFKC").toLocaleLowerCase().includes(query)).slice(0,8);
+      if(!matches.length){results.innerHTML='<p class="investment-fund-search-status">'+m("没有找到该公司管理的基金；仍可手动填写估值。","該当する三菱UFJの投資信託がありません。評価額は手入力できます。","No matching MUFG fund. You can still enter the value manually.")+'</p>';return;}
+      results.innerHTML=matches.map(item=>'<button type="button" class="investment-fund-option" data-fund-code="'+e(item.fundCode)+'"><strong>'+e(item.name)+'</strong><span>'+m("基金代码 ","ファンドコード ","Code ")+e(item.fundCode)+(item.nav?" · NAV "+e(item.nav):"")+'</span></button>').join("");
+      results.querySelectorAll("[data-fund-code]").forEach(button=>button.addEventListener("click",()=>{
+        const fund=catalog.find(item=>item.fundCode===button.dataset.fundCode);if(!fund)return;
+        nameInput.value=fund.name;codeInput.value=fund.fundCode;currencyInput.value="JPY";kindInput.value="fund";results.hidden=true;results.replaceChildren();
+      }));
+    }catch{
+      if(current===sequence)results.innerHTML='<p class="investment-fund-search-status">'+m("暂时无法读取基金目录，请稍后重试；也可以手动填写。","ファンド一覧を取得できません。後で再試行するか、手入力してください。","Fund list unavailable. Try later or enter the details manually.")+'</p>';
+    }
+  };
+  nameInput.addEventListener("input",()=>{clearTimeout(timer);timer=setTimeout(()=>void search(),280);});
+  kindInput.addEventListener("change",updateVisibility);updateVisibility();
+}
+function renderInvestment(){
+  const root=$("#investmentPanel");if(!root)return;
+  if(!workspace){root.innerHTML=workspaceError?'<div class="panel workspace-error" role="alert"><p>'+e(workspaceError)+'</p>'+b("workspace-retry",m("重试","再試行","Retry"),"","button primary")+'</div>':'<div class="panel empty-state">'+m("正在载入你的投资持仓…","投資の保有状況を読み込み中…","Loading investment holdings…")+'</div>';return;}
+  const rows=Array.isArray(workspace?.investments)?workspace.investments:[];
+  const currentValue=row=>investmentQuotes.get(String(row.id))?.status==="ready"?investmentQuotes.get(String(row.id)).valueMinor:String(row.value_minor||"0");
+  const totals=new Map();
+  for(const row of rows){
+    const currency=String(row.currency||"JPY"),digits=Number(row.minor_digits??currencyMinorDigits(currency,0));
+    const total=totals.get(currency)||{cost:0n,value:0n,digits};
+    total.cost+=BigInt(String(row.cost_minor||0));total.value+=BigInt(currentValue(row));totals.set(currency,total);
+  }
+  if(!totals.size){const currency=String(workspace?.settings?.base_currency||"JPY");totals.set(currency,{cost:0n,value:0n,digits:currencyMinorDigits(currency,0)});}
+  const summary=[...totals].map(([currency,total])=>{
+    const profit=total.value-total.cost,cls=profit<0n?"negative":profit>0n?"positive":"";
+    return '<article class="investment-total"><span>'+e(currency)+'</span><div><small>'+m("投入","投入額","Invested")+'</small><strong>'+money(total.cost.toString(),currency,total.digits)+'</strong></div><div><small>'+m("当前估值","現在の評価額","Current value")+'</small><strong>'+money(total.value.toString(),currency,total.digits)+'</strong></div><div><small>'+m("浮动盈亏","評価損益","Unrealized P/L")+'</small><strong class="'+cls+'">'+(profit>0n?"+":"")+money(profit.toString(),currency,total.digits)+'</strong></div></article>';
+  }).join("");
+  const kinds={fund:m("基金 / 投信","投資信託","Fund"),jp_stock:m("日本股票","日本株","Japan stock"),us_stock:m("美国股票","米国株","US stock"),other:m("其他","その他","Other")};
+  const intro=m("按币种统计，不计入日常余额、收支或预算。三菱UFJ资管基金可搜索产品名并自动估值；打开本页时读取一次最新净值。其他产品可手动填写。","通貨別に集計し、日常の残高・収支・予算には含めません。三菱UFJアセットマネジメントの投信は商品名で検索して自動評価できます。本ページを開くと最新基準価額を1回取得します。その他の商品は手入力できます。","Totals stay separate from daily balances, income, spending, and budgets. Search MUFG Asset Management funds by name for automatic valuation; opening this page fetches the latest NAV once. Enter other products manually.");
+  root.innerHTML='<section class="panel investment-overview"><div class="section-heading"><div><h2>'+m("投资持仓","投資の保有状況","Investment holdings")+'</h2><p class="muted">'+intro+'</p></div>'+b("investment-add",icon("plus"),"","icon-button")+'</div><div class="investment-totals">'+summary+'</div></section>'+
+    (rows.length?'<section class="investment-list">'+rows.map(row=>{const currency=String(row.currency||"JPY"),digits=Number(row.minor_digits??currencyMinorDigits(currency,0)),quote=investmentQuotes.get(String(row.id)),value=BigInt(currentValue(row)),profit=value-BigInt(String(row.cost_minor||0)),cls=profit<0n?"negative":profit>0n?"positive":"";let updated=row.updated_on||"";if(quote?.status==="loading")updated=m("正在更新基金净值…","基準価額を更新中…","Updating fund NAV…");else if(quote?.status==="ready")updated=m("净值日期 ","基準価額日 ","NAV date ")+quote.baseDate;else if(quote?.status==="error")updated=m("自动估值暂不可用，显示手动估值","自動評価を取得できず、手入力の評価額を表示","Auto valuation unavailable; showing the manual value");else if(row.kind==="fund"&&row.fund_code)updated=m("打开投资页时自动更新","投資ページを開くと自動更新","Refreshes when Investments opens");return '<article class="panel investment-position"><div class="investment-position-heading"><div><h3>'+e(row.name)+'</h3><small>'+e(kinds[row.kind]||kinds.other)+' · '+e(currency)+(row.quantity?" · "+e(row.quantity)+" "+(row.kind==="fund"?m("口","口","units"):m("份","株","shares")):"")+(row.kind==="fund"&&row.fund_code?" · "+m("基金代码 ","コード ","Code ")+e(row.fund_code):"")+'</small></div><span class="investment-updated">'+e(updated)+(row.pendingSync?" · "+m("待同步","同期待ち","Pending sync"):"")+'</span></div><div class="investment-position-values"><div><small>'+m("投入","投入額","Invested")+'</small><strong>'+money(row.cost_minor,currency,digits)+'</strong></div><div><small>'+m("当前估值","現在の評価額","Current value")+'</small><strong>'+money(value.toString(),currency,digits)+'</strong></div><div><small>'+m("浮动盈亏","評価損益","Unrealized P/L")+'</small><strong class="'+cls+'">'+(profit>0n?"+":"")+money(profit.toString(),currency,digits)+'</strong></div></div><div class="investment-position-actions">'+b("investment-edit",m("修改持仓","保有情報を編集","Edit holding"),row.id,"text-button accent")+b("investment-delete",m("删除","削除","Delete"),row.id,"text-button danger-text")+'</div></article>';}).join("")+'</section>':'<section class="panel investment-empty"><span class="module-icon">'+icon("investment")+'</span><h3>'+m("投资资产：0","投資資産：0","Investment assets: 0")+'</h3><p>'+m("买入后点右上角“+”录入产品、投入金额和当前估值。基金可搜索三菱UFJ资管产品并填入口数自动估值；其他产品可手动录入。","購入後、右上の「+」から商品・投資額・評価額を登録します。投信は三菱UFJアセットマネジメントの商品を検索し、口数を入力すると自動評価できます。その他は手入力できます。","After buying, tap + to enter the product and invested amount. MUFG Asset Management funds can be searched and valued from your unit count; enter other products manually.")+'</p></section>');
+}
 const modules=()=>[
   ["rules","card",m("付款方式与扣款顺序","支払ルールと優先順位","Payment rules"),m("用途匹配，按账户顺序扣款","用途と口座優先順位","Scenarios and account priorities")],
+  ["points","points",m("积分管理","ポイント管理","Points"),m("查看积分余额，设置消费自动返还","ポイント残高と自動還元を管理","Track points and set automatic rewards")],
   ["recurring","repeat",m("定期付款与收入","定期支払・収入","Recurring entries"),m("周期、账单币种与到期处理","周期・請求通貨・期日処理","Schedules, currencies and due dates")],
   ["finance","chart",m("财务报表和预算","財務レポートと予算","Financial reports & budget"),m("账户余额、收支和预算管理","口座残高・収支・予算の管理","Account balances, income, spending, and budgets")],
   ["food","food",m("食材与饮食健康","食材と食生活","Food & wellbeing"),m("采购、食用记录与回顾","購入・食事記録・振り返り","Purchases, meals and reviews")],
@@ -1655,18 +1797,19 @@ function renderMore() {
   }
 }
 window.addEventListener("household-language-changed",()=>{
-  if(selectedPage==="more"&&moreTab==="settings")renderModule("settings");
+  if(selectedPage==="more"&&["settings","rules","points"].includes(moreTab)){if(moreTab==="points")capturePointRewardsDraft();renderModule(moreTab);}
 });
 function favoriteCatalog(){return [
   {id:"home",icon:"home",title:m("总览","概要","Overview")},
   {id:"entry",icon:"chat",title:m("记账","記帳","Record")},
   {id:"ledger",icon:"book",title:m("账单记录","取引一覧","Ledger")},
+  {id:"investment",icon:"investment",title:m("投资","投資","Investments")},
   {id:"assets",icon:"wallet",title:m("余额","残高","Balances")},
   ...modules().filter(([id])=>!["backup","categories"].includes(id)).map(([id,ico,title])=>({id,icon:ico,title}))
 ];}
 function getFavorites(){const key="hh-mobile-favorites:"+(currentUser?.id||"guest");const defaults=["ledger","assets","finance"];try{const stored=localStorage.getItem(key);const values=stored===null?defaults:JSON.parse(stored);const allowed=new Set(favoriteCatalog().map(item=>item.id));return Array.isArray(values)?[...new Set(values.map(id=>["budget","reports"].includes(id)?"finance":["backup","categories"].includes(id)?"settings":id).filter(id=>allowed.has(id)))].slice(0,8):defaults;}catch{return defaults;}}
 function saveFavorites(values){localStorage.setItem("hh-mobile-favorites:"+(currentUser?.id||"guest"),JSON.stringify(values));}
-function openFavorite(id){if(["home","entry","ledger","assets"].includes(id)){navigate(id);return;}navigate("more");if(id==="rules")return editRules();if(["backup","categories","settings"].includes(id)){settingsTab=id==="backup"?"backup":id==="categories"?"categories":"general";moreTab="settings";}else moreTab=id;renderMore();}
+function openFavorite(id){if(["home","entry","ledger","investment","assets"].includes(id)){navigate(id);return;}navigate("more");if(id==="rules")paymentRulesDraft=deepCopy(workspace?.preferences?.paymentRules||[]);if(id==="points")pointRewardsDraft=deepCopy(workspace?.preferences?.pointRewardRules||[]);if(["backup","categories","settings"].includes(id)){settingsTab=id==="backup"?"backup":id==="categories"?"categories":"general";moreTab="settings";}else moreTab=id;renderMore();}
 function moduleHeader(id) {
   const item=modules().find(row=>row[0]===id);
   return '<div class="module-header">'+b("module-back",m("‹ 更多","‹ その他","‹ More"),"","text-button accent")+'<h2>'+e(item?.[2]||"")+'</h2></div>';
@@ -1752,6 +1895,26 @@ function renderModule(id) {
   }
   if(id==="recurring")content+='<div class="button-row">'+b("recurring-edit",icon("plus")+" "+m("新增规则","予定を追加","New schedule"))+b("run-due",m("处理到期项目","期日を処理","Process due entries"))+'</div>'+
     w.recurring.map(row=>'<article class="panel"><div class="spread"><h3>'+e(row.name)+'</h3><strong>'+money(row.amount_minor,row.currency,row.minor_digits)+'</strong></div><p>'+e(row.account_name)+" · "+e(row.category_name)+'</p><p class="muted">'+e(row.next_due_date)+" · "+e({daily:m("每天","毎日","Daily"),weekly:m("每周","毎週","Weekly"),monthly:m("每月","毎月","Monthly"),yearly:m("每年","毎年","Yearly")}[row.frequency])+'</p><div class="button-row">'+b("recurring-edit",m("编辑","編集","Edit"),row.id)+b("recurring-toggle",row.enabled==="1"?m("暂停","停止","Pause"):m("启用","有効化","Enable"),row.id)+b("recurring-delete",m("删除","削除","Delete"),row.id,"button danger-text")+'</div></article>').join("");
+  if(id==="rules"){
+    const rules=paymentRulesDraft||(paymentRulesDraft=deepCopy(w.preferences?.paymentRules||[])),accounts=fieldsAccount();
+    content+='<p class="fineprint payment-rules-intro">'+m("用途说明什么时候使用这条规则；扣款顺序决定优先从哪个账户付款。","用途はルールを使う場面、引落順は優先する口座を表します。","Purpose tells when to use a rule; the order sets which account pays first.")+'</p><div class="button-row payment-rules-tools">'+b("rule-add",icon("plus")+" "+m("添加规则","ルールを追加","Add rule"))+b("payment-rules-save",m("保存","保存","Save"),"","button primary")+'</div>';
+    const cards=rules.map((rule,index)=>'<section class="rule-editor" data-rule="'+index+'"><div class="spread"><strong>'+m("规则","ルール","Rule")+' '+(index+1)+'</strong>'+b("rule-remove",m("删除规则","ルールを削除","Delete rule"),index,"text-button danger-text")+'</div><label class="field"><span>'+m("支付账户","支払口座","Payment account")+'</span><select data-rule-key="payment_method">'+accounts.map(([name,label])=>'<option value="'+e(name)+'" '+(rule.payment_method===name?"selected":"")+'>'+e(label)+'</option>').join("")+'</select></label><label class="field"><span>'+t("currency")+'</span><select data-rule-key="currency">'+[["",m("不限","指定なし","Any")],["JPY","JPY"],["CNY","CNY"],["USD","USD"]].map(([value,label])=>'<option value="'+value+'" '+(rule.currency===value?"selected":"")+'>'+label+'</option>').join("")+'</select></label><label class="field"><span>'+m("用途提示","適用する用途","Purpose / scenario")+'</span><textarea data-rule-key="purpose" rows="2">'+e(rule.purpose||"")+'</textarea></label><p class="fineprint">'+m("从上到下依次扣款","上から順に引き落とし","Funding priority, top to bottom")+'</p><div class="funding-order">'+(rule.account_order||[rule.payment_method]).map((name,position)=>'<div class="order-row"><span>'+(position+1)+'</span><select data-order="'+position+'">'+(cachedBootstrap?.accounts||[]).map(account=>'<option value="'+e(account.name)+'" '+(account.name===name?"selected":"")+'>'+e(account.name)+" · "+e(account.currency)+'</option>').join("")+'</select>'+b("order-up","↑",index+":"+position,"icon-button")+b("order-down","↓",index+":"+position,"icon-button")+b("order-remove","×",index+":"+position,"icon-button")+'</div>').join("")+'</div>'+b("order-add",m("添加扣款来源","引落元を追加","Add funding source"),index)+'</section>').join("");
+    content+='<div class="payment-rules-list">'+(cards.length?cards:'<section class="panel payment-rules-empty"><p>'+m("还没有付款规则，添加一条后就能按用途和顺序选择账户。","支払ルールがありません。追加すると用途と優先順位で口座を選べます。","No payment rules yet. Add one to choose accounts by purpose and priority.")+'</p>'+b("rule-add",icon("plus")+" "+m("添加规则","ルールを追加","Add rule"))+'</section>')+'</div>';
+  }
+  if(id==="points"){
+    const rules=pointRewardsDraft||(pointRewardsDraft=deepCopy(w.preferences?.pointRewardRules||[]));
+    const pointAccounts=(cachedBootstrap?.accounts||[]).filter(account=>account.type==="points"&&account.currency==="JPY");
+    const paymentAccounts=(cachedBootstrap?.accounts||[]).filter(account=>account.type!=="points");
+    const balances=(w.cash||[]).filter(account=>account.account_type==="points");
+    const recent=(w.transactions||[]).filter(row=>String(row.source||"").startsWith("auto_point_reward:")).slice(0,12);
+    const selectOptions=(items,selected,emptyLabel)=>items.length?items.map(account=>'<option value="'+e(String(account.id))+'" '+(String(selected)===String(account.id)?"selected":"")+'>'+e(account.name)+" · "+e(account.currency)+'</option>').join(''):'<option value="">'+e(emptyLabel)+'</option>';
+    const cards=rules.map((rule,index)=>'<section class="point-rule" data-point-rule="'+index+'"><div class="point-rule-head"><strong>'+m("返还规则","還元ルール","Reward rule")+' '+(index+1)+'</strong>'+b("point-rule-remove",m("删除","削除","Remove"),index,"text-button danger-text")+'</div><div class="point-rule-fields"><label class="field"><span>'+m("付款账户","支払口座","Payment account")+'</span><select data-point-rule-key="payment_account_id">'+selectOptions(paymentAccounts,rule.payment_account_id,m("没有可用账户","利用できる口座がありません","No eligible accounts"))+'</select></label><label class="field"><span>'+m("积分存入","還元先ポイント口座","Points account")+'</span><select data-point-rule-key="points_account_id">'+selectOptions(pointAccounts,rule.points_account_id,m("请先创建积分账户","先にポイント口座を作成してください","Create a points account first"))+'</select></label><label class="field point-rate-field"><span>'+m("返还比例（%）","還元率（%）","Reward rate (%)")+'</span><div class="point-rate-input"><input type="number" inputmode="decimal" min="0.01" max="100" step="0.01" data-point-rule-key="rate_percent" value="'+e((Number(rule.rate_bps||0)/100).toFixed(2))+'"><span>%</span></div></label></div></section>').join("");
+    const balanceCards=balances.length?balances.map(account=>'<article class="point-balance-card"><span>'+e(account.account_name)+'</span><strong>'+money(account.balance_minor,"JPY",account.minor_digits,"points")+'</strong></article>').join(""):'<p class="fineprint">'+m("还没有积分账户。请先到“余额”添加账户，并将类型设为“积分”。","ポイント口座がありません。「残高」で口座を追加し、種類を「ポイント」に設定してください。","No points account yet. Add one under Balances and set its type to Points.")+'</p>';
+    const recentRows=recent.length?recent.map(row=>'<div class="point-history-row"><div><strong>'+e(row.description||m("自动返积分","自動ポイント還元","Automatic points reward"))+'</strong><small>'+e(row.occurred_on||"")+" · "+e(row.account_name||"")+'</small></div><strong>+'+money(row.amount_minor,row.currency||"JPY",row.currency_minor_digits??0,"points")+'</strong></div>').join(""):'<p class="fineprint">'+m("设置规则后，新消费产生的积分会显示在这里。","ルール設定後、新しい利用で獲得したポイントがここに表示されます。","Rewards from future purchases will appear here after you set a rule.")+'</p>';
+    content+='<section class="panel point-overview"><div class="section-heading"><div><h3>'+m("积分余额","ポイント残高","Points balances")+'</h3><p class="fineprint">'+m("每1点按1日元等值记录，积分单独展示，不计入日常账户资产。","1ポイントを1円相当で記録します。日常の口座資産とは分けて表示します。","One point is recorded as ¥1 equivalent and shown separately from cash assets.")+'</p></div></div><div class="point-balance-grid">'+balanceCards+'</div></section>'+
+      '<section class="panel point-rules-panel"><div class="section-heading"><div><h3>'+m("消费自动返积分","利用時の自動ポイント還元","Automatic rewards on purchases")+'</h3><p class="fineprint">'+m("按付款账户设置返还比例。确认入账后的消费会自动记一笔积分收入；改删原消费时会同步调整。按日元等值金额计算，舍去不足1点的部分。规则只应用于保存后新增或修改的消费，不追溯旧账。","支払口座ごとに還元率を設定します。確定済みの利用にポイント収入を自動記録し、元の取引を編集・削除すると連動して更新します。円換算額から計算し、1ポイント未満は切り捨てます。保存後の新規・編集取引に適用し、過去分には遡及しません。","Set a rate for each payment account. Confirmed purchases create a points income entry; editing or deleting the purchase updates the linked reward. Rewards use the JPY-equivalent spend and round down to whole points. Rules apply to purchases entered or edited after saving; past entries are not backfilled.")+'</p></div></div><div class="point-rules-toolbar">'+b("point-rule-add",icon("plus")+" "+m("添加规则","ルールを追加","Add rule"))+b("point-rewards-save",m("保存","保存","Save"),"","button primary")+'</div><div class="point-rules-list">'+(cards||'<p class="fineprint">'+m("还没有返还规则，添加一条即可开始自动累计。","還元ルールはまだありません。追加すると自動で貯まります。","No reward rules yet. Add one to start tracking rewards automatically.")+'</p>')+'</div></section>'+
+      '<section class="panel point-history-panel"><h3>'+m("最近自动返还","最近の自動還元","Recent automatic rewards")+'</h3>'+recentRows+'</section>';
+  }
   if(id==="finance") {
     const finance=workspace.reports||workspace;
     const financeTabs=[["balance",m("余额和欠款","残高と借入","Balances and debt")],["profit",m("本期利润表","本期損益","Period profit")],["budget",m("预算管理","予算管理","Budget")]];
@@ -1833,7 +1996,13 @@ function renderModule(id) {
       const allocation=Object.values(plan).reduce((sum,value)=>sum+BigInt(value||0),0n);
       financePieColorNames=[...(cachedBootstrap?.categories||[]).map(row=>String(row.name||row.display_name||"")),...Object.keys(analytics.actualByCategory),...Object.keys(plan),m("其他","その他","Other")].filter(Boolean);
       financePieCategoryOrder=Object.entries(plan).sort(([,left],[,right])=>BigInt(left||0)>BigInt(right||0)?-1:BigInt(left||0)<BigInt(right||0)?1:0).map(([name])=>name);
-      content+='<div class="finance-budget-layout"><div class="finance-budget-side finance-spending-side"><div class="finance-spending-summary"><strong>'+e(period)+'</strong><span>'+m("本期已入账支出","今期の記帳済み支出","Posted spending this period")+' <b>'+money(analytics.totalSpent.toString())+'</b></span>'+(analytics.missingFxCount?'<small>'+m("缺少汇率的人民币流水：","為替未登録の人民元取引：","CNY entries missing exchange rates: ")+analytics.missingFxCount+m("笔，未计入图表。","件。グラフには含まれません。"," entries; excluded from charts.")+'</small>':"")+'</div><section class="finance-chart-panel"><div class="finance-chart-heading"><h3>'+m("支出趋势","支出の推移","Spending trend")+'</h3><div class="finance-chart-modes">'+b("budget-trend-mode",m("日度","日別","Daily"),"daily","pill "+(financeTrendMode==="daily"?"selected":""))+b("budget-trend-mode",m("月度","月別","Monthly"),"monthly","pill "+(financeTrendMode==="monthly"?"selected":""))+'</div></div><p class="finance-chart-hint">'+m("日度显示本期；月度显示近12个月。将鼠标移到折线上的圆点查看日期和金额。","日別は今期、月別は直近12か月です。折れ線の点にカーソルを合わせると日付と金額を表示します。","Daily shows this period; monthly shows the last 12 months. Hover over a point on the line for its date and amount.")+'</p>'+trendChart(analytics,financeTrendMode)+'</section><section class="finance-chart-panel"><h3>'+m("本期消费类别","今期の支出カテゴリ","Spending categories this period")+'</h3>'+financePieChart(Object.entries(analytics.actualByCategory),m("本期暂无已入账分类支出。","今期の記帳済みカテゴリ支出はありません。","No posted category spending this period."))+'</section></div><div class="finance-budget-side"><div class="finance-budget-head"><div><strong>'+e(period)+'</strong><p>'+m("总预算","予算合計","Total budget")+'：<b>'+money(total)+'</b>　·　'+m("分类分配","カテゴリ配分","Category allocation")+'：<b>'+money(allocation.toString())+'</b><br>'+m("已使用","使用済み","Spent")+'：<b>'+money(analytics.totalSpent.toString())+'</b>　·　'+m("剩余","残額","Remaining")+'：<b>'+money(remaining.toString())+'</b></p></div>'+b("budget-edit",m("编辑预算","予算編集","Edit budget"),"","button secondary finance-budget-edit")+'</div>'+(budgetRows.length?"":'<p class="fineprint finance-footnote">'+m("尚未设置分类预算。点击“编辑预算”设置。","カテゴリ予算は未設定です。「予算編集」から設定できます。","No category budgets yet. Select Edit budget to set them.")+'</p>')+financeTable([m("类别","カテゴリ","Category"),m("已使用","使用額","Spent"),m("预算","予算","Budget"),m("剩余","残額","Remaining")],budgetRows,m("本期分类预算","今期カテゴリ予算","Period category budget"),"budget-table")+'<section class="finance-chart-panel"><h3>'+m("预算分配","予算配分","Budget allocation")+'</h3>'+financePieChart(Object.entries(plan),m("添加类别预算后显示预算分配。","カテゴリ予算を追加すると配分を表示します。","Add category budgets to see the allocation."))+'</section></div></div>';
+      const spendingSummary='<div class="finance-spending-summary"><strong>'+e(period)+'</strong><span>'+m("本期已入账支出","今期の記帳済み支出","Posted spending this period")+' <b>'+money(analytics.totalSpent.toString())+'</b></span>'+(analytics.missingFxCount?'<small>'+m("缺少汇率的人民币流水：","為替未登録の人民元取引：","CNY entries missing exchange rates: ")+analytics.missingFxCount+m("笔，未计入图表。","件。グラフには含まれません。"," entries; excluded from charts.")+'</small>':"")+'</div>';
+      const trendPanel='<section class="finance-chart-panel"><div class="finance-chart-heading"><h3>'+m("支出趋势","支出の推移","Spending trend")+'</h3><div class="finance-chart-modes">'+b("budget-trend-mode",m("日度","日別","Daily"),"daily","pill "+(financeTrendMode==="daily"?"selected":""))+b("budget-trend-mode",m("月度","月別","Monthly"),"monthly","pill "+(financeTrendMode==="monthly"?"selected":""))+'</div></div><p class="finance-chart-hint">'+m("日度显示本期；月度显示近12个月。将鼠标移到折线上的圆点查看日期和金额。","日別は今期、月別は直近12か月です。折れ線の点にカーソルを合わせると日付と金額を表示します。","Daily shows this period; monthly shows the last 12 months. Hover over a point on the line for its date and amount.")+'</p>'+trendChart(analytics,financeTrendMode)+'</section>';
+      const spendingPie='<section class="finance-chart-panel"><h3>'+m("本期消费类别","今期の支出カテゴリ","Spending categories this period")+'</h3>'+financePieChart(Object.entries(analytics.actualByCategory),m("本期暂无已入账分类支出。","今期の記帳済みカテゴリ支出はありません。","No posted category spending this period."))+'</section>';
+      const budgetHead='<div class="finance-budget-head"><div><strong>'+e(period)+'</strong><p>'+m("总预算","予算合計","Total budget")+'：<b>'+money(total)+'</b>　·　'+m("分类分配","カテゴリ配分","Category allocation")+'：<b>'+money(allocation.toString())+'</b><br>'+m("已使用","使用済み","Spent")+'：<b>'+money(analytics.totalSpent.toString())+'</b>　·　'+m("剩余","残額","Remaining")+'：<b>'+money(remaining.toString())+'</b></p></div>'+b("budget-edit",m("编辑预算","予算編集","Edit budget"),"","button secondary finance-budget-edit")+'</div>';
+      const budgetTable=(budgetRows.length?"":'<p class="fineprint finance-footnote">'+m("尚未设置分类预算。点击“编辑预算”设置。","カテゴリ予算は未設定です。「予算編集」から設定できます。","No category budgets yet. Select Edit budget to set them.")+'</p>')+financeTable([m("类别","カテゴリ","Category"),m("已使用","使用額","Spent"),m("预算","予算","Budget"),m("剩余","残額","Remaining")],budgetRows,m("本期分类预算","今期カテゴリ予算","Period category budget"),"budget-table");
+      const budgetPie='<section class="finance-chart-panel"><h3>'+m("预算分配","予算配分","Budget allocation")+'</h3>'+financePieChart(Object.entries(plan),m("添加类别预算后显示预算分配。","カテゴリ予算を追加すると配分を表示します。","Add category budgets to see the allocation."))+'</section>';
+      content+='<div class="finance-budget-layout"><div class="finance-budget-side finance-spending-side">'+spendingSummary+trendPanel+'</div><div class="finance-budget-side finance-budget-main">'+budgetHead+budgetTable+'</div><div class="finance-pie-row">'+spendingPie+budgetPie+'</div></div>';
     }
   }
   if(id==="food") {
@@ -1851,13 +2020,6 @@ function renderModule(id) {
   }
   root.innerHTML=content;
   if(id==="finance"&&financialTab==="budget"){
-    const layout=root.querySelector(".finance-budget-layout");
-    const piePanels=[...root.querySelectorAll(".finance-pie")].map(pie=>pie.closest(".finance-chart-panel")).filter(Boolean);
-    if(layout&&piePanels.length===2){
-      const row=document.createElement("div");row.className="finance-pie-row";
-      layout.append(row);
-      piePanels.forEach(panel=>row.append(panel));
-    }
     const chart=root.querySelector(".trend-chart"),wrap=root.querySelector(".finance-chart-wrap"),tooltip=root.querySelector(".finance-chart-tooltip");
     chart?.addEventListener("pointermove",event=>{
       const point=event.target instanceof Element?event.target.closest(".trend-point"):null;
@@ -1947,7 +2109,7 @@ function financePieChart(entries,emptyMessage) {
 }
 function trendChart(analytics,mode="daily") {
   const points=mode==="monthly"?analytics.monthly:analytics.daily,max=points.reduce((largest,item)=>item.value>largest?item.value:largest,1n);
-  const width=760,left=22,right=748,top=12,bottom=138,plotHeight=bottom-top,slot=points.length?(right-left)/points.length:0;
+  const width=760,height=360,left=22,right=748,top=12,bottom=310,plotHeight=bottom-top,slot=points.length?(right-left)/points.length:0;
   const pointX=index=>left+slot*index+slot/2;
   const pointY=value=>{
     if(hiddenAmounts)return bottom-6;
@@ -1964,10 +2126,10 @@ function trendChart(analytics,mode="daily") {
   }).join("");
   const labelCount=Math.min(6,points.length),labels=Array.from({length:labelCount},(_,tick)=>{
     const index=Math.round((points.length-1)*tick/Math.max(1,labelCount-1)),x=pointX(index);
-    return '<text class="trend-axis-label" x="'+x.toFixed(1)+'" y="160" text-anchor="middle">'+e(points[index]?.label||"")+'</text>';
+    return '<text class="trend-axis-label" x="'+x.toFixed(1)+'" y="346" text-anchor="middle">'+e(points[index]?.label||"")+'</text>';
   }).join("");
   const chartLabel=mode==="monthly"?m("近12个月支出趋势","過去12か月の支出推移","Spending over the last 12 months"):m("本期日度支出趋势","今期の日別支出推移","Daily spending this period");
-  return '<div class="finance-chart-wrap"><svg class="trend-chart" viewBox="0 0 '+width+' 174" role="img" aria-label="'+e(chartLabel)+'">'+grid+line+markers+labels+'</svg><div class="finance-chart-tooltip hidden" role="tooltip"></div></div>';
+  return '<div class="finance-chart-wrap"><svg class="trend-chart" viewBox="0 0 '+width+' '+height+'" role="img" aria-label="'+e(chartLabel)+'"><g class="trend-plot">'+grid+line+'</g><g class="trend-markers">'+markers+'</g>'+labels+'</svg><div class="finance-chart-tooltip hidden" role="tooltip"></div></div>';
 }
 
 function renderCloud(target=$("#cloudControls"),includeHeader=true) {
@@ -2157,6 +2319,7 @@ async function runAction(action,data={},progress=null,refresh=true) {
     if(activeJob===opId){activeJob="";if(!isAgentAction)activeJobAgent="";window.cloudJobActive=false;updateConnection();}
     if(isAgentAction&&!localStorage.getItem("hh-active-job:"+owner))localStorage.removeItem("hh-active-job-conversation:"+owner);
     else if(!activeJob&&!isAgentAction)activeJobAgent="";
+    if(action==="cloud_upload")void loadWorkspace(true).catch(()=>{});
     if(ownsProgress){showActionProgress(action,"failed",error.message);await sleepMobile(action==="agent"||action==="agent_prepare"?1800:700);}
     throw error;
   }finally{if(ownsProgress)hideCloudProgress();}
@@ -2250,7 +2413,7 @@ function renderAgent({refreshBalance=true}={}) {
   renderAttachments();
   $("#chatForm").onsubmit=sendAgent;
   $("#chatInput").onkeydown=event=>{
-    if(event.key==="Enter"&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){
+    if(event.key==="Enter"&&!event.shiftKey&&!event.ctrlKey&&!event.isComposing&&event.keyCode!==229){
       event.preventDefault();$("#chatForm").requestSubmit();
     }
   };
@@ -2415,32 +2578,21 @@ async function editSettings(inline=false) {
   if(!inline)$("#editorDialog").addEventListener("close",()=>{$("#editorForm").oninput=null;$("#editorForm").onchange=null;$("#editorBody").onclick=null;$("#editorFooter").onclick=null;settingsDraft=null;settingsInlineCapture=null;},{once:true});
 }
 
-async function editRules() {
-  const cfg=workspace.preferences,rules=deepCopy(cfg.paymentRules),accounts=fieldsAccount();
-  const render=()=>{
-    $("#editorTitle").textContent=m("付款方式与扣款顺序","支払ルールと優先順位","Payment rules");
-    $("#editorSave").textContent=m("保存","保存","Save");$("#editorCancel").textContent=m("‹ 返回更多","‹ その他へ戻る","‹ Back to More");$("#editorFooter").replaceChildren();
-    $("#editorBody").innerHTML='<p class="fineprint">'+m("用途决定何时使用；扣款顺序决定先用哪个账户。同一规则只使用同币种账户，积分可加入日元顺序。","用途が適用場面を決め、口座順が引落優先順位を決めます。同一通貨のみ使用します。","The purpose matches a scenario; the ordered accounts determine funding. Keep one currency per rule; points may join JPY orders.")+'</p>'+rules.map((rule,index)=>'<section class="rule-editor" data-rule="'+index+'"><div class="spread"><strong>'+m("规则","ルール","Rule")+' '+(index+1)+'</strong>'+b("rule-remove",m("删除","削除","Remove"),index,"text-button danger-text")+'</div><label class="field"><span>'+m("支付账户","支払口座","Payment account")+'</span><select data-rule-key="payment_method">'+accounts.map(([name,label])=>'<option value="'+e(name)+'" '+(rule.payment_method===name?"selected":"")+'>'+e(label)+'</option>').join("")+'</select></label><label class="field"><span>'+t("currency")+'</span><select data-rule-key="currency">'+[["",m("不限","指定なし","Any")],["JPY","JPY"],["CNY","CNY"],["USD","USD"]].map(([value,label])=>'<option value="'+value+'" '+(rule.currency===value?"selected":"")+'>'+label+'</option>').join("")+'</select></label><label class="field"><span>'+m("用途提示","適用する用途","Purpose / scenario")+'</span><textarea data-rule-key="purpose" rows="3">'+e(rule.purpose)+'</textarea></label><p class="fineprint">'+m("从上到下依次扣款","上から順に引き落とし","Funding priority, top to bottom")+'</p><div class="funding-order">'+(rule.account_order||[rule.payment_method]).map((name,position)=>'<div class="order-row"><span>'+(position+1)+'</span><select data-order="'+position+'">'+(cachedBootstrap.accounts||[]).map(a=>'<option value="'+e(a.name)+'" '+(a.name===name?"selected":"")+'>'+e(a.name)+" · "+e(a.currency)+'</option>').join("")+'</select>'+b("order-up","↑",index+":"+position,"icon-button")+b("order-down","↓",index+":"+position,"icon-button")+b("order-remove","×",index+":"+position,"icon-button")+'</div>').join("")+'</div>'+b("order-add",m("添加扣款来源","引落元を追加","Add funding source"),index)+'</section>').join("")+b("rule-add",icon("plus")+" "+m("添加规则","ルールを追加","Add rule"));
-  };
-  const capture=()=>{
-    $$("[data-rule]").forEach(node=>{const rule=rules[Number(node.dataset.rule)];$$("[data-rule-key]",node).forEach(input=>rule[input.dataset.ruleKey]=input.value);rule.account_order=$$("[data-order]",node).map(input=>input.value);});
-  };
-  render();$("#editorDialog").showModal();
-  $("#editorForm").onsubmit=async event=>{event.preventDefault();capture();await guarded(async()=>{await runAction("payment_rules",{profiles:rules,revision:cfg.paymentRevision});$("#editorDialog").close();});};
-  $("#editorBody").onclick=async event=>{
-    const button=event.target.closest("[data-action]");if(!button)return;event.stopPropagation();capture();const action=button.dataset.action;
-    const [i,j]=button.dataset.id.split(":").map(Number);
-    if(action==="rule-add"){if(!accounts.length){showToast(t("needsAccount"),true);return;}rules.push({payment_method:accounts[0][0],purpose:"",currency:"",account_order:[accounts[0][0]]});}
-    if(action==="rule-remove"){if(!await confirmOnce(m("删除规则","ルールを削除","Remove rule")+" "+(i+1),m("保存后不再自动匹配此用途。","保存後、この用途を自動適用しません。","After saving, this scenario will no longer match.")))return;rules.splice(i,1);}
-    if(action==="order-add"){const used=rules[i].account_order;const candidate=cachedBootstrap.accounts.find(a=>!used.includes(a.name));if(candidate)used.push(candidate.name);}
-    if(action==="order-remove"){if(!await confirmOnce(m("移除扣款来源：","引落元を削除：","Remove funding source: ")+rules[i].account_order[j],m("保存后不再从此项扣款。","保存後、この項目から引き落としません。","This source will no longer be used after saving.")))return;rules[i].account_order.splice(j,1);}
-    if(action==="order-up"&&j>0)[rules[i].account_order[j-1],rules[i].account_order[j]]=[rules[i].account_order[j],rules[i].account_order[j-1]];
-    if(action==="order-down"&&j<rules[i].account_order.length-1)[rules[i].account_order[j+1],rules[i].account_order[j]]=[rules[i].account_order[j],rules[i].account_order[j+1]];
-    render();
-  };
-  $("#editorDialog").addEventListener("close",()=>$("#editorBody").onclick=null,{once:true});
+function capturePaymentRulesDraft(){
+  if(!Array.isArray(paymentRulesDraft))return;
+  $$("#modulePanel [data-rule]").forEach(node=>{
+    const rule=paymentRulesDraft[Number(node.dataset.rule)];if(!rule)return;
+    $$(`[data-rule-key]`,node).forEach(input=>rule[input.dataset.ruleKey]=input.value);
+    rule.account_order=$$(`[data-order]`,node).map(input=>input.value);
+  });
 }
-
+function capturePointRewardsDraft(){
+  if(!Array.isArray(pointRewardsDraft))return;
+  $$("#modulePanel [data-point-rule]").forEach(node=>{
+    const rule=pointRewardsDraft[Number(node.dataset.pointRule)];if(!rule)return;
+    $$('[data-point-rule-key]',node).forEach(input=>rule[input.dataset.pointRuleKey]=input.value);
+  });
+}
 async function handleMobileClick(event) {
   const button=event.target.closest("[data-action]");if(!button)return;
   // Specialized editors own their internal draft controls.
@@ -2490,14 +2642,80 @@ async function handleMobileClick(event) {
     if(action==="asset-tab"){assetTab=id;renderAssetTabs();return;}
     if(action==="finance-tab"){financialTab=id;renderModule("finance");return;}
     if(action==="settings-tab"){settingsInlineCapture?.();settingsInlineCapture=null;settingsTab=id;renderModule("settings");advanceTutorialTour(action,id);return;}
+    if(action==="backup-warning-reauthorize"){navigate("more");settingsTab="backup";moreTab="settings";renderMore();return;}
     if(action==="budget-trend-mode"){financeTrendMode=id;renderModule("finance");return;}
     if(action==="module-back"){resetMorePageState();const queuePanel=document.querySelector(".queue-panel");if(queuePanel)$("#backupPage")?.append(queuePanel);renderMore();return;}
+    if(["payment-rules-save","rule-add","rule-remove","order-add","order-remove","order-up","order-down"].includes(action)){
+      capturePaymentRulesDraft();
+      const rules=paymentRulesDraft||[],[ruleIndex,orderIndex]=String(id||"").split(":").map(Number);
+      if(action==="payment-rules-save"){
+        const result=await runAction("payment_rules",{profiles:deepCopy(rules),revision:workspace.preferences?.paymentRevision});
+        paymentRulesDraft=deepCopy(workspace?.preferences?.paymentRules||rules);renderModule("rules");
+        if(!result?.queued)showToast(m("付款规则已保存。","支払ルールを保存しました。","Payment rules saved."));
+        return;
+      }
+      if(action==="rule-add"){
+        const accounts=fieldsAccount();if(!accounts.length){showToast(t("needsAccount"),true);return;}
+        rules.push({payment_method:accounts[0][0],purpose:"",currency:"",account_order:[accounts[0][0]]});
+      }
+      if(action==="rule-remove"){
+        if(!Number.isInteger(ruleIndex)||!rules[ruleIndex])return;
+        if(!await confirmOnce(m("删除规则","ルールを削除","Delete rule")+" "+(ruleIndex+1),m("保存后不再自动匹配此用途。","保存後、この用途を自動適用しません。","After saving, this scenario will no longer match.")))return;
+        rules.splice(ruleIndex,1);
+      }
+      if(action==="order-add"){
+        const rule=rules[ruleIndex];if(!rule)return;
+        const order=rule.account_order||(rule.account_order=[rule.payment_method].filter(Boolean));
+        const candidate=(cachedBootstrap?.accounts||[]).find(account=>!order.includes(account.name));
+        if(candidate)order.push(candidate.name);else showToast(m("没有可添加的其他账户。","追加できる口座がありません。","There are no other accounts to add."),true);
+      }
+      if(action==="order-remove"){
+        const rule=rules[ruleIndex],accountName=rule?.account_order?.[orderIndex];if(!rule||accountName===undefined)return;
+        if(!await confirmOnce(m("移除扣款来源：","引落元を削除：","Remove funding source: ")+accountName,m("保存后不再从此项扣款。","保存後、この項目から引き落としません。","This source will no longer be used after saving.")))return;
+        rule.account_order.splice(orderIndex,1);
+      }
+      if(action==="order-up"&&Number.isInteger(orderIndex)&&orderIndex>0){const order=rules[ruleIndex]?.account_order;if(order)[order[orderIndex-1],order[orderIndex]]=[order[orderIndex],order[orderIndex-1]];}
+      if(action==="order-down"){const order=rules[ruleIndex]?.account_order;if(order&&orderIndex<order.length-1)[order[orderIndex+1],order[orderIndex]]=[order[orderIndex],order[orderIndex+1]];}
+      renderModule("rules");return;
+    }
+    if(["point-rewards-save","point-rule-add","point-rule-remove"].includes(action)){
+      capturePointRewardsDraft();
+      const rules=pointRewardsDraft||[],ruleIndex=Number(id);
+      if(action==="point-rule-add"){
+        const payments=(cachedBootstrap?.accounts||[]).filter(account=>account.type!=="points");
+        const points=(cachedBootstrap?.accounts||[]).filter(account=>account.type==="points"&&account.currency==="JPY");
+        if(!payments.length){showToast(m("请先添加一个付款账户。","先に支払口座を追加してください。","Add a payment account first."),true);return;}
+        if(!points.length){showToast(m("请先在余额页添加积分账户。","先に残高ページでポイント口座を追加してください。","Add a points account under Balances first."),true);return;}
+        const available=payments.find(account=>!rules.some(rule=>String(rule.payment_account_id)===String(account.id)));
+        if(!available){showToast(m("每个付款账户只能添加一条返还规则。","支払口座ごとに設定できる還元ルールは1件です。","Each payment account can have one reward rule."),true);return;}
+        rules.push({payment_account_id:String(available.id),points_account_id:String(points[0].id),rate_bps:0});
+        renderModule("points");return;
+      }
+      if(action==="point-rule-remove"){
+        if(!Number.isInteger(ruleIndex)||!rules[ruleIndex])return;
+        rules.splice(ruleIndex,1);renderModule("points");return;
+      }
+      const normalized=[];const seen=new Set();
+      for(const rule of rules){
+        const paymentId=Number(rule.payment_account_id),pointsId=Number(rule.points_account_id),rate=Number(rule.rate_percent);
+        if(!Number.isSafeInteger(paymentId)||!Number.isSafeInteger(pointsId)||!Number.isFinite(rate)||rate<=0||rate>100||Math.abs(rate*100-Math.round(rate*100))>1e-8){
+          showToast(m("请检查每条规则的付款账户、积分账户和返还比例（0.01% 至 100%，最多两位小数）。","各ルールの支払口座・ポイント口座・還元率（0.01%〜100%、小数2桁まで）を確認してください。","Check each payment account, points account, and reward rate (0.01%–100%, up to two decimals)."),true);return;
+        }
+        if(seen.has(paymentId)){showToast(m("同一个付款账户只能设置一条规则。","同じ支払口座には1件だけ設定できます。","Only one rule is allowed per payment account."),true);return;}
+        seen.add(paymentId);normalized.push({payment_account_id:paymentId,points_account_id:pointsId,rate_bps:Math.round(rate*100)});
+      }
+      const result=await runAction("point_rewards",{rules:normalized});
+      pointRewardsDraft=normalized.map(rule=>({...rule,payment_account_id:String(rule.payment_account_id),points_account_id:String(rule.points_account_id),rate_percent:(rule.rate_bps/100).toFixed(2)}));
+      renderModule("points");
+      if(!result?.queued)showToast(m("积分返还规则已保存。","ポイント還元ルールを保存しました。","Points reward rules saved."));
+      return;
+    }
     if(action==="favorites-edit"){favoritesEditing=!favoritesEditing;renderMore();return;}
     if(action==="favorites-add"){favoritesEditing=true;renderMore();document.querySelector(".favorite-picker")?.scrollIntoView({behavior:"smooth",block:"nearest"});return;}
     if(action==="favorite-remove"){saveFavorites(getFavorites().filter(item=>item!==id));showToast(m("已移除常用功能","ショートカットを削除しました","Shortcut removed"));renderMore();return;}
     if(action==="favorite-add"){const values=getFavorites();if(!values.includes(id)&&values.length<8){values.push(id);saveFavorites(values);showToast(m("已添加常用功能","ショートカットを追加しました","Shortcut added"));}else if(values.length>=8)showToast(m("最多添加 8 个常用功能","ショートカットは8件までです","You can add up to 8 shortcuts"),true);favoritesEditing=false;renderMore();return;}
     if(action==="favorite")return openFavorite(id);
-    if(action==="module"){navigate("more");if(id==="rules")return editRules();if(["backup","categories","settings"].includes(id)){settingsTab=id==="backup"?"backup":id==="categories"?"categories":"general";moreTab="settings";}else moreTab=id;renderMore();advanceTutorialTour(action,id);return;}
+    if(action==="module"){navigate("more");if(id==="rules")paymentRulesDraft=deepCopy(workspace?.preferences?.paymentRules||[]);if(id==="points")pointRewardsDraft=deepCopy(workspace?.preferences?.pointRewardRules||[]);if(["backup","categories","settings"].includes(id)){settingsTab=id==="backup"?"backup":id==="categories"?"categories":"general";moreTab="settings";}else moreTab=id;renderMore();advanceTutorialTour(action,id);return;}
     if(action==="add-card"){navigate("assets");assetTab="cash";renderAssetTabs();$("#accountForm").classList.remove("hidden");$("#accountForm [name=type]").value="credit";$("#accountForm [name=name]").focus();return;}
     if(action==="backup"){await runWithCloudProgress("backup","",progress=>runAction("backup",{},progress));showToast(m("备份已创建","バックアップを作成しました","Backup created"));return;}
     if(action==="scope-cancel"){backupDraft=null;if(moreTab==="settings"){settingsTab="backup";renderModule("settings");}else renderCloud();return;}
@@ -2529,6 +2747,38 @@ async function handleMobileClick(event) {
     const dateField=()=>field("date",t("date"),"date",workspace.date);
     const accountField=(name="account",type="all",value="")=>field(name,t("account"),"select",value,fieldsAccount(type));
     const amountField=(name="amount",label=t("amount"),value="")=>field(name,label,"decimal",value);
+    if(action==="investment-add"||action==="investment-edit"){
+      const existing=(workspace.investments||[]).find(row=>String(row.id)===String(id))||null;
+      const toInput=row=>{const code=String(row.currency||"JPY"),places=Number(row.minor_digits??currencyMinorDigits(code,0));return {id:String(row.id),name:String(row.name||""),kind:String(row.kind||"other"),currency:code,cost:plainAmount(row.cost_minor,places,code),value:plainAmount(row.value_minor,places,code),quantity:String(row.quantity||""),fundCode:String(row.fund_code||""),updatedOn:String(row.updated_on||workspace.date||"")};};
+      const positions=(workspace.investments||[]).map(toInput);
+      const values=existing?toInput(existing):{name:"",kind:"fund",currency:"JPY",cost:"",value:"",quantity:"",fundCode:""};
+      const kinds=[["fund",m("基金 / 投信","投資信託","Fund")],["jp_stock",m("日本股票","日本株","Japan stock")],["us_stock",m("美国股票","米国株","US stock")],["other",m("其他","その他","Other")]];
+      const currencies=[["JPY","JPY · "+m("日元","日本円","Japanese yen")],["CNY","CNY · "+m("人民币","人民元","Chinese yuan")],["USD","USD · "+m("美元","米ドル","US dollar")]];
+      return openForm(existing?m("修改投资持仓","投資保有情報を編集","Edit investment holding"):m("添加投资持仓","投資保有情報を追加","Add investment holding"),[
+        field("name",m("产品名称","商品名","Product name"),"text",values.name),
+        field("kind",m("产品类型","商品タイプ","Type"),"select",values.kind,kinds),
+        {...field("fundCode",m("基金代码（可选）","ファンドコード（任意）","Fund code (optional)"),"text",values.fundCode),optional:true},
+        field("currency",m("币种","通貨","Currency"),"select",values.currency,currencies),
+        amountField("cost",m("累计投入","累計投資額","Total invested"),values.cost),
+        {...amountField("value",m("手动估值（自动估值失败时使用）","手入力の評価額（自動取得できない場合に使用）","Manual value (used if auto valuation is unavailable)"),values.value),optional:true},
+        {...field("quantity",m("持有口数 / 数量","保有口数 / 数量","Units held / quantity"),"decimal",values.quantity),optional:true}
+      ],async data=>{
+        const name=String(data.name||"").trim(),cost=String(data.cost||"").trim(),value=String(data.value||cost).trim();
+        if(!name)throw new Error(m("请填写产品名称。","商品名を入力してください。","Enter a product name."));
+        const kind=data.kind||"other",quantity=String(data.quantity||"").trim(),fundCode=kind==="fund"?String(data.fundCode||"").trim():"";
+        if(fundCode&&!/^\d{6}$/.test(fundCode))throw new Error(m("基金代码请填写6位数字，或从产品搜索结果中选择。","ファンドコードは6桁の数字を入力するか、検索結果から選択してください。","Enter a six-digit fund code or select a search result."));
+        if(fundCode&&(!quantity||!/^\d{1,16}(?:\.\d{1,8})?$/.test(quantity)||Number(quantity)<=0))throw new Error(m("已选自动估值基金，请填写大于0的持有口数。","自動評価する投信を選択した場合、0より大きい保有口数を入力してください。","Enter a unit count greater than zero for automatic fund valuation."));
+        const next={id:existing?String(existing.id):createChatSessionId(),name,kind,currency:fundCode?"JPY":(data.currency||"JPY"),cost,value,quantity,fundCode,updatedOn:workspace.date};
+        const updated=existing?positions.map(row=>row.id===String(existing.id)?next:row):[...positions,next];
+        const result=await runAction("investment_save",{positions:updated});if(selectedPage==="investment")void refreshInvestmentQuotes();return result;
+      },{note:m("输入基金名称可搜索三菱UFJ资管的产品，选中后填持有口数；打开投资页时会取一次上一交易日净值并计算估值。其他公司基金、股票和产品仍可手动估值。行情只在本机页面临时计算，不写账本，也不连接券商。","三菱UFJアセットマネジメントの投信は商品名で検索できます。選択後に保有口数を入力すると、投資ページを開く際に前営業日の基準価額を1回取得して評価額を計算します。その他の投信・株式などは手動評価です。相場データはページ内で一時計算し、台帳には書き込まず、証券口座にも接続しません。","Search MUFG Asset Management funds by name, then enter units held. Opening Investments fetches the prior business day's NAV once and calculates value. Enter other funds, stocks, or products manually. Quotes are calculated temporarily in this page; they are not written to the ledger and no brokerage account is connected.") ,onReady:installFundNameSearch});
+    }
+    if(action==="investment-delete"){
+      const target=(workspace.investments||[]).find(row=>String(row.id)===String(id));if(!target)return;
+      if(!await confirmOnce(m("删除投资持仓","投資保有情報を削除","Delete investment holding"),m("只会删除这条投资记录，不会影响账户余额或账单。","この投資記録だけを削除し、口座残高や明細には影響しません。","Only this investment record will be removed. Account balances and ledger entries stay unchanged.")))return;
+      const positions=(workspace.investments||[]).filter(row=>String(row.id)!==String(id)).map(row=>{const currency=String(row.currency||"JPY"),digits=Number(row.minor_digits??currencyMinorDigits(currency,0));return {id:String(row.id),name:String(row.name||""),kind:String(row.kind||"other"),currency,cost:plainAmount(row.cost_minor,digits,currency),value:plainAmount(row.value_minor,digits,currency),quantity:String(row.quantity||""),fundCode:String(row.fund_code||""),updatedOn:String(row.updated_on||workspace.date||"")};});
+      return runAction("investment_save",{positions});
+    }
     const card=workspace.cards.find(row=>row.account_id===id);
     if(action==="account-rename"){
       const account=(cachedBootstrap?.accounts||[]).find(row=>String(row.id)===String(id));

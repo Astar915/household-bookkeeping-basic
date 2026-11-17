@@ -181,9 +181,44 @@ def automatic_pull(
                     if checkpoint.get('revision') and original != checkpoint['revision']:
                         raise LedgerError('本机有尚未同步的修改，已暂停自动下载；请先核对并上传或手动恢复。')
                 report_progress('发现云端更新，正在下载并校验…')
-                if download_kwargs is not None:
+                used_delta = False
+                if (download_kwargs is not None
+                        and checkpoint.get('revision')
+                        and original == checkpoint.get('revision')
+                        and getattr(type(client), 'download_snapshot_delta_with_revision', None)
+                        and getattr(type(client), 'read_snapshot_manifest', None)):
+                    try:
+                        from .sync_snapshot import SnapshotFormatError, build_snapshot
+                        cached_manifest = getattr(client, '_snapshot_manifest_cache', None)
+                        if (isinstance(cached_manifest, tuple) and len(cached_manifest) == 2
+                                and cached_manifest[0] == sha):
+                            remote_manifest, remote_sha = cached_manifest[1], cached_manifest[0]
+                        else:
+                            manifest_result = client.read_snapshot_manifest(repository)
+                            remote_manifest = manifest_result[0] if isinstance(manifest_result, tuple) else None
+                            remote_sha = manifest_result[1] if isinstance(manifest_result, tuple) and len(manifest_result) > 1 else None
+                        if remote_manifest is not None and remote_sha == sha:
+                            local_plan = build_snapshot(
+                                database_path,
+                                payment_store=stores.get('payment_store'),
+                                bookkeeping_skill_store=stores.get('bookkeeping_skill_store'),
+                                food_skill_store=stores.get('food_skill_store'),
+                                receipt_image_directory=stores.get('receipt_image_directory'),
+                                include_scope=remote_manifest.get('scope'),
+                                include_receipt_images=False,
+                                previous_manifest=remote_manifest,
+                            )
+                            body, sha = client.download_snapshot_delta_with_revision(
+                                repository, local_plan.files, expected_sha=sha,
+                                manifest=remote_manifest,
+                            )
+                            used_delta = True
+                    except SnapshotFormatError:
+                        # Keep the full, validated archive as the compatibility path.
+                        pass
+                if not used_delta and download_kwargs is not None:
                     body, sha = client.download_bundle_with_revision(repository, **download_kwargs)
-                else:
+                elif not used_delta:
                     body, sha = client.download_bundle_with_revision(repository)
                 with zipfile.ZipFile(BytesIO(body)) as archive:
                     item = archive.getinfo('manifest.json')
@@ -216,11 +251,17 @@ def automatic_pull(
     _, provider, repository, sha, body, save_remote, created, etag = max(versions, key=lambda x: x[0])
     if body is None:
         with lock:
+            current = local_revision(database_path, **stores)
+            expected = checkpoint.get('revision')
+            if expected and current != expected:
+                raise LedgerError('本机账本与上次同步时不同，不能确认云端已同步；请核对后上传或手动恢复。')
             # Keep the upload/restore baseline, even when local edits exist.
             current_state = state.load()
             current_state['clouds'] = checkpoint['clouds']
             state.save(current_state)
-        return {'status': 'current', 'restored': False, 'warnings': failures}
+        return {'status': 'current' if expected else 'unverified',
+                'restored': False, 'warnings': failures, 'provider': provider,
+                'repository': repository, 'created_at': created}
     with lock:
         current_checkpoint = state.load()
         paused = _paused_download_result(current_checkpoint)
@@ -238,4 +279,5 @@ def automatic_pull(
         save_remote(sha)
         state.synced(provider, repository, sha, local_revision(database_path, **stores), created, etag)
     return {'status': 'restored', 'restored': True, 'provider': provider,
+            'repository': repository, 'created_at': created,
             'backup': str(backup), 'warnings': failures}

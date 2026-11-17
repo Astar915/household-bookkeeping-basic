@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 from workers import fetch
 
 from ledger_runtime import execute_action, load_mobile_config
+from secret_crypto import encrypt_text
 from model_jobs import (
     MAX_CLOUD_BUNDLE_BYTES,
     MAX_FX_RESPONSE_BYTES,
@@ -325,6 +326,25 @@ async def advance_job(database, env, user_id: str, operation_id: str):
         )
         safe_detail = f"; {str(exc)[:180]}" if type(exc).__name__ == "IntegrityError" else ""
         print(f"App job failed ({type(exc).__name__}) at {locations}{safe_detail}.")
+        if action in {"cloud_upload", "cloud_auto_sync"}:
+            try:
+                from backup_status import backup_warning_kind, classify_backup_failure
+                provider = str(data.get("provider", "github")).lower() if action == "cloud_upload" else "github"
+                kind, backup_message = classify_backup_failure(provider, exc)
+                config = await load_mobile_config(database, env, user_id)
+                config["autoStatus"] = backup_message
+                config["autoStatusKind"] = backup_warning_kind([kind])
+                encoded = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+                encrypted = await encrypt_text(
+                    encoded, str(env.TOKEN_ENCRYPTION_KEY), "user:" + user_id + ":mobile-config",
+                )
+                await database.prepare(
+                    "INSERT INTO user_secrets(user_id,secret_name,encrypted_value,updated_at) "
+                    "VALUES(?,'mobile-config',?,?) ON CONFLICT(user_id,secret_name) DO UPDATE SET "
+                    "encrypted_value=excluded.encrypted_value,updated_at=excluded.updated_at"
+                ).bind(user_id, encrypted, _now()).run()
+            except Exception as status_error:
+                print(f"Could not persist cloud backup warning ({type(status_error).__name__}).")
         if isinstance(exc, (ValueError, RuntimeError)):
             message = str(exc)
         else:

@@ -84,15 +84,21 @@ function applyLanguage() {
   if (authLanguageSelect) {
     authLanguageSelect.value = currentLanguage;
     authLanguageSelect.setAttribute("aria-label", currentLanguage === "ja-JP" ? "表示言語" : currentLanguage === "en-US" ? "Display language" : "显示语言");
-    $("#authLanguageLabel").textContent = currentLanguage === "ja-JP" ? "表示言語" : currentLanguage === "en-US" ? "Language" : "界面语言";
+    const authLanguageLabel = $("#authLanguageLabel");
+    if (authLanguageLabel) authLanguageLabel.textContent = currentLanguage === "ja-JP" ? "表示言語" : currentLanguage === "en-US" ? "Language" : "界面语言";
   }
   const tutorialButton = $("#tutorialButton");
   if (tutorialButton) tutorialButton.textContent = currentLanguage === "ja-JP" ? "チュートリアル" : currentLanguage === "en-US" ? "Tutorial" : "新手教程";
-  $(".segmented").setAttribute("aria-label", currentLanguage === "ja-JP" ? "取引の種類" : currentLanguage === "en-US" ? "Transaction type" : "交易类型");
-  $("#showCategoryForm").setAttribute("aria-label", currentLanguage === "ja-JP" ? "カテゴリを追加" : currentLanguage === "en-US" ? "Add category" : "添加类别");
-  $("#accountForm [name=type]").innerHTML = ["bank","wallet","prepaid","transit","points","credit"].map(type => `<option value="${type}">${escapeHtml(WORDS[currentLanguage].accountTypes[type])}</option>`).join("");
-  $("#exportLedger").textContent = currentLanguage === "ja-JP" ? "クラウド台帳をエクスポート" : currentLanguage === "en-US" ? "Export cloud ledger" : "导出云端账本";
-  $("#transactionForm [name=description]").placeholder = currentLanguage === "zh-CN" ? "例如：超市买菜" : currentLanguage === "ja-JP" ? "例：スーパーで食材" : "e.g. groceries";
+  const transactionKinds = $(".segmented");
+  transactionKinds?.setAttribute("aria-label", currentLanguage === "ja-JP" ? "取引の種類" : currentLanguage === "en-US" ? "Transaction type" : "交易类型");
+  const categoryButton = $("#showCategoryForm");
+  categoryButton?.setAttribute("aria-label", currentLanguage === "ja-JP" ? "カテゴリを追加" : currentLanguage === "en-US" ? "Add category" : "添加类别");
+  const accountTypeSelect = $("#accountForm [name=type]");
+  if (accountTypeSelect) accountTypeSelect.innerHTML = ["bank","wallet","prepaid","transit","points","credit"].map(type => `<option value="${type}">${escapeHtml(WORDS[currentLanguage].accountTypes[type])}</option>`).join("");
+  const exportButton = $("#exportLedger");
+  if (exportButton) exportButton.textContent = currentLanguage === "ja-JP" ? "クラウド台帳をエクスポート" : currentLanguage === "en-US" ? "Export cloud ledger" : "导出云端账本";
+  const descriptionInput = $("#transactionForm [name=description]");
+  if (descriptionInput) descriptionInput.placeholder = currentLanguage === "zh-CN" ? "例如：超市买菜" : currentLanguage === "ja-JP" ? "例：スーパーで食材" : "e.g. groceries";
   if (cachedBootstrap) renderAll();
   window.dispatchEvent(new CustomEvent("household-language-changed", {detail: {language: currentLanguage}}));
 }
@@ -302,13 +308,16 @@ if (topbarForViewport && "ResizeObserver" in window) {
 
 function renderSessionStatus() {
   const text = (zh,ja,en) => currentLanguage === "ja-JP" ? ja : currentLanguage === "en-US" ? en : zh;
-  $("#sessionIdentity").textContent = currentUser
+  const identity = $("#sessionIdentity");
+  if (identity) identity.textContent = currentUser
     ? text("已登录：", "ログイン中：", "Signed in: ") + (currentUser.username || "")
     : text("正在恢复安全会话", "安全なセッションを確認中", "Restoring your secure session");
-  $("#sessionWelcome").textContent = currentUser
+  const welcome = $("#sessionWelcome");
+  if (welcome) welcome.textContent = currentUser
     ? text("欢迎回来", "おかえりなさい", "Welcome back")
     : text("正在打开家庭记账", "家計簿を開いています", "Opening your ledger");
-  $("#sessionLoadingText").textContent = cloudBootstrapFailed
+  const loadingText = $("#sessionLoadingText");
+  if (loadingText) loadingText.textContent = cloudBootstrapFailed
     ? text("网页仍保持登录。以下提示仅涉及 GitHub 备份，不需要重新注册或创建账本。", "Web版にはログイン済みです。以下はGitHubバックアップの状態であり、新規登録や台帳作成は不要です。", "You are still signed in. The message below concerns your GitHub backup; no new account or ledger is needed.")
     : currentUser
       ? text("正在打开你的账本，请稍候。", "台帳を開いています。しばらくお待ちください。", "Opening your ledger. Please wait.")
@@ -332,7 +341,8 @@ function showLoggedIn() {
   $("#authScreen").classList.add("hidden");
   $("#appScreen").classList.remove("hidden");
   $("#toolbar").classList.remove("hidden");
-  $("#usernameLabel").textContent = currentUser?.username || "";
+  const usernameLabel = $("#usernameLabel");
+  if (usernameLabel) usernameLabel.textContent = currentUser?.username || "";
   updateTopbarLayout(true);
   updateConnection();
 }
@@ -348,7 +358,8 @@ function showLoggedOut() {
 function showCloudBootstrapBlocked(message) {
   cloudBootstrapFailed = true;
   showSessionPending(true);
-  $("#cloudBootstrapError").textContent = message;
+  const errorNode = $("#cloudBootstrapError");
+  if (errorNode) errorNode.textContent = message;
 }
 
 function currencyMinorDigits(currency, fallbackDigits = 0) {
@@ -403,17 +414,25 @@ function updateConnection() {
     "en-US": {online:"Service connected",offline:"Saved offline",syncing:"Syncing ledger…",working:"Processing in the cloud…",pending:`${pendingSyncCount} pending`,conflict:"Sync conflict needs attention"},
   };
   const status = $("#connectionState");
-  status.textContent = labels[currentLanguage]?.[state] || labels["zh-CN"][state];
-  status.dataset.state = state;
-  status.classList.toggle("is-offline", state === "offline");
-  status.classList.toggle("is-syncing", state === "syncing" || state === "working");
-  status.classList.toggle("has-pending", state === "pending");
-  status.classList.toggle("has-conflict", state === "conflict");
-  $("#offlineBanner").classList.toggle("hidden", online || !currentUser);
-  $("#offlineBanner").textContent = t("networkHint");
-  $("#syncButton").disabled = sending || !navigator.onLine;
-  $("#syncButton").textContent = sending ? t("syncing") : t("syncNow");
-  $("#syncButton").title = t("uploadHint");
+  if (status) {
+    status.textContent = labels[currentLanguage]?.[state] || labels["zh-CN"][state];
+    status.dataset.state = state;
+    status.classList.toggle("is-offline", state === "offline");
+    status.classList.toggle("is-syncing", state === "syncing" || state === "working");
+    status.classList.toggle("has-pending", state === "pending");
+    status.classList.toggle("has-conflict", state === "conflict");
+  }
+  const offlineBanner = $("#offlineBanner");
+  if (offlineBanner) {
+    offlineBanner.classList.toggle("hidden", online || !currentUser);
+    offlineBanner.textContent = t("networkHint");
+  }
+  const syncButton = $("#syncButton");
+  if (syncButton) {
+    syncButton.disabled = sending || !navigator.onLine;
+    syncButton.textContent = sending ? t("syncing") : t("syncNow");
+    syncButton.title = t("uploadHint");
+  }
 }
 
 function renderAll() {
@@ -1098,7 +1117,7 @@ function setupEvents() {
     finally { delete target.dataset.saving; submit.disabled=false; }
   });
   $("#ledgerFile").addEventListener("change", event => handleImport(event.target.files?.[0]));
-  $("#exportLedger").addEventListener("click", exportLedger);
+  $("#exportLedger")?.addEventListener("click", exportLedger);
   window.addEventListener("online", () => { updateConnection(); syncQueue(); });
   window.addEventListener("offline", updateConnection);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) syncQueue(); });

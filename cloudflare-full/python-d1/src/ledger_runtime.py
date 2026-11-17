@@ -205,6 +205,7 @@ async def load_mobile_config(database: Any, env: Any, user_id: str) -> dict[str,
                     credential_updated = datetime.fromisoformat(str(_field(sync_row, "updated_at")).replace("Z", "+00:00"))
                     if credential_updated > config_updated:
                         cfg["autoStatus"] = ""
+                        cfg["autoStatusKind"] = "ok"
                 except (TypeError, ValueError):
                     pass
     return cfg
@@ -309,6 +310,7 @@ async def _complete_unchanged_cloud_upload(
     )
     if action == "cloud_auto_sync":
         config["autoStatus"] = "云端自动备份完成。"
+        config["autoStatusKind"] = "ok"
 
     statements = [database.prepare(
         "UPDATE app_jobs SET state='done',message='已完成',result_json=?,updated_at=? "
@@ -549,6 +551,7 @@ class WorkerMobileWorkspace(MobileWorkspace):
     def public_settings(self, uid):
         value = super().public_settings(uid)
         value["autoStatus"] = str(self.config(uid).get("autoStatus", ""))
+        value["autoStatusKind"] = str(self.config(uid).get("autoStatusKind", ""))
         value["onboardingRequired"] = not bool(self.config(uid).get("onboardingCompleted", True))
         value.pop("onboardingCompleted", None)
         return value
@@ -871,7 +874,9 @@ class WorkerMobileWorkspace(MobileWorkspace):
         opener = getattr(self, "_provider_opener", None)
 
         if action == "cloud_auto_sync":
+            from backup_status import backup_warning_kind, classify_backup_failure
             outcomes = []
+            failure_kinds = []
             for selected_provider, cloud in list(config.get("cloud", {}).items()):
                 if selected_provider not in {"github", "gitee"} or not cloud.get("token"):
                     continue
@@ -893,13 +898,8 @@ class WorkerMobileWorkspace(MobileWorkspace):
                         f"Automatic cloud backup failed "
                         f"(provider={selected_provider}, error={type(exc).__name__}, at={locations})."
                     )
-                    if selected_provider == "github" and isinstance(exc, GitHubAuthError):
-                        failure_message = (
-                            "GitHub 授权需要重新连接。请到“更多 → 设置 → 备份”点击“连接 / 重新授权”，"
-                            "然后上传备份；账目仍保存在网页版云端。"
-                        )
-                    else:
-                        failure_message = "自动备份未完成，请检查网络、授权或云端版本。账目已保存。"
+                    failure_kind, failure_message = classify_backup_failure(selected_provider, exc)
+                    failure_kinds.append(failure_kind)
                     outcomes.append((selected_provider, False, failure_message))
             updated = self.config(uid)
             successful = sum(1 for _provider, ok, _message in outcomes if ok)
@@ -907,13 +907,17 @@ class WorkerMobileWorkspace(MobileWorkspace):
             if not outcomes:
                 status = "未连接云端备份服务。"
             elif failed and successful:
-                status = "部分云端自动备份未完成，请检查连接状态。账目已保存。"
+                messages = [message for _provider, ok, message in outcomes if not ok]
+                status = "部分云端自动备份未完成：" + "；".join(messages)
             elif failed:
                 messages = [message for _provider, ok, message in outcomes if not ok]
-                status = "；".join(messages) or "云端自动备份未完成，请检查连接状态。账目已保存。"
+                status = ("部分云端备份未完成：" if successful else "") + (
+                    "；".join(messages) or "云端自动备份未完成，请检查连接状态。账目已保存。"
+                )
             else:
                 status = "云端自动备份完成。"
             updated["autoStatus"] = status
+            updated["autoStatusKind"] = backup_warning_kind(failure_kinds)
             self.save_config(uid, updated)
             return {"message": status, "providers": outcomes}
 
@@ -959,6 +963,8 @@ class WorkerMobileWorkspace(MobileWorkspace):
                 "lastSha": None,
                 "cloudSha": sha,
             }
+            config["autoStatus"] = ""
+            config["autoStatusKind"] = "ok"
             self.save_config(uid, config)
             if action == "github_auth":
                 PullState(self.folder(uid) / "cloud_pull_state.json").pause_downloads(choice_pending=True)
@@ -1080,7 +1086,9 @@ class WorkerMobileWorkspace(MobileWorkspace):
                         refresh_token=getattr(client, "refresh_token", ""),
                         snapshotCheckpoint=refreshed_checkpoint,
                     )
-                    if selected != previous_selected:
+                    config["autoStatus"] = "云端备份已是最新。"
+                    config["autoStatusKind"] = "ok"
+                    if selected != previous_selected or config != original_config:
                         self.save_config(uid, config)
                     return {"message": "云端备份已是最新，无需上传。", "unchanged": True}
             sync_revision = local_revision(self.db_path(uid), **self.stores(uid))
@@ -1136,6 +1144,8 @@ class WorkerMobileWorkspace(MobileWorkspace):
             if manifest_etag:
                 snapshot_checkpoint["manifestEtag"] = manifest_etag
             selected["snapshotCheckpoint"] = snapshot_checkpoint
+            updated["autoStatus"] = "云端备份完成。"
+            updated["autoStatusKind"] = "ok"
         else:
             selected.pop("snapshotCheckpoint", None)
         self.save_config(uid, updated)
