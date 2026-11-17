@@ -253,6 +253,7 @@ DEFAULT_CATEGORIES = (
     ("现金盘盈", "income"),
     ("余额盘盈", "income"),
     ("积分盘盈", "income"),
+    ("积分返还", "income"),
     ("餐饮", "expense"),
     ("食材", "expense"),
     ("交通", "expense"),
@@ -276,6 +277,7 @@ DEFAULT_CATEGORY_TRANSLATIONS = (
     ("现金盘盈", "現金過剰", "Cash surplus"),
     ("余额盘盈", "残高過剰", "Balance surplus"),
     ("积分盘盈", "ポイント過剰", "Points surplus"),
+    ("积分返还", "ポイント還元", "Points reward"),
     ("餐饮", "外食", "Dining"),
     ("食材", "食材・食品", "Groceries"),
     ("交通", "交通費", "Transportation"),
@@ -1158,6 +1160,9 @@ class Database:
         """
         account = self.account(account_name)
         account_id = int(account["id"])
+        from .cash_management import cash_currency_for_name
+
+        cash_currency = cash_currency_for_name(self, account_name)
         if account["account_type"] not in {"bank", "wallet", "prepaid", "transit", "points"}:
             raise LedgerError("此账户不属于现金管理；请在对应管理页面处理。")
         protected_references = self._account_deletion_blockers(account_id)
@@ -1201,11 +1206,9 @@ class Database:
                 "DELETE FROM account_balance_snapshots WHERE account_id=?", (account_id,)
             )
             self.connection.execute("DELETE FROM accounts WHERE id=?", (account_id,))
-            hidden_cash_currencies = {
-                "现金（日元）": "JPY",
-                "现金（人民币）": "CNY",
-            }
-            cash_currency = hidden_cash_currencies.get(account_name)
+            self.connection.execute(
+                "DELETE FROM settings WHERE key=?", (f"account_name_aliases_{account_id}",)
+            )
             if cash_currency is not None:
                 self.connection.execute(
                     "INSERT OR REPLACE INTO settings(key,value,note) VALUES (?,?,?)",
@@ -1537,6 +1540,7 @@ class Database:
                 )
             if effect == "posted":
                 self._record_credit_recovery_points([int(cursor.lastrowid)])
+                self._sync_auto_point_reward(int(cursor.lastrowid))
             self.connection.commit()
         except sqlite3.IntegrityError as exc:
             self.connection.rollback()
@@ -1665,6 +1669,8 @@ class Database:
                     ids[0], date_text, item_names, purchase_item_source, "unclassified"
                 )
             self._record_credit_recovery_points(ids)
+            for transaction_id in ids:
+                self._sync_auto_point_reward(transaction_id)
             self.connection.commit()
         except sqlite3.IntegrityError as exc:
             self.connection.rollback()
@@ -1943,6 +1949,108 @@ class Database:
             raise
         return inserted
 
+    def _sync_auto_point_reward(self, transaction_id: int) -> int:
+        """Keep web-configured automatic points rewards linked to their purchase."""
+        reward_prefix = f"auto_point_reward:{int(transaction_id)}"
+        transaction = self.connection.execute(
+            """SELECT t.*,a.name AS account_name,a.account_type AS account_type
+               FROM transactions t LEFT JOIN accounts a ON a.id=t.account_id
+               WHERE t.id=?""",
+            (int(transaction_id),),
+        ).fetchone()
+        if transaction is None or str(transaction["source"] or "").startswith("auto_point_reward:"):
+            return 0
+
+        reward = self.connection.execute(
+            "SELECT id,source FROM transactions WHERE source=? OR source LIKE ? ORDER BY id LIMIT 1",
+            (reward_prefix, reward_prefix + ":%"),
+        ).fetchone()
+        rule = None
+        try:
+            configured = json.loads(self.get_setting("point_reward_rules_v1", "[]"))
+        except (TypeError, ValueError):
+            configured = []
+        if isinstance(configured, list) and transaction["account_id"] is not None:
+            for candidate in configured:
+                if not isinstance(candidate, dict) or candidate.get("enabled", True) is False:
+                    continue
+                try:
+                    matches = int(candidate.get("payment_account_id")) == int(transaction["account_id"])
+                    rate_bps = int(candidate.get("rate_bps"))
+                    points_account_id = int(candidate.get("points_account_id"))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if matches and 1 <= rate_bps <= 10000:
+                    point_account = self.connection.execute(
+                        "SELECT id,name,account_type,currency,opening_date FROM accounts WHERE id=?",
+                        (points_account_id,),
+                    ).fetchone()
+                    if (point_account is not None and point_account["account_type"] == "points"
+                            and point_account["currency"] == "JPY"):
+                        rule = (point_account, rate_bps, int(transaction["account_id"]))
+                        break
+
+        eligible = (
+            transaction["kind"] == "expense"
+            and transaction["balance_effect"] == "posted"
+            and not bool(transaction["needs_review"])
+            and transaction["account_id"] is not None
+            and transaction["account_type"] != "points"
+        )
+        reward_minor = 0
+        point_account = None
+        if eligible and rule is not None:
+            point_account, rate_bps, payment_account_id = rule
+            if str(transaction["occurred_on"]) >= str(point_account["opening_date"]):
+                if str(transaction["currency"]) == "JPY":
+                    basis_minor = int(transaction["amount_minor"])
+                elif transaction["jpy_equiv_minor"] is not None:
+                    basis_minor = int(transaction["jpy_equiv_minor"])
+                else:
+                    basis_minor = 0
+                reward_minor = basis_minor * rate_bps // 10000
+
+        if reward_minor <= 0 or point_account is None:
+            if reward is not None:
+                self.connection.execute("DELETE FROM transactions WHERE id=?", (int(reward["id"]),))
+            return 0
+
+        category = self.connection.execute(
+            "SELECT id FROM categories WHERE name='积分返还' AND kind='income' AND is_active=1",
+        ).fetchone()
+        if category is None:
+            if reward is not None:
+                self.connection.execute("DELETE FROM transactions WHERE id=?", (int(reward["id"]),))
+            return 0
+
+        reward_source = f"{reward_prefix}:{payment_account_id}:{int(point_account['id'])}:{rate_bps}"
+        description = f"积分返还 · {transaction['account_name'] or '账户'} · {transaction['description']}"[:300]
+        values = (
+            str(transaction["occurred_on"]), reward_minor, int(point_account["id"]), int(category["id"]),
+            description, str(transaction["created_at"]),
+        )
+        if reward is None:
+            self.connection.execute(
+                """INSERT INTO transactions
+                   (occurred_on,kind,amount_minor,currency,account_id,category_id,description,
+                    balance_effect,jpy_equiv_minor,needs_review,source,created_at)
+                   VALUES (?,'income',?,'JPY',?,?,?,'posted',?,0,?,?)""",
+                (values[0], values[1], values[2], values[3], values[4], values[1], reward_source, values[5]),
+            )
+        else:
+            self.connection.execute(
+                """UPDATE transactions
+                   SET occurred_on=?,kind='income',amount_minor=?,currency='JPY',account_id=?,
+                       to_account_id=NULL,to_amount_minor=NULL,category_id=?,description=?,
+                       balance_effect='posted',jpy_equiv_minor=?,fx_rate=NULL,fx_rate_date=NULL,
+                       fx_source=NULL,account_amount_minor=NULL,account_fx_rate=NULL,
+                       account_fx_rate_date=NULL,account_fx_source=NULL,needs_review=0,source=?,created_at=?
+                   WHERE id=?""",
+                (values[0], values[1], values[2], values[3], values[4], values[1], reward_source,
+                 values[5], int(reward["id"])),
+            )
+        return reward_minor
+
     def add_credit_limit_snapshot(
         self, account_name: str, snapshot_date: str, limit: str | int, available: str | int, note: str = ""
     ) -> int:
@@ -2101,52 +2209,58 @@ class Database:
             raise LedgerError("账本正在执行其他写入，暂时无法恢复额度快照")
         if snapshot_type not in {"manual", "automatic"}:
             raise LedgerError("额度快照类型无效")
-        table = "credit_limit_snapshots" if snapshot_type == "manual" else "credit_limit_recovery_points"
-        selected = self.connection.execute(
-            f"SELECT * FROM {table} WHERE account_id=? AND id=?",
-            (account_id, snapshot_id),
-        ).fetchone()
-        if selected is None:
+        history = self.credit_snapshot_history(account_id, limit=500)
+        selected_index = next(
+            (
+                index for index, row in enumerate(history)
+                if row["snapshot_type"] == snapshot_type and int(row["id"]) == snapshot_id
+            ),
+            None,
+        )
+        if selected_index is None:
             raise LedgerError("所选额度快照已不存在，请刷新历史后重试")
+        selected = history[selected_index]
         if snapshot_type == "automatic" and selected["available_minor"] is None:
             raise LedgerError("这笔流水发生时还没有额度基准，无法作为恢复快照；可以在流水列表中撤销这笔记录")
-        snapshot_date = str(selected["snapshot_date"])
-        created_at = str(selected["created_at"])
-        transaction_id = (
-            int(selected["transaction_id"]) if snapshot_type == "automatic" else 0
-        )
-        manual_count = int(self.connection.execute(
-            """SELECT COUNT(*) FROM credit_limit_snapshots
-               WHERE account_id=? AND (snapshot_date>? OR (snapshot_date=? AND created_at>?))""",
-            (account_id, snapshot_date, snapshot_date, created_at),
-        ).fetchone()[0])
-        recovery_count = int(self.connection.execute(
-            """SELECT COUNT(*) FROM credit_limit_recovery_points
-               WHERE account_id=? AND (
-                   snapshot_date>? OR
-                   (snapshot_date=? AND (created_at>? OR (created_at=? AND transaction_id>?)))
-               )""",
-            (account_id, snapshot_date, snapshot_date, created_at, created_at, transaction_id),
-        ).fetchone()[0])
+        newer_rows = history[:selected_index]
+        manual_count = sum(row["snapshot_type"] == "manual" for row in newer_rows)
+        recovery_count = sum(row["snapshot_type"] == "automatic" for row in newer_rows)
         if manual_count + recovery_count == 0:
             raise LedgerError("所选快照已经是最新快照，无需恢复")
 
         backup_path = self._backup_before_credit_recovery("snapshot-restore")
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            self.connection.execute(
-                """DELETE FROM credit_limit_snapshots
-                   WHERE account_id=? AND (snapshot_date>? OR (snapshot_date=? AND created_at>?))""",
-                (account_id, snapshot_date, snapshot_date, created_at),
+            # Re-read under the write lock so a snapshot added after the backup
+            # is included in the same ordering used by the history screen.
+            current_history = self.credit_snapshot_history(account_id, limit=500)
+            current_index = next(
+                (
+                    index for index, row in enumerate(current_history)
+                    if row["snapshot_type"] == snapshot_type and int(row["id"]) == snapshot_id
+                ),
+                None,
             )
-            self.connection.execute(
-                """DELETE FROM credit_limit_recovery_points
-                   WHERE account_id=? AND (
-                       snapshot_date>? OR
-                       (snapshot_date=? AND (created_at>? OR (created_at=? AND transaction_id>?)))
-                   )""",
-                (account_id, snapshot_date, snapshot_date, created_at, created_at, transaction_id),
-            )
+            if current_index is None:
+                raise LedgerError("所选额度快照已不存在，请刷新历史后重试")
+            newer_rows = current_history[:current_index]
+            if not newer_rows:
+                raise LedgerError("所选快照已经是最新快照，无需恢复")
+            manual_count = sum(row["snapshot_type"] == "manual" for row in newer_rows)
+            recovery_count = sum(row["snapshot_type"] == "automatic" for row in newer_rows)
+            manual_ids = [int(row["id"]) for row in newer_rows if row["snapshot_type"] == "manual"]
+            recovery_ids = [int(row["id"]) for row in newer_rows if row["snapshot_type"] == "automatic"]
+            for table, row_ids in (
+                ("credit_limit_snapshots", manual_ids),
+                ("credit_limit_recovery_points", recovery_ids),
+            ):
+                for offset in range(0, len(row_ids), 400):
+                    chunk = row_ids[offset:offset + 400]
+                    placeholders = ",".join("?" for _ in chunk)
+                    self.connection.execute(
+                        f"DELETE FROM {table} WHERE account_id=? AND id IN ({placeholders})",
+                        (account_id, *chunk),
+                    )
             self.connection.commit()
         except Exception:
             self.connection.rollback()
@@ -2291,6 +2405,7 @@ class Database:
                 )
                 if cursor.rowcount != 1:
                     raise LedgerError("流水状态已改变，请刷新后重试。")
+                self._sync_auto_point_reward(transaction_id)
             return False
 
         if row["kind"] not in {"income", "expense"}:
@@ -2347,6 +2462,7 @@ class Database:
             if cursor.rowcount != 1:
                 raise LedgerError("流水状态已改变，请刷新后重试。")
             self._record_credit_recovery_points([transaction_id])
+            self._sync_auto_point_reward(transaction_id)
         return True
 
     def update_transaction_with_backup(
@@ -2375,6 +2491,8 @@ class Database:
         ).fetchone()
         if old is None:
             raise LedgerError("所选流水已不存在，请刷新账单记录后重试。")
+        if str(old["source"] or "").startswith("auto_point_reward:"):
+            raise LedgerError("这条是自动生成的积分返还记录，请修改对应消费账目以同步调整。")
         if self.connection.execute(
             "SELECT 1 FROM credit_repayment_periods WHERE transaction_id=?", (transaction_id,)
         ).fetchone() is not None:
@@ -2600,6 +2718,7 @@ class Database:
                     "DELETE FROM food_purchase_items WHERE transaction_id=?", (transaction_id,)
                 )
             self._rebuild_credit_recovery_points(affected_card_ids)
+            self._sync_auto_point_reward(transaction_id)
             self.connection.commit()
         except Exception:
             self.connection.rollback()
@@ -2710,10 +2829,12 @@ class Database:
         ).fetchone() is None:
             raise LedgerError(f"找不到流水 #{transaction_id}；请刷新账单记录后重试")
         transaction = self.connection.execute(
-            """SELECT id,occurred_on,created_at,account_id,to_account_id
+            """SELECT id,occurred_on,created_at,account_id,to_account_id,source
                FROM transactions WHERE id=?""",
             (transaction_id,),
         ).fetchone()
+        if str(transaction["source"] or "").startswith("auto_point_reward:"):
+            raise LedgerError("这条是自动生成的积分返还记录，请删除对应消费账目以同步撤销。")
 
         backup_root = (
             self.path.parent.parent / "backups"
@@ -2753,6 +2874,11 @@ class Database:
                     f"UPDATE credit_repayment_rules SET last_status=?,updated_at=? WHERE id IN ({placeholders})",
                     ("本期流水已手工删除；自动还款关联已取消", now, *rule_ids),
                 )
+
+            self.connection.execute(
+                "DELETE FROM transactions WHERE source=? OR source LIKE ?",
+                (f"auto_point_reward:{int(transaction_id)}", f"auto_point_reward:{int(transaction_id)}:%"),
+            )
 
             for account_id in (transaction["account_id"], transaction["to_account_id"]):
                 if account_id is None:
@@ -2890,6 +3016,12 @@ class Database:
                 parse_date(row["next_due_date"], self.time_zone)
             except LedgerError:
                 errors.append(f"每月还款计划“{row['card_name']}”日期无效")
+            try:
+                due_time = str(row["due_time"])
+                if datetime.strptime(due_time, "%H:%M").strftime("%H:%M") != due_time:
+                    raise ValueError("invalid time format")
+            except (TypeError, ValueError):
+                errors.append(f"每月还款计划“{row['card_name']}”时间无效")
         for row in self.connection.execute(
             """SELECT p.*,r.card_account_id,card.name AS card_name,t.kind AS transaction_kind,
                       t.to_account_id AS transaction_card_id,t.occurred_on AS transaction_date

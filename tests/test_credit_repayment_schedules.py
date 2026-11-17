@@ -75,6 +75,16 @@ class CreditRepaymentScheduleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._save(due_time="9:00")
 
+    def test_database_validation_checks_saved_repayment_time(self) -> None:
+        self._save(due_time="09:00")
+        self.db.connection.execute(
+            "UPDATE credit_repayment_rules SET due_time='9:00' WHERE card_account_id=?",
+            (self.db.account("Mercari Card")["id"],),
+        )
+        self.db.connection.commit()
+        errors, _ = self.db.validate()
+        self.assertTrue(any("时间无效" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

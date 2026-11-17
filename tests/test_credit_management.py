@@ -126,6 +126,50 @@ class CreditManagementTests(unittest.TestCase):
             finally:
                 migrated.close()
 
+    def test_restore_uses_snapshot_history_order_for_same_time_entries(self) -> None:
+        card_id = int(self.db.account("Mercari Card")["id"])
+        self.db.add_transaction(
+            occurred_on="2026-10-16", kind="expense", amount="1000", currency="JPY",
+            account_name="Mercari Card", category_name="娱乐", description="快照后消费",
+        )
+        self.db.add_credit_limit_snapshot(
+            "Mercari Card", "2026-10-16", "100000", "39000", note="当天手工快照",
+        )
+        manual = self.db.connection.execute(
+            "SELECT id FROM credit_limit_snapshots WHERE account_id=? AND snapshot_date=?",
+            (card_id, "2026-10-16"),
+        ).fetchone()
+        automatic = self.db.connection.execute(
+            "SELECT id FROM credit_limit_recovery_points WHERE account_id=? AND snapshot_date=?",
+            (card_id, "2026-10-16"),
+        ).fetchone()
+        self.assertIsNotNone(manual)
+        self.assertIsNotNone(automatic)
+
+        # Equal timestamps force the history screen's transaction-id tie break.
+        shared_created_at = "2026-11-17 00:00:00.000000"
+        self.db.connection.execute(
+            "UPDATE credit_limit_snapshots SET created_at=? WHERE id=?",
+            (shared_created_at, manual["id"]),
+        )
+        self.db.connection.execute(
+            "UPDATE credit_limit_recovery_points SET created_at=? WHERE id=?",
+            (shared_created_at, automatic["id"]),
+        )
+        self.db.connection.commit()
+        history = self.db.credit_snapshot_history(card_id, limit=500)
+        selected = next(row for row in history if row["snapshot_type"] == "manual" and row["id"] == manual["id"])
+        self.assertEqual(history[0]["snapshot_type"], "automatic")
+
+        backup, manual_count, recovery_count = self.db.restore_credit_snapshot_history(
+            card_id, "manual", int(selected["id"]),
+        )
+        self.assertTrue(backup.exists())
+        self.assertEqual((manual_count, recovery_count), (0, 1))
+        remaining = self.db.credit_snapshot_history(card_id, limit=500)
+        self.assertNotIn(int(automatic["id"]), {int(row["id"]) for row in remaining if row["snapshot_type"] == "automatic"})
+        self.assertIn(int(manual["id"]), {int(row["id"]) for row in remaining if row["snapshot_type"] == "manual"})
+
     def test_repayment_is_a_transfer_and_changes_only_the_card_ledger_balance(self) -> None:
         self.db.add_transaction(
             occurred_on="2026-10-16", kind="expense", amount="20000", currency="JPY",

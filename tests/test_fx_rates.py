@@ -15,6 +15,7 @@ from unittest.mock import patch
 from bookkeeping.cli import _report
 from bookkeeping.fx_rates import (
     ECB_SOURCE,
+    FxRateUnavailable,
     JpyRate,
     convert_minor_to_jpy_minor,
     resolve_jpy_rate,
@@ -47,6 +48,19 @@ class FxRateTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(cached), ("23.600000000000", "2026-10-09", ECB_SOURCE))
         self.assertEqual(convert_minor_to_jpy_minor(100, 2, rate.rate), 24)
+
+    def test_rate_lookup_uses_independent_fallback_when_primary_is_unavailable(self) -> None:
+        observations = [
+            {"date": "2026-10-14", "quote": "CNY", "rate": "7.5"},
+            {"date": "2026-10-14", "quote": "JPY", "rate": "177"},
+        ]
+        with patch("bookkeeping.fx_rates._download_ecb_cross_rates", side_effect=FxRateUnavailable("primary down")), \
+             patch("bookkeeping.fx_rates._download_frankfurter_v1_cross_rates", return_value=observations) as fallback, \
+             redirect_stdout(StringIO()):
+            rate = resolve_jpy_rate(self.db, "CNY", "2026-10-15")
+        self.assertEqual(rate.rate, Decimal("23.6"))
+        self.assertEqual(rate.rate_date, "2026-10-14")
+        fallback.assert_called_once()
 
     def test_cny_expense_stores_original_amount_and_transaction_date_jpy_equivalent(self) -> None:
         self.db.add_account(

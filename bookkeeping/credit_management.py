@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import sqlite3
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -223,15 +224,40 @@ def save_credit_repayment_schedule(
         if amount_minor is not None:
             if period and period["status"] == "posted":
                 raise LedgerError("这期还款已经记账，不能再修改金额")
-            database.connection.execute(
-                """INSERT INTO credit_repayment_periods
-                   (rule_id,due_date,amount_minor,status,transaction_id,created_at,updated_at)
-                   VALUES (?,?,?,'pending',NULL,?,?)
-                   ON CONFLICT(rule_id,due_date) DO UPDATE SET
-                       amount_minor=excluded.amount_minor,status='pending',transaction_id=NULL,
-                       updated_at=excluded.updated_at""",
-                (schedule_id, due_date_text, amount_minor, now, now),
-            )
+            if period:
+                updated = database.connection.execute(
+                    """UPDATE credit_repayment_periods
+                       SET amount_minor=?,status='pending',transaction_id=NULL,updated_at=?
+                       WHERE id=? AND status!='posted'""",
+                    (amount_minor, now, period["id"]),
+                )
+                if updated.rowcount == 0:
+                    raise LedgerError("这期还款已记账，不能再修改金额；请刷新后核对。")
+            else:
+                try:
+                    database.connection.execute(
+                        """INSERT INTO credit_repayment_periods
+                           (rule_id,due_date,amount_minor,status,transaction_id,created_at,updated_at)
+                           VALUES (?,?,?,'pending',NULL,?,?)""",
+                        (schedule_id, due_date_text, amount_minor, now, now),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raced_period = database.connection.execute(
+                        "SELECT id,status FROM credit_repayment_periods WHERE rule_id=? AND due_date=?",
+                        (schedule_id, due_date_text),
+                    ).fetchone()
+                    if not raced_period:
+                        raise
+                    if raced_period["status"] == "posted":
+                        raise LedgerError("这期还款已记账，不能再修改金额；请刷新后核对。") from exc
+                    updated = database.connection.execute(
+                        """UPDATE credit_repayment_periods
+                           SET amount_minor=?,status='pending',transaction_id=NULL,updated_at=?
+                           WHERE id=? AND status!='posted'""",
+                        (amount_minor, now, raced_period["id"]),
+                    )
+                    if updated.rowcount == 0:
+                        raise LedgerError("这期还款已记账，不能再修改金额；请刷新后核对。") from exc
             database.connection.execute(
                 "UPDATE credit_repayment_rules SET last_status='本期金额已填写，等待还款日' WHERE id=?",
                 (schedule_id,),

@@ -381,6 +381,18 @@ class MobileWorkspace:
         name = f"{prefix}-{self.local_now(uid):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.zip"
         with self.lock(uid):
             cfg = self.config(uid)
+            time_zone = normalize_time_zone(cfg.get("timeZone", DEFAULT_TIME_ZONE))
+            metadata_db = Database(self.db_path(uid))
+            try:
+                metadata_db.initialize()
+                # Keep the region used by date and schedule logic in the
+                # portable ledger data so desktop restores use the same zone.
+                if metadata_db.get_setting("time_zone", "") != time_zone:
+                    metadata_db.set_setting(
+                        "time_zone", time_zone, "Region used for dates and scheduled operations"
+                    )
+            finally:
+                metadata_db.close()
             body = create_sync_bundle(
                 self.db_path(uid), folder / name, **self.stores(uid),
                 include_scope=DEFAULT_BACKUP_SCOPE if full else cfg["scope"],
@@ -1103,6 +1115,10 @@ class MobileWorkspace:
             previous_plan = db.get_setting(previous_plan_key)
             if previous_plan and not db.get_setting(current_plan_key):
                 db.set_setting(current_plan_key, previous_plan, "Carry budget to the updated billing cycle")
+            db.set_setting(
+                "time_zone", requested_time_zone,
+                "Region used for dates and scheduled operations",
+            )
             db.set_setting("billing_cycle_start_day", str(cycle_start_day), "Web billing cycle")
         finally:
             db.close()

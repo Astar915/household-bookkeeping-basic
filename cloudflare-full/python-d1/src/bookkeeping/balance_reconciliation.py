@@ -154,6 +154,9 @@ def reconcile_named_balance(
             before_text = format_account_amount(before_minor, digits, code, account["account_type"])
             counted_text = format_account_amount(counted_minor, digits, code, account["account_type"])
             subject = "可用额度" if is_credit else "余额"
+            if is_credit:
+                before_text = before_text.removesuffix(f" {code}")
+                counted_text = counted_text.removesuffix(f" {code}")
             fx_values: tuple[Any, ...] = (None, None, None, None)
             if code != "JPY" and account["account_type"] != "points":
                 if rate is None:
@@ -163,7 +166,7 @@ def reconcile_named_balance(
                              format(rate.rate, "f"), rate.rate_date, rate.source)
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
             description = (
-                f"信用卡额度盘点调整：可用额度 {before_text} → {counted_text}"
+                f"信用卡额度盘点调整：可用额度 {before_text} → {counted_text} {code}"
                 if is_credit else
                 f"{group}盘点调整：账面{subject}{before_text}，实盘{counted_text}"
             )
@@ -322,15 +325,20 @@ def record_credit_snapshot(
                 if previous_available_minor is not None
                 else limit_minor - before_minor
             )
-            previous_available_text = format_account_amount(previous_available, digits, code, "credit")
-            current_available_text = format_account_amount(available_minor, digits, code, "credit")
+            previous_available_text = format_account_amount(
+                previous_available, digits, code, "credit"
+            ).removesuffix(f" {code}")
+            current_available_text = format_account_amount(
+                available_minor, digits, code, "credit"
+            ).removesuffix(f" {code}")
             cursor = connection.execute(
                 """INSERT INTO transactions
                    (occurred_on,kind,amount_minor,currency,account_id,category_id,description,
                     balance_effect,jpy_equiv_minor,fx_rate,fx_rate_date,fx_source,needs_review,source,created_at)
                    VALUES (?,?,?,?,?,?,?,'posted',?,?,?,?,0,'balance_reconciliation',?)""",
                 (date_text, kind, abs(difference), code, int(account["id"]), category["id"],
-                 f"信用卡额度盘点调整：可用额度 {previous_available_text} → {current_available_text}", *fx_values, transaction_time),
+                 f"信用卡额度盘点调整：可用额度 {previous_available_text} → {current_available_text} {code}",
+                 *fx_values, transaction_time),
             )
             transaction_id = int(cursor.lastrowid)
             database._record_credit_recovery_points([transaction_id])

@@ -21,7 +21,7 @@ ACCOUNT_TYPE_LABELS = {
 
 def build_balance_sheet(database: Database, as_of: str | date) -> dict[str, Any]:
     """Build currency-separated assets and liabilities, with points reported separately."""
-    as_of_date = parse_date(as_of) if isinstance(as_of, str) else as_of
+    as_of_date = parse_date(as_of, getattr(database, "time_zone", "Asia/Tokyo")) if isinstance(as_of, str) else as_of
     monetary_codes = {
         row["code"] for row in database.connection.execute(
             "SELECT code FROM currencies WHERE is_monetary=1 ORDER BY code"
@@ -185,20 +185,57 @@ def build_balance_sheet(database: Database, as_of: str | date) -> dict[str, Any]
         })
 
     base_currency = database.get_base_currency()
-    base_equivalent = {
+    base_totals = {
         "currency": base_currency,
         "minor_digits": int(database.currency(base_currency)["minor_digits"]),
-        # Keep the asset headline in its native currency. Foreign currencies
-        # remain visible as separate subtotals below the headline.
-        "assets_minor": int(assets.get(base_currency, 0)),
-        "bank_deposits_minor": int(deposits.get(base_currency, 0)),
-        "known_liabilities_minor": int(known_liabilities.get(base_currency, 0)),
-        "estimated_liabilities_minor": int(estimated_liabilities.get(base_currency, 0)),
-        "net_assets_minor": int(assets.get(base_currency, 0))
-        - int(known_liabilities.get(base_currency, 0))
-        - int(estimated_liabilities.get(base_currency, 0)),
+        "assets_minor": 0,
+        "bank_deposits_minor": 0,
+        "known_liabilities_minor": 0,
+        "estimated_liabilities_minor": 0,
+        "net_assets_minor": 0,
         "missing_conversion_count": 0,
     }
+    try:
+        from .fx_rates import convert_minor_at_rate, resolve_exchange_rate
+
+        target_digits = int(database.currency(base_currency)["minor_digits"])
+        for code in sorted(monetary_codes):
+            if code == base_currency:
+                rate = None
+            else:
+                try:
+                    rate = resolve_exchange_rate(
+                        database, code, base_currency, as_of_date.isoformat(), fetch_if_missing=False
+                    ).rate
+                except (ValueError, RuntimeError):
+                    base_totals["missing_conversion_count"] += 1
+                    continue
+            source_digits = int(database.currency(code)["minor_digits"])
+            for key, source_map in (
+                ("assets_minor", assets),
+                ("bank_deposits_minor", deposits),
+                ("known_liabilities_minor", known_liabilities),
+                ("estimated_liabilities_minor", estimated_liabilities),
+            ):
+                amount = int(source_map.get(code, 0))
+                converted = amount if rate is None else convert_minor_at_rate(
+                    amount, source_digits, target_digits, rate
+                )
+                base_totals[key] += converted
+            net = (
+                int(assets.get(code, 0))
+                - int(known_liabilities.get(code, 0))
+                - int(estimated_liabilities.get(code, 0))
+            )
+            if rate is None:
+                converted_net = net
+            else:
+                converted_abs = convert_minor_at_rate(abs(net), source_digits, target_digits, rate)
+                converted_net = -converted_abs if net < 0 else converted_abs
+            base_totals["net_assets_minor"] += converted_net
+    except (ValueError, RuntimeError):
+        # Keep native-currency totals available if the cached FX data is incomplete.
+        base_totals["missing_conversion_count"] = max(1, base_totals["missing_conversion_count"])
     return {
         "as_of": as_of_date.isoformat(),
         "assets": assets,
@@ -214,7 +251,7 @@ def build_balance_sheet(database: Database, as_of: str | date) -> dict[str, Any]
         "currency_minor_digits": {
             code: int(database.currency(code)["minor_digits"]) for code in monetary_codes
         },
-        "base_equivalent": base_equivalent,
+        "base_equivalent": base_totals,
         "unknown_liability_count": unknown_liability_count,
         "points_total": points_total,
         "rows": rows,
@@ -231,8 +268,10 @@ def _completeness_label(value: str) -> str:
 
 def build_profit_statement(database: Database, as_of: str | date) -> dict[str, Any]:
     """Summarize native-currency activity and transaction-date totals in the main currency."""
-    as_of_date = parse_date(as_of) if isinstance(as_of, str) else as_of
-    start, end = billing_cycle(as_of_date, database.get_billing_cycle_start_day())
+    as_of_date = parse_date(as_of, getattr(database, "time_zone", "Asia/Tokyo")) if isinstance(as_of, str) else as_of
+    start, end = billing_cycle(
+        as_of_date, database.get_billing_cycle_start_day(), getattr(database, "time_zone", "Asia/Tokyo")
+    )
     through = min(end, as_of_date)
     rows = database.report_rows(start.isoformat(), through.isoformat())
     base_currency = database.get_base_currency()
@@ -319,7 +358,7 @@ def build_profit_statement(database: Database, as_of: str | date) -> dict[str, A
                     from .fx_rates import resolve_exchange_rate
 
                     exchange_cache[cache_key] = resolve_exchange_rate(
-                        database, code, base_currency, str(row["occurred_on"])
+                        database, code, base_currency, str(row["occurred_on"]), fetch_if_missing=False
                     )
                 from .fx_rates import convert_minor_at_rate
 

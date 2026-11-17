@@ -66,6 +66,21 @@ class FinancialStatementsTests(unittest.TestCase):
         statement = build_balance_sheet(self.database, "2026-10-16")
         self.assertEqual(statement["bank_deposits"]["JPY"], 200000)
 
+    def test_balance_sheet_converts_cached_foreign_assets_to_main_currency(self) -> None:
+        self.database.add_account(
+            name="人民币钱包", account_type="wallet", currency="CNY",
+            opening_balance="100.00", opening_date="2026-01-01",
+        )
+        self.database.connection.execute(
+            """INSERT OR REPLACE INTO fx_rates
+               (base_currency,quote_currency,rate_date,rate,source,retrieved_at)
+               VALUES ('CNY','JPY','2026-10-15','20','test','2026-10-15T00:00:00+00:00')"""
+        )
+        statement = build_balance_sheet(self.database, "2026-10-15")
+        self.assertEqual(statement["base_equivalent"]["currency"], "JPY")
+        self.assertEqual(statement["base_equivalent"]["assets_minor"], 211600)
+        self.assertEqual(statement["base_equivalent"]["bank_deposits_minor"], 200000)
+
     def test_inferred_card_debt_is_not_reported_as_confirmed(self) -> None:
         self.database.add_account(
             name="推算信用卡", account_type="credit", currency="JPY",

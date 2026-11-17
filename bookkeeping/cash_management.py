@@ -153,7 +153,7 @@ def reconcile_account_balances(
     post_differences: bool = True,
 ) -> list[dict[str, Any]]:
     """Reconcile managed balances, optionally posting differences as transactions."""
-    date_text = parse_date(occurred_on).isoformat()
+    date_text = parse_date(occurred_on, getattr(database, "time_zone", "Asia/Tokyo")).isoformat()
     # Resolve FX before taking the write lock. A CNY adjustment is a single CNY
     # ledger posting with a saved JPY reporting equivalent, not a second posting.
     pre_rows = {row["account_name"]: row for row in managed_balances(database)}
