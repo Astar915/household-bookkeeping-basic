@@ -1,8 +1,8 @@
 <div align="center">
   <img src="assets/household-bookkeeping.png" alt="家庭记账" width="96" />
-  <h1>🏡 家庭记账｜每一笔，都清清楚楚</h1>
-  <p><strong>少一点“钱去哪了”，多一点心里有数。</strong></p>
-  <p>像聊天一样记账，把账户、预算和报表放在一起；账本默认留在自己的电脑，选择权一直在你手里。</p>
+  <h1>🏡 家庭记账 Agent｜让每一笔，都清清楚楚</h1>
+  <p><strong>AI 理解日常表达，账务规则核对每一笔。</strong></p>
+  <p>记账 Agent 处理文字与小票，饮食健康 Agent 帮你回顾采购和饮食记录；模型与 Skill 可按需配置，账本默认留在自己的电脑。</p>
   <p>
     <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.exe">🪟 直接下载 Windows EXE</a> ·
     <a href="#第一次使用">🧭 第一次使用</a> ·
@@ -11,17 +11,24 @@
   <p>
     <img src="https://img.shields.io/badge/Windows-免安装版-0078D4?style=for-the-badge&logo=windows" alt="Windows 免安装版" />
     <img src="https://img.shields.io/badge/账本-本地优先-7C3AED?style=for-the-badge" alt="本地优先" />
-    <img src="https://img.shields.io/badge/AI-可选配置-EC4899?style=for-the-badge" alt="AI 可选配置" />
+    <img src="https://img.shields.io/badge/AI-双 Agent 工作流-EC4899?style=for-the-badge" alt="双 Agent 工作流" />
     <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge" alt="MIT License" />
   </p>
-  <p><strong>当前版本：0.2.3 · 所在地区、智能助手与分类学习</strong></p>
+  <p><strong>当前版本：0.2.3 · 双 Agent、地区设置与分类学习</strong></p>
   <p><strong>LANGUAGE</strong><br />
   简体中文 · <a href="README.en.md">English</a> · <a href="README.ja.md">日本語</a></p>
 </div>
 
-> 💬 **记账可以很简单：**“昨晚晚餐 850 日元，现金支付。”检查候选记录，确认后保存。自然语言记账需要你自行配置本机 Ollama 或兼容模型；不用 AI，也能打开并管理本地账本。
+> 💬 **交给 Agent 一句话：**“昨晚晚餐 850 日元，现金支付。”记账 Agent 提取交易信息，账务程序校验必要字段、账户和币种后写入；信息不足时会先追问。小票识别会先生成待确认草稿。模型由你选择配置；不使用 AI，也能手动记录并管理本地账本。
 
-## ✨ 这本账能帮你做什么
+## 🤖 两个 Agent，账务规则把关
+
+- **记账 Agent**：理解收入、支出、转账和余额盘点等日常表达，也能辅助读取小票；缺少必要信息时继续追问。
+- **饮食健康 Agent**：围绕你提供的饮食与采购记录进行整理和回顾。
+- **账务程序负责校验与写入**：核对账目字段、账户和币种，再写入结构化账本；模型不直接操作数据库。
+- **按需配置模型和 Skill**：可配置文字与图片服务，也可使用本机 Ollama；不配置 AI 时仍可手动使用账本。
+
+## 📒 一套完整的家庭账本
 
 - 💸 记录收入、支出、转账和余额盘点，JPY、CNY 分开核算
 - 💳 管理银行、现金、钱包、交通卡、积分、信用卡和固定资产
@@ -34,7 +41,7 @@
 
 1. **下载并打开软件**：Windows 用户按下方“单文件启动”操作，不需要安装 Python。
 2. **登记自己的账户和真实余额**：在“资产”及“更多”中设置银行、钱包、信用卡等账户。新用户从空账本开始。
-3. **记一笔**：打开“记录 → 记账”，输入日期、用途、金额、币种和账户；检查识别结果，确认后才会写入本地账本。
+3. **记一笔**：在“记录 → 记账”手动填写，或向 Agent 描述日期、用途、金额和账户；账务程序校验后写入，小票图片会先显示草稿供你核对。
 4. **随时核对**：在“账单”中筛选或修正记录；在“更多 → 家庭财务报表”看报表，在首页看预算进度。
 5. **先备份，再换设备**：在“设置 → 账本与备份”创建本地备份。GitHub/Gitee 同步是可选项，连接前请先看同步说明。
 

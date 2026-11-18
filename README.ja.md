@@ -1,8 +1,8 @@
 <div align="center">
   <img src="assets/household-bookkeeping.png" alt="家計簿" width="96" />
-  <h1>🏡 家計簿｜一つ一つの支出が、ちゃんと見える</h1>
-  <p><strong>「お金はどこへ？」を減らして、家計に安心を。</strong></p>
-  <p>自然な文章で記帳し、口座・予算・レポートを一か所に。台帳は初期設定では自分の PC に保存されます。</p>
+  <h1>🏡 家計簿｜2つの AI Agent で、記録をわかりやすく</h1>
+  <p><strong>AI が日常の言葉を理解し、会計ルールが記録を検証します。</strong></p>
+  <p>記帳 Agent は文章やレシートを扱い、食生活 Agent は食事や買い物の記録を振り返ります。モデルと Skill は選択でき、台帳は初期設定では自分の PC に保存されます。</p>
   <p>
     <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.exe">🪟 Windows EXE を直接ダウンロード</a> ·
     <a href="#初めて使うとき">🧭 初めて使うとき</a> ·
@@ -11,17 +11,24 @@
   <p>
     <img src="https://img.shields.io/badge/Windows-Portable-0078D4?style=for-the-badge&logo=windows" alt="Windows ポータブル版" />
     <img src="https://img.shields.io/badge/Ledger-Local--first-7C3AED?style=for-the-badge" alt="ローカル優先" />
-    <img src="https://img.shields.io/badge/AI-Optional-EC4899?style=for-the-badge" alt="AI は任意" />
+    <img src="https://img.shields.io/badge/AI-Two%20Agents-EC4899?style=for-the-badge" alt="2つの Agent" />
     <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge" alt="MIT License" />
   </p>
-  <p><strong>現在のバージョン：0.2.3 · 地域設定・スマートアシスタント・カテゴリ学習</strong></p>
+  <p><strong>現在のバージョン：0.2.3 · 2つの Agent・地域設定・カテゴリ学習</strong></p>
   <p><strong>LANGUAGE</strong><br />
   <a href="README.md">简体中文</a> · <a href="README.en.md">English</a> · 日本語</p>
 </div>
 
-> 💬 **記帳はこれだけ：**「昨日の夕食、850 JPY、現金で支払い」。候補を確認して確定すると保存されます。自然言語入力には利用者が設定するモデルサービスが必要ですが、AI なしでもローカル台帳を開いて管理できます。
+> 💬 **Agent に一言伝えるだけ：**「昨日の夕食、850 JPY、現金で支払い」。記帳 Agent が取引情報を抽出し、会計プログラムが必須項目・口座・通貨を検証してから保存します。情報が足りない場合は質問し、レシート認識では確認用の下書きを先に表示します。モデルは自分で選択でき、AI なしでも手動で台帳を利用できます。
 
-## ✨ できること
+## 🤖 2つの Agent と会計ルールによる確認
+
+- **記帳 Agent**：収入、支出、振替、残高確認などの日常表現を理解し、レシートの読み取りも補助します。必要な情報が不足している場合は質問します。
+- **食生活 Agent**：入力した食事や買い物の記録を整理し、振り返りを手伝います。
+- **会計プログラムが検証して保存**：取引項目、口座、通貨を確認して構造化台帳へ記録します。モデルがデータベースを直接操作することはありません。
+- **モデルと Skill は選択可能**：文章・画像サービスやローカル Ollama を設定できます。AI を設定しなくても手動記帳は利用できます。
+
+## 📒 家計をまとめる台帳
 
 - 💸 収入、支出、振替、残高確認を記録（JPY と CNY は別々に管理）
 - 💳 銀行、現金、ウォレット、交通系 IC、ポイント、クレジットカード、固定資産を管理
@@ -34,7 +41,7 @@
 
 1. **ダウンロードして起動**：下の Windows 単一ファイル版の手順を確認します。Python は不要です。
 2. **自分の口座と実際の残高を登録**：「資産」や「その他」で銀行、ウォレット、クレジットカードなどを設定します。新規利用時は空の台帳から始まります。
-3. **取引を記録**：「記録 → 家計簿」を開き、日付、用途、金額、通貨、口座を入力します。候補を確認して確定するとローカル台帳に保存されます。
+3. **取引を記録**：「記録 → 家計簿」で手入力するか、Agent に日付、用途、金額、口座を伝えます。会計プログラムが検証して保存し、レシート画像は確認用の下書きを表示します。
 4. **いつでも確認**：「明細」で検索・修正、「その他 → 家計財務レポート」でレポートを確認し、ホーム画面で予算の進捗を見ます。
 5. **端末を変える前にバックアップ**：「設定 → 台帳とバックアップ」でローカルバックアップを作成します。GitHub/Gitee 同期は任意です。接続前に説明を確認してください。
 

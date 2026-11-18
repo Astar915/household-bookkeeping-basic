@@ -1,8 +1,8 @@
 <div align="center">
   <img src="assets/household-bookkeeping.png" alt="Household Bookkeeping" width="96" />
-  <h1>🏡 Household Bookkeeping · Every entry, crystal clear</h1>
-  <p><strong>Less “Where did the money go?” More peace of mind.</strong></p>
-  <p>Record transactions in plain language and bring accounts, budgets, and reports together. Your ledger stays on your computer by default.</p>
+  <h1>🏡 Household Bookkeeping · Two AI Agents, One Clear Ledger</h1>
+  <p><strong>AI understands everyday language. Bookkeeping rules check every entry.</strong></p>
+  <p>A bookkeeping agent handles text and receipts; a food agent helps review meal and grocery records. Choose your models and Skills, while your ledger stays on your computer by default.</p>
   <p>
     <a href="https://github.com/Astar915/household-bookkeeping-basic/releases/latest/download/HouseholdBookkeeping-Windows-x64.exe">🪟 Download the Windows EXE</a> ·
     <a href="#first-use">🧭 First use</a> ·
@@ -11,17 +11,24 @@
   <p>
     <img src="https://img.shields.io/badge/Windows-Portable-0078D4?style=for-the-badge&logo=windows" alt="Windows portable app" />
     <img src="https://img.shields.io/badge/Ledger-Local--first-7C3AED?style=for-the-badge" alt="Local first" />
-    <img src="https://img.shields.io/badge/AI-Optional-EC4899?style=for-the-badge" alt="AI is optional" />
+    <img src="https://img.shields.io/badge/AI-Two%20Agents-EC4899?style=for-the-badge" alt="Two agent workflows" />
     <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge" alt="MIT License" />
   </p>
-  <p><strong>Current version: 0.2.3 · Region settings, smart assistant, and category learning</strong></p>
+  <p><strong>Current version: 0.2.3 · Two agents, region settings, and category learning</strong></p>
   <p><strong>LANGUAGE</strong><br />
   <a href="README.md">简体中文</a> · English · <a href="README.ja.md">日本語</a></p>
 </div>
 
-> 💬 **Bookkeeping can be this simple:** “Dinner yesterday, 850 JPY, paid in cash.” Review the suggested entry and confirm to save. Natural-language entry needs a model service you configure; you can still open and manage your local ledger without AI.
+> 💬 **Tell the agent what happened:** “Dinner yesterday, 850 JPY, paid in cash.” The bookkeeping agent extracts the transaction details; the bookkeeping program validates required fields, account, and currency before saving. It asks follow-up questions when details are missing. Receipt recognition first creates a draft for you to review. Choose your model service, or use the ledger manually without AI.
 
-## ✨ What you can do
+## 🤖 Two agents, with bookkeeping rules in control
+
+- **Bookkeeping agent:** Understands everyday descriptions of income, expenses, transfers, and balance checks, and can help read receipts. It asks follow-up questions when required details are missing.
+- **Food agent:** Organizes and reviews the meal and grocery records you provide.
+- **The bookkeeping program validates and saves:** It checks transaction fields, accounts, and currencies before writing to the structured ledger; the model does not access the database directly.
+- **Choose models and Skills as needed:** Configure text and image services, including local Ollama. The ledger remains usable for manual bookkeeping without AI.
+
+## 📒 A complete household ledger
 
 - 💸 Record income, expenses, transfers, and balance counts; JPY and CNY stay separate
 - 💳 Manage bank, cash, wallet, transit, points, credit-card, and fixed-asset records
@@ -34,7 +41,7 @@
 
 1. **Download and open the app.** Follow the single-file Windows steps below; Python is not required.
 2. **Add your accounts and real balances.** Set up bank, wallet, and credit-card accounts under **Assets** and **More**. New installations start with an empty ledger.
-3. **Record an entry.** Open **Record → Bookkeeping** and enter the date, purpose, amount, currency, and account. Review the suggestion and confirm it before it is saved locally.
+3. **Record an entry.** Enter it manually under **Record → Bookkeeping**, or describe the date, purpose, amount, and account to an agent. The bookkeeping program validates entries before saving; receipt images are shown as drafts for review.
 4. **Review anytime.** Filter or correct entries under **Ledger**; find reports under **More → Household Financial Reports** and budget progress on the home page.
 5. **Back up before changing devices.** Create a local backup under **Settings → Ledger and Backups**. GitHub/Gitee sync is optional; read its guide before connecting.
 
